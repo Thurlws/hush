@@ -10,9 +10,15 @@
 </head>
 <body>
 <main id="login">
+  <div class="card">
+  <h1>hush</h1>
+  <p class="sub">End-to-end encrypted chat</p>
+  <div id="sessions-box" hidden>
+    <p class="section">Your chats</p>
+    <ul id="sessions"></ul>
+    <button id="add-session" type="button">+ Add session</button>
+  </div>
   <form id="login-form" autocomplete="off" novalidate>
-    <h1>hush</h1>
-    <p class="sub">End-to-end encrypted chat</p>
     <label for="key">Enter key</label>
     <input id="key" maxlength="64" spellcheck="false" autocapitalize="off" autocorrect="off"
            placeholder="xxxx-xxxx-xxxx-xxxx-xxxx-xxxx">
@@ -20,9 +26,11 @@
     <input id="name" maxlength="24" spellcheck="false" autocapitalize="off" autocorrect="off"
            placeholder="letters, digits, _ . -">
     <button id="join" type="submit" disabled>Loading…</button>
-    <p id="login-error" role="alert"></p>
-    <p class="fine">Your fingerprint<br><span id="myfp">…</span></p>
+    <button id="cancel-add" type="button" hidden>Back to your chats</button>
   </form>
+  <p id="login-error" role="alert"></p>
+  <p class="fine">Your fingerprint<br><span id="myfp">…</span></p>
+  </div>
   <noscript>hush needs JavaScript: your messages are encrypted in the browser.</noscript>
 </main>
 

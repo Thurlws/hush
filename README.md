@@ -183,7 +183,8 @@ Back it up. If you lose it, your friends will get a "key changed" warning.
 | `/quit` | leave (also the Leave button, or Ctrl-C in the terminal) |
 | `/waiting`, `/approve NAME`, `/deny NAME` | admins: the waitlist |
 
-In the browser, send an image with the **+** button or by pasting it; whatever is typed in the box
+In the browser, chats you've joined are saved on the login page: click one to rejoin, or
+**+ Add session** to join another with its key. Send an image with the **+** button or by pasting it; whatever is typed in the box
 goes along as its caption. Click an image to see it full size and save it. **Load older messages** at the top goes back in time.
 
 In the terminal: `/img FILE [caption]` sends an image (jpeg, png, gif or webp, up to 25 MB),
@@ -261,7 +262,8 @@ This is a hobby project, not a professional security audit. Specifically:
 - The server sees metadata: who is in which chat, who messages whom, when, how long each message is,
   and how big each image is. The terminal client's connection isn't wrapped in TLS, so anyone on the
   network path sees that metadata too.
-- Identity keys are stored unencrypted (file permission 0600, or the browser's storage). Anyone with
+- Identity keys, and in the browser the keys of saved chats, are stored unencrypted (file permission 0600,
+  or the browser's storage). Anyone with
   access to your account or browser profile can take them. A new browser or device is a new identity.
 - A malicious server can drop, hide or reorder messages. It can't read or forge them without you
   noticing a key change.

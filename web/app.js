@@ -338,7 +338,61 @@ function showLogin(err) {
   $("join").textContent = "Join";
   $("login-error").textContent = err || "";
   document.title = "hush";
-  ($("name").value ? $("key") : $("name")).focus();
+  showSessions();
+  if (!$("login-form").hidden) ($("name").value ? $("key") : $("name")).focus();
+}
+
+// ---- saved chats ----------------------------------------------------------------
+// Chats you've joined from this browser, so you can rejoin with a click. They
+// stay in this browser's storage, next to your identity key.
+
+const sessionId = key => sodium.to_hex(deriveChatKey(sodium, key).token);
+let sessions = [];
+try {
+  const list = JSON.parse(local.get("hush.sessions") || "[]");
+  if (Array.isArray(list))
+    sessions = list.filter(x => x && typeof x.key === "string" && typeof x.name === "string" &&
+      NAME_RE.test(x.name) && deriveChatKey(sodium, x.key))
+      .map(x => ({ key: x.key, name: x.name, label: NAME_RE.test(x.label || "") ? x.label : "" }));
+} catch { sessions = []; }
+const storeSessions = () => local.set("hush.sessions", JSON.stringify(sessions));
+
+// Newest first, one entry per chat and name.
+function rememberSession(key, name, label) {
+  const id = sessionId(key);
+  sessions = sessions.filter(x => !(sessionId(x.key) === id && x.name === name));
+  sessions.unshift({ key, name, label });
+  storeSessions();
+}
+
+let adding = false;
+function showSessions() {
+  const list = $("sessions");
+  list.replaceChildren();
+  for (const x of sessions) {
+    const li = el("li"), join = el("button", "session"), forget = el("button", "forget", "×");
+    join.type = forget.type = "button";
+    join.append(el("b", "", x.label || "chat"), el("span", "", `as ${x.name}`));
+    join.onclick = () => {
+      for (const b of list.querySelectorAll("button")) b.disabled = true;
+      join.lastChild.textContent = `as ${x.name} · connecting…`;
+      connect(x.name, x.key);
+    };
+    forget.title = `Remove ${x.label || "this chat"} from this list`;
+    forget.setAttribute("aria-label", forget.title);
+    forget.onclick = () => {
+      if (!confirm(`Remove "${x.label || "this chat"}" from this list? You'll need its key to join again.`)) return;
+      sessions = sessions.filter(y => y !== x);
+      storeSessions();
+      showSessions();
+    };
+    li.append(join, forget);
+    list.append(li);
+  }
+  const listed = sessions.length > 0 && !adding;
+  $("sessions-box").hidden = !listed;
+  $("login-form").hidden = listed;
+  $("cancel-add").hidden = !sessions.length;
 }
 
 function connect(name, key) {
@@ -359,14 +413,17 @@ function onEvent(ev, name, key) {
   case "waiting":
     retries = 0;
     local.set("hush.name", name);
-    tab.set("hush.key", key);
+    tab.set("hush.session", JSON.stringify({ key, name }));
+    rememberSession(key, name, ev.label);
     showWaiting(ev.label);
     break;
   case "pending": showWaitlist(); break;
   case "ready":
     retries = 0;
     local.set("hush.name", name);
-    tab.set("hush.key", key);
+    tab.set("hush.session", JSON.stringify({ key, name }));
+    rememberSession(key, name, ev.label);
+    adding = false;
     $("key").value = "";
     $("label").textContent = ev.label;
     document.title = `hush · ${ev.label}`;
@@ -403,7 +460,7 @@ function onEvent(ev, name, key) {
   case "error": if (inChat && chat && chat.ready) line("warn", `! server: ${ev.text}`); break;
   case "closed":
     if (ev.quit || ev.error) { // left, or the server said no: don't retry
-      tab.del("hush.key");
+      tab.del("hush.session");
       showLogin(ev.error ? capitalize(ev.error) + "." : "");
     } else if (waiting) { // keep our place in line
       retryTimer = setTimeout(() => connect(name, key), 5000);
@@ -487,18 +544,33 @@ document.addEventListener("click", e => { // clicking outside the panel closes i
 $("mydata").addEventListener("click", saveMyData);
 $("wait-cancel").addEventListener("click", () => {
   if (chat && chat.ws.readyState < 2) chat.close();
-  tab.del("hush.key");
+  tab.del("hush.session");
   showLogin();
 });
 
 $("leave").addEventListener("click", () => {
   if (chat && chat.ws.readyState < 2) return chat.close();
-  tab.del("hush.key");
+  tab.del("hush.session");
   showLogin();
+});
+
+$("add-session").addEventListener("click", () => {
+  adding = true;
+  $("login-error").textContent = "";
+  showSessions();
+  ($("name").value ? $("key") : $("name")).focus();
+});
+$("cancel-add").addEventListener("click", () => {
+  adding = false;
+  $("login-error").textContent = "";
+  showSessions();
 });
 
 $("myfp").textContent = myFp;
 $("name").value = local.get("hush.name") || "";
-const saved = tab.get("hush.key");
-if (saved && NAME_RE.test($("name").value) && deriveChatKey(sodium, saved)) connect($("name").value, saved);
+// After a reload, go straight back into the chat this tab was in.
+let resume = null;
+try { resume = JSON.parse(tab.get("hush.session") || "null"); } catch { resume = null; }
+if (resume && typeof resume.key === "string" && NAME_RE.test(resume.name || "") && deriveChatKey(sodium, resume.key))
+  connect(resume.name, resume.key);
 else showLogin($("login-error").textContent);

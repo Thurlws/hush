@@ -31,7 +31,23 @@ button {
 
 /* login and waiting */
 #login, #waiting { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
-#login-form, #waiting .card { width: 100%; max-width: 380px; display: flex; flex-direction: column; }
+#login .card, #login-form, #waiting .card { width: 100%; max-width: 380px; display: flex; flex-direction: column; }
+
+/* saved chats */
+.section { margin: 0 0 .5em; font-weight: 600; }
+#sessions { list-style: none; margin: 0 0 .8em; padding: 0; display: flex; flex-direction: column; gap: .5em; }
+#sessions li { display: flex; gap: .4em; }
+.session {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; text-align: left;
+  padding: .55em .8em; background: var(--field);
+}
+.session:hover:not(:disabled) { border-color: var(--dim); }
+.session:disabled { opacity: .6; cursor: default; }
+.session b, .session span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session span { color: var(--dim); font-size: .85em; }
+.forget { flex: none; width: 2.6em; color: var(--dim); }
+#add-session { align-self: flex-start; }
+#cancel-add { margin-top: .6em; color: var(--dim); }
 #waiting p { margin: 0 0 .8em; }
 .fp-big { font-size: 1.1em; font-weight: 600; letter-spacing: .03em; }
 #wait-cancel { align-self: flex-start; margin-top: .6em; }

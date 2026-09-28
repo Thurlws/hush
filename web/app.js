@@ -258,20 +258,34 @@ async function saveMyData() {
 
 // ---- the waitlist ---------------------------------------------------------------
 
-function showRequests() {
-  const box = $("requests");
-  box.replaceChildren();
-  if (chat && chat.admin)
+// Admins only: a Waitlist button with a count, which opens the list.
+function showWaitlist() {
+  const admin = !!(chat && chat.admin), n = admin ? chat.pending.size : 0;
+  $("waitlist-btn").hidden = !admin;
+  $("waitlist-count").textContent = n ? String(n) : "";
+  $("waitlist-count").hidden = !n;
+  const list = $("waitlist-list");
+  list.replaceChildren();
+  if (admin)
     for (const [name, fp] of chat.pending) {
       const row = el("div", "request");
       const approve = el("button", "approve", "Approve"), deny = el("button", "deny", "Deny");
       approve.type = deny.type = "button";
       approve.onclick = () => { approve.disabled = deny.disabled = true; chat.decide(name, true); };
       deny.onclick = () => { approve.disabled = deny.disabled = true; chat.decide(name, false); };
-      row.append(el("span", "who", `${name} wants to join`), el("span", "fp", fp), approve, deny);
-      box.append(row);
+      const who = el("div", "who-box");
+      who.append(el("span", "who", name), el("span", "fp", fp));
+      row.append(who, approve, deny);
+      list.append(row);
     }
-  box.hidden = !box.childElementCount;
+  $("waitlist-empty").hidden = n > 0;
+  if (!admin) $("waitlist").hidden = true;
+}
+
+function toggleWaitlist(open = $("waitlist").hidden) {
+  $("waitlist").hidden = !open;
+  $("waitlist-btn").setAttribute("aria-expanded", String(open));
+  if (open) $("waitlist-close").focus();
 }
 
 function showWaiting(label) {
@@ -318,6 +332,7 @@ function showLogin(err) {
   shown.clear();
   $("chat").hidden = true;
   $("waiting").hidden = true;
+  $("waitlist").hidden = true;
   $("login").hidden = false;
   $("join").disabled = false;
   $("join").textContent = "Join";
@@ -347,10 +362,7 @@ function onEvent(ev, name, key) {
     tab.set("hush.key", key);
     showWaiting(ev.label);
     break;
-  case "pending":
-    if (ev.waiting) line("sys", `* ${ev.name} wants to join, with fingerprint ${ev.fp}`);
-    showRequests();
-    break;
+  case "pending": showWaitlist(); break;
   case "ready":
     retries = 0;
     local.set("hush.name", name);
@@ -367,11 +379,11 @@ function onEvent(ev, name, key) {
       $("msgs").replaceChildren();
       $("older").hidden = true;
       line("info", `connected as ${name} to the chat "${ev.label}"\nyour fingerprint: ${myFp}\ntype /help for commands` +
-        (ev.admin ? "\nyou're an admin: people who want to join show up at the top" : ""));
+        (ev.admin ? "\nyou're an admin: people who want to join are under Waitlist" : ""));
       $("msg").focus();
     }
     showOnline();
-    showRequests();
+    showWaitlist();
     break;
   case "history":
     if (ev.dir === 0) {
@@ -460,7 +472,17 @@ $("older").addEventListener("click", () => {
 
 $("viewer").addEventListener("click", e => { if (e.target === $("viewer")) closeViewer(); });
 $("viewer-close").addEventListener("click", closeViewer);
-document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("viewer").hidden) closeViewer(); });
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (!$("viewer").hidden) closeViewer();
+  else if (!$("waitlist").hidden) toggleWaitlist(false);
+});
+$("waitlist-btn").addEventListener("click", () => toggleWaitlist());
+$("waitlist-close").addEventListener("click", () => toggleWaitlist(false));
+document.addEventListener("click", e => { // clicking outside the panel closes it
+  if (!$("waitlist").hidden && !$("waitlist").contains(e.target) && !$("waitlist-btn").contains(e.target))
+    toggleWaitlist(false);
+});
 
 $("mydata").addEventListener("click", saveMyData);
 $("wait-cancel").addEventListener("click", () => {

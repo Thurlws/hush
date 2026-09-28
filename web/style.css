@@ -58,11 +58,22 @@ header b { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-sp
 #dot.on { background: var(--n1); }
 #dot.off { background: var(--warn); }
 
-/* admins: people waiting to join */
-#requests { border-bottom: 1px solid var(--line); padding: .5em 16px; }
-.request { display: flex; flex-wrap: wrap; align-items: center; gap: .3em .7em; padding: .25em 0; }
+/* admins: the waitlist button and its panel */
+#waitlist-count {
+  display: inline-block; min-width: 1.5em; margin-left: .3em; padding: 0 .4em; border-radius: 1em;
+  background: var(--warn); color: #fff; font-size: .8em; text-align: center;
+}
+#waitlist {
+  position: fixed; z-index: 5; top: 3.4em; right: 16px; width: min(440px, calc(100% - 32px));
+  max-height: calc(100% - 5em); overflow-y: auto; padding: .8em 1em;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 30px rgba(0, 0, 0, .25);
+}
+.panel-head { display: flex; justify-content: space-between; align-items: center; }
+.hint { margin: .5em 0; color: var(--dim); font-size: .85em; }
+.request { display: flex; align-items: center; gap: .6em; padding: .55em 0; border-top: 1px solid var(--line); }
+.who-box { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .request .who { font-weight: 600; }
-.request .fp { color: var(--dim); font-size: .9em; flex: 1; }
+.request .fp { color: var(--dim); font-size: .85em; overflow-wrap: anywhere; }
 .request .approve { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 #log { flex: 1; overflow-y: auto; padding: .8em 16px; }
 #msgs > div { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -95,3 +106,10 @@ header b { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-sp
 .name { font-weight: 700; }
 .n0 { color: var(--n0); } .n1 { color: var(--n1); } .n2 { color: var(--n2); }
 .n3 { color: var(--n3); } .n4 { color: var(--n4); } .n5 { color: var(--n5); }
+
+/* narrow phones: keep the header on one line */
+@media (max-width: 480px) {
+  header { gap: .4em; }
+  header button { padding: .3em .55em; }
+  #online { font-size: .8em; }
+}

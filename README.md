@@ -38,6 +38,18 @@ Everyone else runs:
 ./hush -n yourname HOST:PORT     # or HOST PORT; [ipv6]:PORT for IPv6
 ```
 
+Prefer a browser window? `web/hush-web` takes the same arguments, runs `hush` for you and
+serves the chat on localhost (needs only Python 3):
+
+```sh
+./web/hush-web -n yourname HOST              # then open the link it prints
+./web/hush-web --listen 8000 -n yourname HOST
+```
+
+The page only talks to the local `hush` process, so keys and encryption stay in the C client.
+It listens on 127.0.0.1 only, and the link contains a random token that other websites can't
+guess. Anyone with that link and access to your machine can read and send as you, so don't share it.
+
 Your identity key is created on first run in `~/.local/share/hush/identity.key`.
 Back it up. If you lose it, your friends will get a "key changed" warning.
 

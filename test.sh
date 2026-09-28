@@ -55,4 +55,29 @@ check  "$T/alice2.out"   "dropped a message from bob" "alice drops messages from
 check  "$T/alice2.out"   "not sent to bob"            "alice refuses to encrypt to the changed key"
 absent "$T/mallory2.out" "can you read this"          "impostor never sees alice's message"
 
+# Web wrapper: alice chats through hush-web's HTTP endpoints instead of a terminal.
+if command -v python3 >/dev/null && command -v curl >/dev/null; then
+    WPORT=$((PORT + 1))
+    XDG_DATA_HOME="$T/a" ./web/hush-web --listen "$WPORT" -n alice 127.0.0.1 "$PORT" >"$T/web.out" 2>&1 &
+    w=$!
+    sleep 0.8
+    tok=$(sed -n 's/.*#//p' "$T/web.out")
+    curl -sN "http://127.0.0.1:$WPORT/events?t=$tok" >"$T/web.sse" &
+    (sleep 0.5; echo "hello web"; sleep 1.5) | client carol c >"$T/carol.out" 2>&1 &
+    c=$!
+    sleep 1
+    curl -s -H "X-Token: $tok" --data-binary "hello from the browser" "http://127.0.0.1:$WPORT/send"
+    curl -s -o "$T/web.denied" -w "%{http_code}" --data-binary "sneaky" "http://127.0.0.1:$WPORT/send" >"$T/web.code"
+    wait $c
+    kill $w; wait $w 2>/dev/null
+
+    check  "$T/web.sse"   "carol: hello web"             "hush-web streams incoming messages"
+    check  "$T/carol.out" "alice: hello from the browser" "hush-web sends messages"
+    check  "$T/web.code"  "403"                          "hush-web refuses requests without the token"
+    absent "$T/carol.out" "sneaky"                       "unauthenticated text is never sent"
+    absent "$T/web.out"   "Traceback"                    "hush-web runs without errors"
+else
+    echo "skip - hush-web tests (need python3 and curl)"
+fi
+
 [ $fail = 0 ] && echo "all tests passed" || { echo "some tests failed"; exit 1; }

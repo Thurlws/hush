@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""hush-web: a minimal browser front end for the hush client.
+
+Runs the real `hush` binary as a child process and bridges its stdin/stdout
+to a page served on 127.0.0.1. Keys and crypto stay in the C client; this
+only moves plaintext between that process and your own browser.
+
+    hush-web [--listen PORT] [hush args...]   e.g.  hush-web -n alice 100.64.0.1
+
+Every request needs the random token printed at startup (so other websites
+can't read or post to your chat), and the Host header must be localhost (so
+DNS rebinding can't get around that).
+"""
+import collections
+import http.server
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import urllib.parse
+
+MAX_TEXT = 4000
+HISTORY = 2000
+
+
+def find_hush():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.environ.get("HUSH"), os.path.join(here, "..", "hush"), os.path.join(here, "hush")):
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("hush")
+
+
+class Chat:
+    """The hush child process plus a numbered backlog of its output lines."""
+
+    def __init__(self, argv):
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+        self.lines = collections.deque(maxlen=HISTORY)  # (seq, text)
+        self.seq = 0
+        self.done = False
+        self.cond = threading.Condition()
+        self.wlock = threading.Lock()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for raw in self.proc.stdout:
+            self._add(raw.decode("utf-8", "replace").rstrip("\n"))
+        code = self.proc.wait()
+        self._add(f"! hush exited (status {code})")
+        with self.cond:
+            self.done = True
+            self.cond.notify_all()
+
+    def _add(self, text):
+        with self.cond:
+            self.seq += 1
+            self.lines.append((self.seq, text))
+            self.cond.notify_all()
+
+    def since(self, seq, timeout):
+        """Lines after seq, waiting up to timeout for one to arrive."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.seq > seq or self.done, timeout)
+            return [l for l in self.lines if l[0] > seq], self.done
+
+    def send(self, text):
+        # One line per submit: hush treats \r and \n as Enter.
+        text = " ".join(text.splitlines()).encode()[:MAX_TEXT]
+        with self.wlock:
+            try:
+                self.proc.stdin.write(text + b"\n")
+                self.proc.stdin.flush()
+                return True
+            except (BrokenPipeError, ValueError):
+                return False
+
+    def close(self):
+        try:
+            self.proc.stdin.close()  # hush quits cleanly on EOF
+            self.proc.wait(timeout=2)
+        except Exception:
+            self.proc.kill()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    chat = token = hosts = None
+
+    def log_message(self, *args):
+        pass  # keep the terminal quiet; message text must never end up in logs
+
+    def _guard(self, query):
+        if self.headers.get("Host") not in self.hosts:
+            self._reply(403, b"bad host")
+            return False
+        token = self.headers.get("X-Token") or query.get("t", [""])[0]
+        if not secrets.compare_digest(token.encode(), self.token.encode()):
+            self._reply(403, b"bad token")
+            return False
+        return True
+
+    def _reply(self, code, body, ctype="text/plain; charset=utf-8", extra=()):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in extra:
+            self.send_header(k, v)
+        if code >= 400:  # the request body may be unread, so don't reuse the connection
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(url.query)
+        if url.path == "/":
+            # The page holds no secrets; it reads the token from the URL fragment.
+            if self.headers.get("Host") not in self.hosts:
+                return self._reply(403, b"bad host")
+            nonce = secrets.token_urlsafe(12)
+            csp = (f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; "
+                   "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+            return self._reply(200, PAGE.replace("NONCE", nonce).encode(), "text/html; charset=utf-8",
+                               [("Content-Security-Policy", csp)])
+        if url.path == "/events":
+            if self._guard(query):
+                self._events(int(self.headers.get("Last-Event-ID") or 0))
+            return
+        self._reply(404, b"not found")
+
+    def _events(self, seq):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            while True:
+                lines, done = self.chat.since(seq, 15)
+                out = [f"id: {n}\ndata: {text}\n\n" for n, text in lines]
+                if lines:
+                    seq = lines[-1][0]
+                if done:
+                    out.append("event: end\ndata: \n\n")
+                elif not lines:
+                    out.append(": ping\n\n")  # notice dead connections
+                self.wfile.write("".join(out).encode())
+                self.wfile.flush()
+                if done:
+                    return
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self):
+        url = urllib.parse.urlsplit(self.path)
+        if url.path != "/send":
+            return self._reply(404, b"not found")
+        if not self._guard({}):
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 4 * MAX_TEXT:
+            return self._reply(413, b"too long")
+        text = self.rfile.read(n).decode("utf-8", "replace")
+        ok = self.chat.send(text)
+        self._reply(204 if ok else 410, b"")
+
+
+def main():
+    args = sys.argv[1:]
+    port = 7780
+    if args[:1] == ["--listen"] and len(args) > 1:
+        port, args = int(args[1]), args[2:]
+    if not args or args[0] in ("-h", "--help"):
+        sys.exit("usage: hush-web [--listen PORT] [-n name] host[:port]\n"
+                 "  runs hush and serves a chat page on http://127.0.0.1:PORT (default 7780)")
+    hush = find_hush()
+    if not hush:
+        sys.exit("hush-web: can't find the hush binary (run `make`, or set HUSH=/path/to/hush)")
+
+    Handler.token = secrets.token_urlsafe(24)
+    Handler.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        sys.exit(f"hush-web: can't listen on 127.0.0.1:{port}: {e.strerror} (try --listen PORT)")
+    server.daemon_threads = True
+    Handler.chat = Chat([hush, *args])
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)  # even if started with SIGINT ignored
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    print(f"hush-web: open http://127.0.0.1:{port}/#{Handler.token}", flush=True)
+    print("hush-web: Ctrl-C to quit", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        Handler.chat.close()
+
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hush</title>
+<style>
+:root {
+  --bg: #fbfbfa; --fg: #1d1d1b; --dim: #8a8a85; --line: #e6e6e2; --field: #fff;
+  --warn: #c0392b; --sys: #9a6b00; --dm: #8e44ad;
+  --n0: #c0392b; --n1: #2e8b3e; --n2: #a07800; --n3: #2c64c4; --n4: #9b3fb0; --n5: #16867f;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151514; --fg: #e4e4df; --dim: #777772; --line: #2a2a28; --field: #1d1d1b;
+    --warn: #ff6b5b; --sys: #d9a93a; --dm: #c68be0;
+    --n0: #ff7a6b; --n1: #6fcf7f; --n2: #e0bf4a; --n3: #7aa7ff; --n4: #d58cf0; --n5: #5fd0c6;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 15px/1.5 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  display: flex; flex-direction: column;
+}
+header {
+  display: flex; align-items: center; gap: .6em; padding: .7em 16px;
+  border-bottom: 1px solid var(--line); color: var(--dim);
+}
+header b { color: var(--fg); }
+#dot { width: .55em; height: .55em; border-radius: 50%; background: var(--dim); }
+#dot.on { background: var(--n1); }
+#dot.off { background: var(--warn); }
+#log { flex: 1; overflow-y: auto; padding: .8em 16px; }
+#log div { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ts { color: var(--dim); }
+.sys { color: var(--sys); }
+.warn { color: var(--warn); font-weight: 600; }
+.info { color: var(--dim); }
+.tag { color: var(--dm); }
+.name { font-weight: 700; }
+form { display: flex; gap: .5em; padding: .7em 16px; border-top: 1px solid var(--line); }
+input {
+  flex: 1; font: inherit; color: var(--fg); background: var(--field);
+  border: 1px solid var(--line); border-radius: 6px; padding: .5em .7em; outline: none;
+}
+input:focus { border-color: var(--dim); }
+</style>
+</head>
+<body>
+<header><span id="dot"></span><b>hush</b><span id="who">connecting…</span></header>
+<main id="log" aria-live="polite"></main>
+<form id="f" autocomplete="off">
+  <input id="in" maxlength="4000" placeholder="message, or /help" autofocus>
+</form>
+<script nonce="NONCE">
+const token = location.hash.slice(1);
+const log = document.getElementById("log"), input = document.getElementById("in");
+const dot = document.getElementById("dot"), who = document.getElementById("who");
+let me = "", last = "info";
+const hist = [], MSG = /^(\d\d:\d\d) (\[dm(?: to [\w.-]+)?\] )?([\w.-]+): (.*)$/s;
+
+// Same palette choice as the terminal client (djb2 hash mod 6).
+function hue(name) {
+  let h = 5381;
+  for (const c of new TextEncoder().encode(name)) h = (h * 33 + c) >>> 0;
+  return `var(--n${h % 6})`;
+}
+function span(cls, text, color) {
+  const s = document.createElement("span");
+  s.className = cls; s.textContent = text;
+  if (color) s.style.color = color;
+  return s;
+}
+// All text goes in through textContent, never as HTML.
+function add(line) {
+  const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  const div = document.createElement("div");
+  const m = MSG.exec(line);
+  let c;
+  if (m) {
+    div.append(span("ts", m[1] + " "));
+    if (m[2]) div.append(span("tag", m[2]));
+    div.append(span("name", m[3], hue(m[3])), ": " + m[4]);
+    c = "msg";
+  } else {
+    c = /^!/.test(line) ? "warn" : /^\* /.test(line) ? "sys" : /^\s/.test(line) ? last : "info";
+    div.className = c; div.textContent = line;
+    const k = /^connected to (\S+) as ([\w.-]+)$/.exec(line);
+    if (k) { me = k[2]; who.textContent = `${me} @ ${k[1]}`; document.title = `hush · ${me}`; }
+  }
+  last = c;
+  log.append(div);
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+
+const es = new EventSource("/events?t=" + encodeURIComponent(token));
+es.onopen = () => { dot.className = "on"; };
+es.onmessage = e => add(e.data);
+es.addEventListener("end", () => {
+  es.close(); dot.className = "off"; input.disabled = true;
+  who.textContent = (me ? me + " · " : "") + "disconnected";
+});
+es.onerror = () => {
+  if (es.readyState !== EventSource.CLOSED) return void (dot.className = "");
+  dot.className = "off"; who.textContent = "disconnected (is hush-web still running?)";
+};
+
+let hi = 0;
+document.getElementById("f").addEventListener("submit", async e => {
+  e.preventDefault();
+  const text = input.value;
+  if (!text.trim()) return;
+  input.value = "";
+  hist.push(text); hi = hist.length;
+  const r = await fetch("/send", { method: "POST", headers: { "X-Token": token }, body: text })
+    .catch(() => null);
+  if (!r || !r.ok) add("! could not reach hush-web; message not sent");
+});
+input.addEventListener("keydown", e => {
+  if (e.key === "ArrowUp" && hi > 0) input.value = hist[--hi];
+  else if (e.key === "ArrowDown" && hi < hist.length) input.value = hist[++hi] ?? "";
+  else return;
+  e.preventDefault();
+});
+if (!token) add("! no token in the URL: open the link hush-web printed");
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()

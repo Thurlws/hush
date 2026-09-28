@@ -68,6 +68,15 @@ mkdir -p "$S"
 K1=$(newkey main)
 K2=$(newkey other)
 [ -n "$K1" ] && [ -n "$K2" ] && echo "ok   - hushd newkey prints a key" || { echo "FAIL - hushd newkey"; fail=1; }
+[[ $K1 =~ ^[0-9a-z]{4}-[0-9a-z]{4}$ ]] && echo "ok   - keys look like xxxx-xxxx" || { echo "FAIL - key format: $K1"; fail=1; }
+# A key made before keys got shorter (24 characters, no Argon2id) must keep working.
+KOLD=0123-4567-89ab-cdef-ghjk-mnpq
+python3 - "$S/hushd-keys.txt" <<'EOF'
+import hashlib, sys
+token = hashlib.blake2b(b"0123456789abcdefghjkmnpq", digest_size=32, key=b"hush-chat-login-v3").digest()
+verifier = hashlib.blake2b(token, digest_size=32, key=b"hush-chat-verify-v3").hexdigest()
+open(sys.argv[1], "a").write(f"3 {verifier} oldstyle\n")
+EOF
 absent "$S/hushd-keys.txt" "$K1" "the keys file holds no plaintext keys"
 
 server "$S"
@@ -103,6 +112,20 @@ check  "$T/alice.out"  "chat: main"               "clients are told which chat t
 absent "$T/carol.out"  "hello from alice"         "people in another chat don't see messages"
 absent "$T/alice.out"  "carol"                    "people in another chat don't see each other"
 check  "$T/carol.out"  "there is no alice in this chat" "no DMs across chats"
+
+sleep 1 | client alice a "$KOLD" >"$T/alice-old.out" 2>&1
+check "$T/alice-old.out" "chat: oldstyle" "24-character keys from before still work"
+
+# An admin creates a chat from the terminal; its key works right away.
+(sleep 0.5; echo "/newchat club"; sleep 1) | client alice a >"$T/alice-new.out" 2>&1
+KC=$(grep -ao 'Its key: [0-9a-z-]*' "$T/alice-new.out" | cut -d' ' -f3)
+check "$T/alice-new.out" "Created the chat \"club\"" "/newchat creates a chat"
+sleep 1 | client bob b "$KC" >"$T/bob-club.out" 2>&1
+check "$T/bob-club.out" "chat: club" "...and its key lets people in"
+absent "$S/hushd-keys.txt" "$KC" "...and the server never got the key"
+(sleep 0.5; echo "/newchat club2"; sleep 1) | client dave d >/dev/null 2>&1
+admin keys >"$T/keys-club.out"
+check  "$T/keys-club.out" "club" "hushd keys lists chats made in a client"
 
 # History: someone who wasn't there gets the chat, but not other people's DMs.
 sleep 2 | client dave d >"$T/dave.out" 2>&1
@@ -267,6 +290,13 @@ if command -v node >/dev/null; then
     check  "$T/alice3.out" "from the web"                  "terminal receives a web client's image"
     check  "$T/wendy.out"  "alice: hello from a terminal"  "web client receives a terminal message"
     check  "$T/wendy-my.json" "hello from a browser"       "web \"My data\" has your messages"
+    (sleep 1; echo "/newchat webclub"; sleep 1.5) | web wally >"$T/wally-new.out" 2>&1
+    KW=$(grep -ao 'with key [0-9a-z-]*' "$T/wally-new.out" | cut -d' ' -f3)
+    check "$T/wally-new.out" "created webclub" "a web admin creates a chat"
+    sleep 1 | client alice a "$KW" >"$T/alice-webclub.out" 2>&1
+    check "$T/alice-webclub.out" "chat: webclub" "...whose key works in the terminal"
+    (sleep 1; echo "/newchat nope"; sleep 1) | web wendy >"$T/wendy-new.out" 2>&1
+    check "$T/wendy-new.out" "only an admin can create chats" "people who aren't admins can't create chats"
     absent "$T/wendy-my.json" "hello from a terminal"      "...and not other people's"
     (sleep 1; echo "/save $T/web-saved.jpg"; sleep 1.5) | web wally >"$T/walter.out" 2>&1
     check  "$T/walter.out" "wendy: hello from a browser"   "web client gets history"

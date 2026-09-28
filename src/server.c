@@ -346,16 +346,26 @@ static void keys_load(void)
     fclose(f);
 }
 
-/* Replace path with the output of write_fn, atomically. */
-static void file_replace(const char *path, void (*write_fn)(FILE *))
+/* Replace path with the output of write_fn, atomically. Returns -1 on failure. */
+static int file_write(const char *path, void (*write_fn)(FILE *))
 {
     char tmp[4200];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f)
-        die("cannot write %s: %s", tmp, strerror(errno));
+        return -1;
     write_fn(f);
-    if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0 || rename(tmp, path) != 0)
+    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (fclose(f) != 0 || !ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void file_replace(const char *path, void (*write_fn)(FILE *))
+{
+    if (file_write(path, write_fn) != 0)
         die("cannot write %s: %s", path, strerror(errno));
 }
 
@@ -1127,6 +1137,45 @@ static void on_fetch(struct client *c, const uint8_t *p, size_t n)
     pump_downloads(c);
 }
 
+/* An admin made a chat key in their client and sends its login token. */
+static void on_newchat(struct client *c, const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1];
+    int k = name_get(p, n, label);
+    if (k < 0 || n - (size_t)k != 32) {
+        send_error(c, "a chat name is 1-24 of A-Z a-z 0-9 _ . -", 0);
+        return;
+    }
+    if (!c->admin) {
+        send_error(c, "only an admin can create chats", 0);
+        return;
+    }
+    if (!take_request(c))
+        return;
+    struct room r = { 0 };
+    chat_verifier(p + k, r.hash);
+    char msg[64 + HUSH_NAME_MAX];
+    if (room_by_label(label) || room_find(r.hash)) {
+        snprintf(msg, sizeof msg, "there is already a chat called %s", label);
+        send_error(c, msg, 0);
+        return;
+    }
+    strcpy(r.label, label);
+    room_add(&r);
+    if (file_write(keys_path, keys_write) != 0) {
+        note("cannot write %s: %s", keys_path, strerror(errno));
+        nrooms--;
+        send_error(c, "the server could not save the new chat", 0);
+        return;
+    }
+    file_changed(keys_path, &keys_st); /* already up to date */
+    note("%s: %s created the chat %s", c->addr, c->name, label);
+    struct buf b = { 0 };
+    name_put(&b, label);
+    send_to(c, T_CREATED, b.data, b.len);
+    buf_free(&b);
+}
+
 static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_t n)
 {
     if (c->st == ST_HELLO && type == T_HELLO)
@@ -1143,6 +1192,8 @@ static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_
         on_fetch(c, p, n);
     else if (c->st == ST_READY && type == T_DECIDE)
         on_decide(c, p, n);
+    else if (c->st == ST_READY && type == T_NEWCHAT)
+        on_newchat(c, p, n);
     else
         send_error(c, "protocol violation", 1);
 }
@@ -1424,17 +1475,12 @@ static void cmd_newkey(const char *label)
     keys_load();
     if (room_by_label(label))
         die("there is already a key called %s (hushd revoke %s to replace it)", label, label);
-    static const char alphabet[] = "0123456789abcdefghjkmnpqrstvwxyz";
-    char key[HUSH_KEY_CHARS + HUSH_KEY_CHARS / 4], *o = key;
-    for (int i = 0; i < HUSH_KEY_CHARS; i++) {
-        if (i && i % 4 == 0)
-            *o++ = '-';
-        *o++ = alphabet[randombytes_uniform(sizeof alphabet - 1)];
-    }
-    *o = '\0';
+    char key[HUSH_KEY_CHARS + HUSH_KEY_CHARS / 4];
     uint8_t token[32];
     struct room r = { 0 };
-    chat_key_derive(key, strlen(key), token, NULL);
+    chat_key_new(key);
+    if (chat_key_derive(key, strlen(key), token, NULL) != 0)
+        die("not enough memory to derive the key (Argon2id needs 128 MB)");
     chat_verifier(token, r.hash);
     strcpy(r.label, label);
     room_add(&r);
@@ -1707,7 +1753,10 @@ static void cmd_export(const char *label, const char *dir)
     char key[HUSH_KEY_MAX + 2];
     uint8_t token[32], chat_key[32], chat_id[32], check[32];
     read_chat_key(key, sizeof key);
-    if (chat_key_derive(key, strlen(key), token, chat_key) != 0)
+    int bad = chat_key_derive(key, strlen(key), token, chat_key);
+    if (bad == -2)
+        die("not enough memory to derive the key (Argon2id needs 128 MB)");
+    if (bad)
         die("that isn't a chat key");
     sodium_memzero(key, sizeof key);
     chat_verifier(token, check);

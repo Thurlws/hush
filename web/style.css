@@ -79,7 +79,7 @@ header b { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-sp
   display: inline-block; min-width: 1.5em; margin-left: .3em; padding: 0 .4em; border-radius: 1em;
   background: var(--warn); color: #fff; font-size: .8em; text-align: center;
 }
-#waitlist {
+.panel {
   position: fixed; z-index: 5; top: 3.4em; right: 16px; width: min(440px, calc(100% - 32px));
   max-height: calc(100% - 5em); overflow-y: auto; padding: .8em 1em;
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 30px rgba(0, 0, 0, .25);
@@ -90,7 +90,11 @@ header b { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-sp
 .who-box { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .request .who { font-weight: 600; }
 .request .fp { color: var(--dim); font-size: .85em; overflow-wrap: anywhere; }
-.request .approve { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.approve { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.panel .row { display: flex; gap: .5em; margin-top: .4em; }
+.panel label { display: block; margin: .6em 0 0; }
+.error { min-height: 1.2em; margin: .5em 0 0; color: var(--warn); font-size: .9em; }
+#newchat-key { user-select: all; margin: .2em 0 .6em; font-size: 1.4em; }
 #log { flex: 1; overflow-y: auto; padding: .8em 16px; }
 #msgs > div { white-space: pre-wrap; overflow-wrap: anywhere; }
 #older { display: block; margin: 0 auto .8em; color: var(--dim); }

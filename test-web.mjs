@@ -3,7 +3,7 @@
 //   node test-web.mjs NAME KEY URL ORIGIN [IDENTITY-FILE]
 // Besides the chat commands: "/img FILE [caption]" sends an image as is,
 // "/save FILE" saves the newest image seen, and "/mydata FILE" writes what
-// "My data" would put in messages.json.
+// "My data" would put in messages.json. "/newchat NAME" creates a chat (admins).
 import { readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import sodium from "./web/sodium.mjs";
@@ -66,6 +66,9 @@ async function run(l) {
       const mime = { jpg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp" }[img[1].split(".").pop()];
       await s.sendImage(new Uint8Array(readFileSync(img[1])), { mime, width: 1, height: 1, caption: img[2] });
       console.log("image sent");
+    } else if (/^\/newchat /.test(l)) {
+      const { label, key } = await s.createChat(l.slice(9));
+      console.log(`created ${label} with key ${key}`);
     } else if (mine) {
       const items = await s.exportMine();
       writeFileSync(mine[1], JSON.stringify(items.map(m => ({ from: m.from, to: m.to, text: m.text, image: !!m.image })), null, 1));

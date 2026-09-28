@@ -167,10 +167,11 @@ void fingerprint(const uint8_t pk[crypto_sign_PUBLICKEYBYTES], char out[HUSH_FP_
     *o = '\0';
 }
 
+static const char key_alphabet[] = "0123456789abcdefghjkmnpqrstvwxyz";
+
 int chat_key_derive(const char *key, size_t n, uint8_t token[32], uint8_t chat_key[32])
 {
-    static const char alphabet[] = "0123456789abcdefghjkmnpqrstvwxyz";
-    char norm[HUSH_KEY_CHARS];
+    char norm[HUSH_KEY_CHARS_OLD];
     size_t k = 0;
     for (size_t i = 0; i < n; i++) {
         char ch = (char)tolower((unsigned char)key[i]);
@@ -180,19 +181,44 @@ int chat_key_derive(const char *key, size_t n, uint8_t token[32], uint8_t chat_k
             ch = '0';
         else if (ch == 'i' || ch == 'l')
             ch = '1';
-        if (!ch || !strchr(alphabet, ch) || k == HUSH_KEY_CHARS)
+        if (!ch || !strchr(key_alphabet, ch) || k == HUSH_KEY_CHARS_OLD)
             return -1;
         norm[k++] = ch;
     }
-    if (k != HUSH_KEY_CHARS)
-        return -1;
     /* Different BLAKE2b keys make the two outputs unrelated. */
-    if (token)
-        crypto_generichash(token, 32, (const uint8_t *)norm, k, (const uint8_t *)"hush-chat-login-v3", 18);
-    if (chat_key)
-        crypto_generichash(chat_key, 32, (const uint8_t *)norm, k, (const uint8_t *)"hush-chat-crypt-v3", 18);
+    if (k == HUSH_KEY_CHARS_OLD) {
+        if (token)
+            crypto_generichash(token, 32, (const uint8_t *)norm, k, (const uint8_t *)"hush-chat-login-v3", 18);
+        if (chat_key)
+            crypto_generichash(chat_key, 32, (const uint8_t *)norm, k, (const uint8_t *)"hush-chat-crypt-v3", 18);
+    } else if (k == HUSH_KEY_CHARS) {
+        /* 40 bits is little, so every guess has to pay for Argon2id. The salt
+         * is fixed so that every client gets the same keys. */
+        uint8_t master[64];
+        if (crypto_pwhash(master, sizeof master, norm, k, (const uint8_t *)"hush-chat-key-v4", 3, 128u << 20,
+                          crypto_pwhash_ALG_ARGON2ID13) != 0)
+            return -2;
+        if (token)
+            crypto_generichash(token, 32, master, sizeof master, (const uint8_t *)"hush-chat-login-v4", 18);
+        if (chat_key)
+            crypto_generichash(chat_key, 32, master, sizeof master, (const uint8_t *)"hush-chat-crypt-v4", 18);
+        sodium_memzero(master, sizeof master);
+    } else {
+        return -1;
+    }
     sodium_memzero(norm, sizeof norm);
     return 0;
+}
+
+void chat_key_new(char out[HUSH_KEY_CHARS + HUSH_KEY_CHARS / 4])
+{
+    char *o = out;
+    for (int i = 0; i < HUSH_KEY_CHARS; i++) {
+        if (i && i % 4 == 0)
+            *o++ = '-';
+        *o++ = key_alphabet[randombytes_uniform(sizeof key_alphabet - 1)];
+    }
+    *o = '\0';
 }
 
 void chat_verifier(const uint8_t token[32], uint8_t out[32])

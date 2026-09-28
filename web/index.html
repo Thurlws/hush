@@ -21,7 +21,7 @@
   <form id="login-form" autocomplete="off" novalidate>
     <label for="key">Enter key</label>
     <input id="key" maxlength="64" spellcheck="false" autocapitalize="off" autocorrect="off"
-           placeholder="xxxx-xxxx-xxxx-xxxx-xxxx-xxxx">
+           placeholder="xxxx-xxxx">
     <label for="name">Your name</label>
     <input id="name" maxlength="24" spellcheck="false" autocapitalize="off" autocorrect="off"
            placeholder="letters, digits, _ . -">
@@ -49,10 +49,33 @@
   <header>
     <span id="dot"></span><b id="label">hush</b><span id="online"></span>
     <button id="waitlist-btn" type="button" hidden aria-expanded="false" aria-controls="waitlist">Waitlist <span id="waitlist-count" hidden></span></button>
+    <button id="newchat-btn" type="button" hidden aria-expanded="false" aria-controls="newchat">New chat</button>
     <button id="mydata" type="button" title="Download everything you sent here, and the DMs sent to you">My data</button>
     <button id="leave" type="button">Leave</button>
   </header>
-  <div id="waitlist" hidden role="dialog" aria-label="Waitlist">
+  <div id="newchat" class="panel" hidden role="dialog" aria-label="New chat">
+    <div class="panel-head"><b>New chat</b><button id="newchat-close" type="button">Close</button></div>
+    <form id="newchat-form" autocomplete="off">
+      <p class="hint">A new chat gets its own key, made in this browser. The server never sees it.</p>
+      <label for="newchat-name">Name for the chat</label>
+      <div class="row">
+        <input id="newchat-name" maxlength="24" spellcheck="false" autocapitalize="off" placeholder="letters, digits, _ . -">
+        <button id="newchat-create" type="submit">Create</button>
+      </div>
+      <p id="newchat-error" class="error" role="alert"></p>
+    </form>
+    <div id="newchat-result" hidden>
+      <p>Key for <b id="newchat-label"></b>:</p>
+      <p id="newchat-key" class="fp-big"></p>
+      <p class="hint">Give it to the people you want in this chat. It isn't stored on the server, so keep it;
+        it's also saved in your list of chats on this browser.</p>
+      <div class="row">
+        <button id="newchat-copy" type="button">Copy</button>
+        <button id="newchat-join" type="button" class="approve">Join it now</button>
+      </div>
+    </div>
+  </div>
+  <div id="waitlist" class="panel" hidden role="dialog" aria-label="Waitlist">
     <div class="panel-head"><b>Waitlist</b><button id="waitlist-close" type="button">Close</button></div>
     <p class="hint">Check each fingerprint with the person (e.g. on a call) before you let them in.</p>
     <div id="waitlist-list"></div>

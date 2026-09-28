@@ -107,7 +107,9 @@ Names and fingerprints stay the same. People who were already in a chat don't ha
 
 ## Managing chats
 
-Each key opens one chat. Only whoever can run `hushd` on the server can create keys.
+Each key opens one chat, and looks like `k3x7-9fqa`. Admins create chats in the page with the
+**New chat** button (or `/newchat NAME` in the terminal): the key is made on their device, and the
+server only ever gets a hash of a value derived from it. On the server:
 
 ```sh
 hushd newkey NAME     # new chat; prints its key once (the server keeps only a hash)
@@ -182,6 +184,7 @@ Back it up. If you lose it, your friends will get a "key changed" warning.
 | `/trust NAME` | accept NAME's new key after it changed |
 | `/quit` | leave (also the Leave button, or Ctrl-C in the terminal) |
 | `/waiting`, `/approve NAME`, `/deny NAME` | admins: the waitlist |
+| `/newchat NAME` | admins: create a chat and get its key (terminal; the page has a New chat button) |
 
 In the browser, chats you've joined are saved on the login page: click one to rejoin, or
 **+ Add session** to join another with its key. Send an image with the **+** button or by pasting it; whatever is typed in the box
@@ -222,7 +225,9 @@ or pose as your friends without you getting a loud warning.
 
 ## Server hardening
 
-- The chat key is 120 random bits. The server stores only a hash of a value derived from it, in a `0600` file.
+- A chat key is 40 random bits, stretched with Argon2id (128 MB, 3 passes) before anything is derived
+  from it, so every guess costs real time and memory. The server stores only a hash of the login token,
+  in a `0600` file. Guessing keys by logging in is capped by the rate limits below.
 - Rate limits per IP address (per /64 for IPv6): new connections and page requests (burst of 30,
   then one every 2 seconds), open connections (16), wrong chat keys (5, then one a minute) and
   uploaded bytes (100 MB, then 1 MB a second), plus messages and requests per connection.
@@ -251,6 +256,10 @@ This is a hobby project, not a professional security audit. Specifically:
   leak messages from browser users. That's true of any web-based encrypted chat. The terminal client
   doesn't have this problem, and fingerprint checks still catch key swaps.
 - Use HTTPS. Over plain HTTP, anyone on the network path could change the page on its way to your friends.
+- Chat keys are short so they're easy to share. Guessing one by logging in would take years at the
+  rate limits, but someone who steals the server's files can try keys offline; Argon2id makes that
+  cost thousands of CPU-years per chat, not seconds. Keys made before keys got shorter (24 characters)
+  are much stronger and keep working.
 - **Anyone with a chat key can read that chat's whole history**, including what was said before they
   joined. If a key leaks, `hushd revoke` it (which deletes the history) and make a new one.
 - The waitlist keeps people out of the server, not out of the encryption: someone who has the chat key

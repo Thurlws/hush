@@ -1,11 +1,12 @@
-libsodium.js 0.8.4 (https://github.com/jedisct1/libsodium.js), ISC license.
+libsodium.js 0.8.4, sumo build (https://github.com/jedisct1/libsodium.js), ISC license.
+The sumo build is used for Argon2id (crypto_pwhash).
 
-libsodium.mjs  = npm libsodium@0.8.4          dist/modules-esm/libsodium.mjs
-sodium.mjs     = npm libsodium-wrappers@0.8.4 dist/modules-esm/libsodium-wrappers.mjs,
-                 with its import of "libsodium" changed to "./libsodium.mjs".
+libsodium.mjs  = npm libsodium-sumo@0.8.4          dist/modules-sumo-esm/libsodium-sumo.mjs
+sodium.mjs     = npm libsodium-wrappers-sumo@0.8.4 dist/modules-sumo-esm/libsodium-wrappers.mjs,
+                 with its import of "libsodium-sumo" changed to "./libsodium.mjs".
 
 sha256 of the files as shipped here:
-29087d1719326c68006fe88cd110110e6c198ea078bd9c417ba3975875c89819  libsodium.mjs
+4c94708f7e78eac7a32b29e2ce0ff96f4bd599d78c129f27bf8a061e20776c8c  libsodium.mjs
 8f16ccb6411bea6fb4e15f46e01e64dd65ef80efeaf079e21f7996f0252ad77e  sodium.mjs
 
 Copyright (c) 2015-2026

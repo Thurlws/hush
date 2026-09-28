@@ -82,6 +82,8 @@ static int more_history;
 static int am_admin;
 static char waiting[WAITING_MAX][HUSH_NAME_MAX + 1];
 static size_t nwaiting;
+/* /newchat: the key we made, shown once the server has the chat */
+static char new_key[HUSH_KEY_CHARS + HUSH_KEY_CHARS / 4], new_label[HUSH_NAME_MAX + 1];
 
 /* One image going up, one coming down. */
 static struct {
@@ -905,6 +907,43 @@ static void cmd_decide(const char *name, int approve)
     buf_free(&b);
 }
 
+static void cmd_newchat(const char *label)
+{
+    if (!am_admin) {
+        say("! only an admin can create chats");
+        return;
+    }
+    if (!name_valid(label, strlen(label))) {
+        say("usage: /newchat NAME   (1-24 of A-Z a-z 0-9 _ . -)");
+        return;
+    }
+    /* The key is made here; the server only ever gets its login token. */
+    uint8_t tok[32];
+    chat_key_new(new_key);
+    if (chat_key_derive(new_key, strlen(new_key), tok, NULL) != 0) {
+        say("! not enough memory to make a key");
+        return;
+    }
+    strcpy(new_label, label);
+    struct buf b = { 0 };
+    name_put(&b, label);
+    buf_put(&b, tok, sizeof tok);
+    net_send(T_NEWCHAT, &b);
+    buf_free(&b);
+}
+
+static void on_created(const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1];
+    if (name_get(p, n, label) < 0 || strcmp(label, new_label))
+        return;
+    say("%sCreated the chat \"%s\". Its key: %s%s\n"
+        "  Give it to the people you want in there. It isn't stored anywhere, so keep it.",
+        col("\033[1;32m"), label, new_key, col("\033[0m"));
+    sodium_memzero(new_key, sizeof new_key);
+    new_label[0] = '\0';
+}
+
 static void cmd_waiting(void)
 {
     if (!am_admin) {
@@ -1229,6 +1268,8 @@ static void process_frames(void)
             on_blob(p, n);
         else if (type == T_PENDING)
             on_pending(p, n);
+        else if (type == T_CREATED)
+            on_created(p, n);
         else if (type == T_ERROR) {
             char msg[HUSH_MAX_FRAME + 1];
             sanitize(p, n, msg);
@@ -1279,7 +1320,8 @@ static void cmd_help(void)
         say("As an admin:\n"
             "  /waiting         who's waiting to join\n"
             "  /approve NAME    let NAME in (check their fingerprint first)\n"
-            "  /deny NAME       turn NAME away");
+            "  /deny NAME       turn NAME away\n"
+            "  /newchat NAME    create a chat and get its key");
 }
 
 static void cmd_who(void)
@@ -1421,6 +1463,8 @@ static void submit(void)
             cmd_mydata();
         else if (!strcmp(cmd, "waiting"))
             cmd_waiting();
+        else if (!strcmp(cmd, "newchat"))
+            cmd_newchat(arg);
         else if (!strcmp(cmd, "approve"))
             cmd_decide(arg, 1);
         else if (!strcmp(cmd, "deny"))
@@ -1599,8 +1643,11 @@ int main(int argc, char **argv)
         strcpy(chat_key_text, key);
     else
         prompt_key();
-    if (chat_key_derive(chat_key_text, strlen(chat_key_text), token, chat_key) != 0)
-        die("that isn't a chat key (it looks like xxxx-xxxx-xxxx-xxxx-xxxx-xxxx)");
+    int bad = chat_key_derive(chat_key_text, strlen(chat_key_text), token, chat_key);
+    if (bad == -2)
+        die("not enough memory to read the chat key (Argon2id needs 128 MB)");
+    if (bad)
+        die("that isn't a chat key (it looks like xxxx-xxxx)");
     sodium_memzero(chat_key_text, sizeof chat_key_text);
     crypto_generichash(chat_id, sizeof chat_id, chat_key, sizeof chat_key, NULL, 0);
 

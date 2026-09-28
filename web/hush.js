@@ -4,9 +4,9 @@
 // this in Node.
 
 const T = {
-  HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6, DECIDE: 7,
+  HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6, DECIDE: 7, NEWCHAT: 8,
   CHALLENGE: 10, WELCOME: 11, PEER: 12, LEAVE: 13, MSG: 14, ERROR: 15, HISTORY_END: 16, UPLOADED: 17, BLOB: 18,
-  WAITING: 19, PENDING: 20,
+  WAITING: 19, PENDING: 20, CREATED: 21,
 };
 const HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2, WELCOME_ADMIN = 1;
 const PEER_ONLINE = 1, PEER_NEW = 2, UP_FIRST = 1, UP_LAST = 2, BLOB_LAST = 1, BLOB_MISSING = 2;
@@ -29,24 +29,50 @@ export function fingerprint(sodium, pk) {
   return sodium.to_hex(sodium.crypto_generichash(16, pk)).match(/.{4}/g).join(" ");
 }
 
-// The login token (all the server sees) and the chat's encryption key, from
-// a chat key as typed. Same rules as chat_key_derive() in src/proto.c.
-export function deriveChatKey(sodium, typed) {
-  const alphabet = "0123456789abcdefghjkmnpqrstvwxyz";
+const KEY_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
+
+// A chat key as typed, normalised: case, dashes and spaces don't matter, and
+// o, i and l count as 0, 1 and 1. null if it can't be a key. Keys are 8
+// characters; ones made before keys got shorter have 24.
+export function normalizeKey(typed) {
   let norm = "";
   for (let ch of typed.toLowerCase()) {
     if (ch === "-" || ch === " ") continue;
     if (ch === "o") ch = "0";
     else if (ch === "i" || ch === "l") ch = "1";
-    if (!alphabet.includes(ch) || norm.length === 24) return null;
+    if (!KEY_ALPHABET.includes(ch) || norm.length === 24) return null;
     norm += ch;
   }
-  if (norm.length !== 24) return null;
-  const n = enc.encode(norm);
-  return {
-    token: sodium.crypto_generichash(32, n, enc.encode("hush-chat-login-v3")),
-    chatKey: sodium.crypto_generichash(32, n, enc.encode("hush-chat-crypt-v3")),
-  };
+  return norm.length === 8 || norm.length === 24 ? norm : null;
+}
+
+// A new random chat key, as xxxx-xxxx.
+export function newChatKey(sodium) {
+  let k = "";
+  for (let i = 0; i < 8; i++) k += (i === 4 ? "-" : "") + KEY_ALPHABET[sodium.randombytes_uniform(32)];
+  return k;
+}
+
+// The login token (all the server sees) and the chat's encryption key, from
+// a chat key as typed. Same as chat_key_derive() in src/proto.c: short keys
+// go through Argon2id (a tenth of a second or so), so results are kept.
+const derived = new Map();
+export function deriveChatKey(sodium, typed) {
+  const norm = normalizeKey(typed);
+  if (!norm) return null;
+  if (derived.has(norm)) return derived.get(norm);
+  const gh = (data, ctx) => sodium.crypto_generichash(32, data, enc.encode(ctx));
+  let out;
+  if (norm.length === 24) {
+    out = { token: gh(enc.encode(norm), "hush-chat-login-v3"), chatKey: gh(enc.encode(norm), "hush-chat-crypt-v3") };
+  } else {
+    const master = sodium.crypto_pwhash(64, enc.encode(norm), enc.encode("hush-chat-key-v4"), 3, 128 * 1024 * 1024,
+                                        sodium.crypto_pwhash_ALG_ARGON2ID13);
+    out = { token: gh(master, "hush-chat-login-v4"), chatKey: gh(master, "hush-chat-crypt-v4") };
+    master.fill(0);
+  }
+  derived.set(norm, out);
+  return out;
 }
 
 // Untrusted text is only ever shown with textContent, but it could still
@@ -113,6 +139,7 @@ export class Session {
     this.admin = false;
     this.pending = new Map(); // admins: name -> fingerprint of people waiting
     this.exporting = null;
+    this.creating = null;
     this.fetches = new Map(); // blob id hex -> {image, resolve, reject, parts, size}
     this.fetchQueue = [];
     this.ws = new WS(url);
@@ -124,6 +151,7 @@ export class Session {
       const err = new Error("disconnected");
       if (this.upload) this.upload.reject(err);
       if (this.exporting) this.exporting.reject(err);
+      if (this.creating) this.creating.reject(err);
       for (const f of this.fetches.values()) f.reject(err);
       for (const f of this.fetchQueue) f.reject(err);
       this.fetches.clear();
@@ -160,6 +188,10 @@ export class Session {
     if (type === T.ERROR) {
       this.lastError = clean(dec.decode(p));
       if (this.upload && /image/.test(this.lastError)) this.upload.reject(new Error(this.lastError));
+      if (this.creating && /chat/.test(this.lastError)) {
+        this.creating.reject(new Error(this.lastError));
+        this.creating = null;
+      }
       this.emit({ type: "error", text: this.lastError });
     } else if (!this.ready) {
       if (type === T.CHALLENGE && p.length === 32) {
@@ -186,6 +218,24 @@ export class Session {
     else if (type === T.UPLOADED && p.length === 16 && this.upload) this.upload.resolve(p.slice());
     else if (type === T.BLOB && p.length >= 17) this.onBlob(p);
     else if (type === T.PENDING) this.onPending(p);
+    else if (type === T.CREATED && this.creating && readName(p) && readName(p)[0] === this.creating.label) {
+      const { label, key, resolve } = this.creating;
+      this.creating = null;
+      resolve({ label, key });
+    }
+  }
+
+  // Admins: make a new chat. The key is made here and only its login token
+  // goes to the server. Resolves to {label, key}.
+  createChat(label) {
+    if (!this.admin) return Promise.reject(new Error("only an admin can create chats"));
+    if (!NAME_RE.test(label)) return Promise.reject(new Error("a chat name is 1-24 letters, digits, _ . or -"));
+    if (this.creating) return Promise.reject(new Error("already creating a chat"));
+    const key = newChatKey(this.s), { token } = deriveChatKey(this.s, key);
+    return new Promise((resolve, reject) => {
+      this.creating = { label, key, resolve, reject };
+      this.send(T.NEWCHAT, nameBytes(label), token);
+    });
   }
 
   onPending(p) {
@@ -481,7 +531,8 @@ export class Session {
       (this.admin ? "\nAs an admin:\n" +
         "  /waiting         who's waiting to join\n" +
         "  /approve NAME    let NAME in (check their fingerprint first)\n" +
-        "  /deny NAME       turn NAME away" : ""));
+        "  /deny NAME       turn NAME away\n" +
+        "Create chats with the New chat button." : ""));
   }
 
   listWaiting() {

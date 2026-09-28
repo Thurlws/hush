@@ -4,10 +4,13 @@
  * where length covers type + payload. Browsers send the same frames
  * without the length, one per binary WebSocket message.
  *
- * Chat keys. The admin creates one per chat with `hushd newkey`. Clients
- * derive two unrelated values from it: a login token, which is all the
- * server ever sees (and it stores only a hash of that), and the chat's
- * encryption key, which never leaves the clients.
+ * Chat keys. An admin creates one per chat (`hushd newkey`, or NEWCHAT
+ * from the web page). Clients derive two unrelated values from it: a login
+ * token, which is all the server ever sees (and it stores only a hash of
+ * that), and the chat's encryption key, which never leaves the clients.
+ * Keys are 8 characters (40 bits) and go through Argon2id first, so each
+ * guess against stolen server files is slow; older 24-character keys
+ * (120 bits) are used as they are.
  *
  * Handshake (client -> server -> client):
  *   HELLO     name, ed25519 public key, login token
@@ -50,7 +53,8 @@
 #define HUSH_CHALLENGE_LEN 32
 #define HUSH_AUTH_CONTEXT  "hush-auth-v3"
 #define HUSH_MSG_CONTEXT   "hush-msg-v3"
-#define HUSH_KEY_CHARS     24 /* chat key: Crockford base32, 120 random bits */
+#define HUSH_KEY_CHARS     8  /* chat key: Crockford base32, 40 random bits */
+#define HUSH_KEY_CHARS_OLD 24 /* keys made before they got shorter: 120 bits */
 #define HUSH_KEY_MAX       64 /* as typed, dashes and spaces allowed */
 #define HUSH_FP_LEN        40 /* 32 hex digits in groups of 4, plus NUL */
 #define HUSH_MAX_TEXT      4000
@@ -69,6 +73,7 @@ enum {
     T_UPLOAD = 5,  /* u8 flags (UP_FIRST, UP_LAST), data */
     T_FETCH = 6,   /* blob id[16] */
     T_DECIDE = 7,  /* admins: u8 approve, name */
+    T_NEWCHAT = 8, /* admins: chat label, login token[32] of a key the client made */
     /* server -> client */
     T_CHALLENGE = 10,   /* challenge[32] */
     T_WELCOME = 11,     /* chat label (same rules as a name), u8 flags (WELCOME_ADMIN) */
@@ -81,6 +86,7 @@ enum {
     T_BLOB = 18,        /* blob id[16], u8 status (BLOB_*), data */
     T_WAITING = 19,     /* chat label: you're on the waitlist */
     T_PENDING = 20,     /* admins: u8 waiting (1) or decided (0), name, pk[32] */
+    T_CREATED = 21,     /* admins: chat label, after NEWCHAT */
 };
 
 enum { PEER_ONLINE = 1, PEER_NEW = 2 };
@@ -126,9 +132,12 @@ void fingerprint(const uint8_t pk[crypto_sign_PUBLICKEYBYTES], char out[HUSH_FP_
 
 /* Read a chat key as typed (case, dashes and spaces don't matter; o, i
  * and l count as 0, 1 and 1) and derive its login token and the chat's
- * encryption key. Either output may be NULL. Returns -1 if it can't be a key. */
+ * encryption key. Either output may be NULL. Returns -1 if it can't be a
+ * key, -2 if there wasn't enough memory for Argon2id. */
 int chat_key_derive(const char *key, size_t n, uint8_t token[32], uint8_t chat_key[32]);
 /* What the server stores for a login token. */
 void chat_verifier(const uint8_t token[32], uint8_t out[32]);
+/* A new random chat key, as xxxx-xxxx. */
+void chat_key_new(char out[HUSH_KEY_CHARS + HUSH_KEY_CHARS / 4]);
 
 __attribute__((noreturn, format(printf, 1, 2))) void die(const char *fmt, ...);

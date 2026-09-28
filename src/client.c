@@ -59,6 +59,7 @@ static struct peer peers[MAX_PEERS];
 static size_t npeers;
 
 static char my_name[HUSH_NAME_MAX + 1];
+static char chat_key[HUSH_KEY_MAX + 2], chat_label[HUSH_NAME_MAX + 1];
 static uint8_t my_pk[crypto_sign_PUBLICKEYBYTES], my_sk[crypto_sign_SECRETKEYBYTES];
 static uint8_t my_xsk[crypto_scalarmult_BYTES];
 static uint64_t my_ctr;
@@ -369,9 +370,14 @@ static void handshake(void)
     const uint8_t *p;
     size_t n, fs;
 
+    uint8_t kl = (uint8_t)strlen(chat_key);
     name_put(&b, my_name);
     buf_put(&b, my_pk, sizeof my_pk);
+    buf_put(&b, &kl, 1);
+    buf_put(&b, chat_key, kl);
     net_send(T_HELLO, &b);
+    sodium_memzero(b.data, b.len);
+    sodium_memzero(chat_key, sizeof chat_key);
 
     expect(T_CHALLENGE, &p, &n, &fs);
     if (n != HUSH_CHALLENGE_LEN)
@@ -389,6 +395,8 @@ static void handshake(void)
     buf_free(&b);
 
     expect(T_WELCOME, &p, &n, &fs);
+    if (name_get(p, n, chat_label) < 0)
+        die("bad welcome from server");
     buf_consume(&rx, fs);
 }
 
@@ -835,11 +843,34 @@ static void on_signal(int sig)
     running = 0;
 }
 
+/* Ask for the chat key on the terminal without echoing it. */
+static void prompt_key(void)
+{
+    if (!isatty(STDIN_FILENO))
+        die("no chat key: use -k KEY or set HUSH_KEY");
+    struct termios t, off;
+    int hide = tcgetattr(STDIN_FILENO, &t) == 0;
+    fputs("chat key: ", stderr);
+    if (hide) {
+        off = t;
+        off.c_lflag &= ~(tcflag_t)ECHO;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &off);
+    }
+    char *ok = fgets(chat_key, sizeof chat_key, stdin);
+    if (hide)
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
+    fputc('\n', stderr);
+    if (!ok)
+        die("no chat key given");
+    chat_key[strcspn(chat_key, "\r\n")] = '\0';
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: hush [-n name] host[:port]   e.g.  hush -n alice 100.64.0.1\n"
-                    "       hush [-n name] host port\n"
+    fprintf(stderr, "usage: hush [-n name] [-k key] host[:port]   e.g.  hush -n alice 203.0.113.7\n"
+                    "       hush [-n name] [-k key] host port\n"
                     "  -n name  your chat name (default: $USER)\n"
+                    "  -k key   the chat key you were given (or set HUSH_KEY; asked for if missing)\n"
                     "  host     IP address or hostname of the machine running hushd\n"
                     "  port     defaults to " HUSH_DEFAULT_PORT "\n");
     exit(2);
@@ -847,11 +878,13 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-    const char *name = getenv("USER");
+    const char *name = getenv("USER"), *key = getenv("HUSH_KEY");
     int opt;
-    while ((opt = getopt(argc, argv, "n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "n:k:h")) != -1) {
         if (opt == 'n')
             name = optarg;
+        else if (opt == 'k')
+            key = optarg;
         else
             usage();
     }
@@ -889,6 +922,14 @@ int main(int argc, char **argv)
     if (!name || !name_valid(name, strlen(name)))
         die("pick a name with -n (1-24 of A-Z a-z 0-9 _ . -)");
     strcpy(my_name, name);
+    if (key && strlen(key) > HUSH_KEY_MAX)
+        die("that chat key is too long");
+    if (key && *key)
+        strcpy(chat_key, key);
+    else
+        prompt_key();
+    if (!*chat_key || strlen(chat_key) > HUSH_KEY_MAX)
+        die("that chat key is not valid");
 
     if (sodium_init() < 0)
         die("libsodium failed to initialise");
@@ -916,8 +957,8 @@ int main(int argc, char **argv)
     interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     char fp[HUSH_FP_LEN];
     fingerprint(my_pk, fp);
-    say("%sconnected to %s:%s as %s%s\nyour fingerprint: %s\ntype /help for commands",
-        col("\033[1m"), host, port, my_name, col("\033[0m"), fp);
+    say("%sconnected to %s:%s as %s, chat: %s%s\nyour fingerprint: %s\ntype /help for commands",
+        col("\033[1m"), host, port, my_name, chat_label, col("\033[0m"), fp);
     if (interactive)
         term_raw();
     ui_ready = 1;

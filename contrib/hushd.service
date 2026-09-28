@@ -1,0 +1,40 @@
+# systemd unit for hushd behind a reverse proxy (see README).
+# Install: sudo cp contrib/hushd.service /etc/systemd/system/ && sudo systemctl enable --now hushd
+[Unit]
+Description=hush chat server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hush
+Group=hush
+WorkingDirectory=/var/lib/hush
+ExecStart=/usr/local/bin/hushd -x
+Restart=on-failure
+UMask=0077
+
+# hushd needs nothing but its own directory and the network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hush
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

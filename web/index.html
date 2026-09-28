@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>hush</title>
+<link rel="stylesheet" href="/style.css">
+<script type="module" src="/app.js"></script>
+</head>
+<body>
+<main id="login">
+  <form id="login-form" autocomplete="off" novalidate>
+    <h1>hush</h1>
+    <p class="sub">End-to-end encrypted chat</p>
+    <label for="key">Enter key</label>
+    <input id="key" maxlength="64" spellcheck="false" autocapitalize="off" autocorrect="off"
+           placeholder="xxxx-xxxx-xxxx-xxxx-xxxx-xxxx">
+    <label for="name">Your name</label>
+    <input id="name" maxlength="24" spellcheck="false" autocapitalize="off" autocorrect="off"
+           placeholder="letters, digits, _ . -">
+    <button id="join" type="submit" disabled>Loading…</button>
+    <p id="login-error" role="alert"></p>
+    <p class="fine">Your fingerprint<br><span id="myfp">…</span></p>
+  </form>
+  <noscript>hush needs JavaScript: your messages are encrypted in the browser.</noscript>
+</main>
+
+<div id="chat" hidden>
+  <header>
+    <span id="dot"></span><b id="label">hush</b><span id="online"></span>
+    <button id="leave" type="button">Leave</button>
+  </header>
+  <div id="log" aria-live="polite"></div>
+  <form id="send-form" autocomplete="off">
+    <input id="msg" maxlength="4000" placeholder="message, or /help" aria-label="message">
+  </form>
+</div>
+</body>
+</html>

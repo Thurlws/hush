@@ -1,0 +1,7 @@
+# build output
+hush
+hushd
+src/*.o
+
+# server state (name -> key registrations)
+hushd-users.txt

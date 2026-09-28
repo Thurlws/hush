@@ -1,7 +1,7 @@
 # hush
 
 End-to-end encrypted group chat for you and your friends, in C. Chat in the browser or in the terminal,
-with history, private messages and images.
+with history, private messages and images. New people wait on a waitlist until you let them in.
 
 - `hushd` is the server. It serves the web page and stores and passes on encrypted messages and
   images, which it cannot read. Only the person running it can create the keys that let people into a chat.
@@ -30,7 +30,14 @@ make
 ./hushd                    # web page on port 8080, terminal clients on port 7777
 ```
 
-Open `http://SERVER-IP:8080`, enter the key and a name, and you're in. Give the key to your friends.
+Open `http://SERVER-IP:8080`. The login page shows **your fingerprint**; make yourself admin with it,
+then enter the key and a name:
+
+```sh
+./hushd admin "6937 b1d5 6e73 e529 69b1 ba58 820e f284"     # your fingerprint from the login page
+```
+
+Give the key to your friends. When they join, they wait until you approve them in the chat.
 
 ## Running it on a VPS
 
@@ -73,10 +80,12 @@ This is the setup for a small cloud server, e.g. an Oracle Cloud free VM. You ge
    The service runs `hushd -x`, which makes it trust the `X-Forwarded-For` header from Caddy,
    so the rate limits apply to each visitor's real address.
 
-5. **Create a chat key** and give it to your friends:
+5. **Create a chat key and make yourself admin.** Open your site; the login page shows your fingerprint.
    ```sh
    sudo -u hush hushd -C /var/lib/hush newkey friends
+   sudo -u hush hushd -C /var/lib/hush admin "YOUR FINGERPRINT"
    ```
+   Join with the key, then give it to your friends. Each of them waits until you approve them.
 
 Logs: `journalctl -u hushd -f`. Everything the server keeps is in `/var/lib/hush`; back that up.
 
@@ -91,9 +100,10 @@ first), make each chat a new key and send it to your friends again:
 sudo -u hush hushd -C /var/lib/hush keys             # old keys are marked as old
 sudo -u hush hushd -C /var/lib/hush revoke friends
 sudo -u hush hushd -C /var/lib/hush newkey friends
+sudo -u hush hushd -C /var/lib/hush admin "YOUR FINGERPRINT"
 ```
 
-Names and fingerprints stay the same.
+Names and fingerprints stay the same. People who were already in a chat don't have to be approved again.
 
 ## Managing chats
 
@@ -109,6 +119,38 @@ hushd forget USER     # free up a name, e.g. when a friend lost their browser da
 
 A running server picks up these changes by itself. Add `-C DIR` to work on the files in DIR;
 for the VPS setup above that's `sudo -u hush hushd -C /var/lib/hush ...`.
+
+### Admins and the waitlist
+
+Admins are identity keys, not names, so nobody becomes admin by picking your name. Everyone's
+fingerprint is on their login page, and in `/fp`.
+
+```sh
+hushd admin "FINGERPRINT"     # that key is admin in every chat, and never waits
+hushd unadmin "FINGERPRINT"
+hushd admins                  # list them
+```
+
+The first time someone joins a chat, they land on a waiting screen and see nothing of the chat.
+Admins in the chat get a request with the person's name and fingerprint, and **Approve** / **Deny**
+buttons (in the terminal: `/approve NAME`, `/deny NAME`, `/waiting`). Check the fingerprint with them
+before approving, e.g. over a call. Denied people can't try again. Without being online:
+
+```sh
+hushd pending                 # who's waiting for which chat
+hushd approve CHAT NAME       # they get in within a second if they're waiting right now
+hushd deny CHAT NAME
+```
+
+### Getting the data out
+
+- **Everyone:** the **My data** button downloads a zip of everything you sent in the chat and every DM
+  sent to you, with your images, decrypted in your browser. In the terminal, `/mydata` saves the same
+  to a folder in `~/Downloads`.
+- **The operator:** `hushd export CHAT DIR` asks for the chat's key and decrypts the whole chat into
+  `DIR`: `messages.txt` (readable), `messages.json` (with signature checks) and `images/`. DMs can't
+  be opened with the chat key, so they're listed without their contents. The folder is the chat in
+  plain form: copy it off the server and delete it there.
 
 Messages and images are kept until you `clear` or `revoke` the chat. Uploads are refused
 while the disk has less than 1 GB free.
@@ -139,12 +181,13 @@ Back it up. If you lose it, your friends will get a "key changed" warning.
 | `/verify NAME` | mark NAME as verified after comparing fingerprints |
 | `/trust NAME` | accept NAME's new key after it changed |
 | `/quit` | leave (also the Leave button, or Ctrl-C in the terminal) |
+| `/waiting`, `/approve NAME`, `/deny NAME` | admins: the waitlist |
 
 In the browser, send an image with the **+** button or by pasting it; whatever is typed in the box
 goes along as its caption. Click an image to see it full size and save it. **Load older messages** at the top goes back in time.
 
 In the terminal: `/img FILE [caption]` sends an image (jpeg, png, gif or webp, up to 25 MB),
-`/save N` saves image N to `~/Downloads`, and `/more` shows older messages.
+`/save N` saves image N to `~/Downloads`, `/more` shows older messages, and `/mydata` saves your data.
 
 Verify your friends once. On a call (or in person), each of you reads out
 the fingerprint from `/fp`, checks it against what `/fp THEIRNAME` shows, and then runs
@@ -169,6 +212,7 @@ or pose as your friends without you getting a loud warning.
   which removes hidden data like the GPS position phones store in them.
 - The server keeps messages in SQLite and images as files, all encrypted. It knows who sent what to
   which chat or person, and when, but not what it says.
+- The waitlist is enforced by the server: it sends people nothing from a chat until they're approved.
 - Key pinning (TOFU): your client remembers every friend's key. If the server ever hands you a
   different key for them, the client warns you loudly and refuses to show their messages or send
   them DMs until you `/trust` it.
@@ -208,6 +252,8 @@ This is a hobby project, not a professional security audit. Specifically:
 - Use HTTPS. Over plain HTTP, anyone on the network path could change the page on its way to your friends.
 - **Anyone with a chat key can read that chat's whole history**, including what was said before they
   joined. If a key leaks, `hushd revoke` it (which deletes the history) and make a new one.
+- The waitlist keeps people out of the server, not out of the encryption: someone who has the chat key
+  and also gets a copy of the server's files could read the chat without ever being approved.
 - History is kept forever unless you `clear` it, and there's no forward secrecy: whoever gets both a copy
   of the server's files and the chat key (or, for DMs, one side's identity key) can read everything stored.
 - Members can post junk the server can't tell apart from real messages, since it can't read them.

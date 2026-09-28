@@ -26,11 +26,24 @@
   <noscript>hush needs JavaScript: your messages are encrypted in the browser.</noscript>
 </main>
 
+<main id="waiting" hidden>
+  <div class="card">
+    <h1>hush</h1>
+    <p class="sub">You're on the waitlist</p>
+    <p>An admin of <b id="wait-label"></b> has to let you in. Keep this page open; it opens by itself once they do.</p>
+    <p>They'll see your fingerprint, so they can check it's you:</p>
+    <p id="wait-fp" class="fp-big"></p>
+    <button id="wait-cancel" type="button">Cancel</button>
+  </div>
+</main>
+
 <div id="chat" hidden>
   <header>
     <span id="dot"></span><b id="label">hush</b><span id="online"></span>
+    <button id="mydata" type="button" title="Download everything you sent here, and the DMs sent to you">My data</button>
     <button id="leave" type="button">Leave</button>
   </header>
+  <div id="requests" hidden></div>
   <div id="log">
     <button id="older" type="button" hidden>Load older messages</button>
     <div id="msgs" aria-live="polite"></div>

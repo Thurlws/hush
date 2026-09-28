@@ -1,6 +1,7 @@
 // The page: login form, chat log, input and images. The protocol is in hush.js.
 import sodium from "./sodium.mjs";
 import { Session, NAME_RE, KEY_MAX, MAX_IMAGE, IMAGE_TYPES, fingerprint, publicKey, deriveChatKey } from "./hush.js";
+import { zip } from "./zip.js";
 
 const $ = id => document.getElementById(id);
 
@@ -202,6 +203,86 @@ async function sendImage(file) {
   }
 }
 
+// ---- my data ------------------------------------------------------------------
+
+// Everything you sent here and the DMs sent to you, decrypted in this
+// browser and saved as a zip: messages.json plus the images.
+async function saveMyData() {
+  if (!chat || !chat.ready) return line("warn", "! not connected right now");
+  $("mydata").disabled = true;
+  const status = el("div", "info", "collecting your data…");
+  append(status);
+  try {
+    const items = await chat.exportMine(), files = [], messages = [];
+    let images = 0;
+    for (const m of items) {
+      const e = { id: m.id, time: m.time ? new Date(m.time).toISOString() : undefined, from: m.from, to: m.to || undefined };
+      if (m.error) {
+        e.error = m.error;
+      } else if (m.image) {
+        const name = `images/${m.id}.${IMAGE_TYPES[m.image.mime]}`;
+        status.textContent = `downloading your images… ${++images}`;
+        try {
+          files.push({ name, data: await chat.fetchImage(m.image) });
+          e.image = name;
+        } catch (err) {
+          e.image = null;
+          e.error = err.message;
+        }
+        e.caption = m.image.caption;
+      } else {
+        e.text = m.text;
+      }
+      messages.push(e);
+    }
+    const chatName = $("label").textContent, now = new Date();
+    const doc = { chat: chatName, name: chat.name, fingerprint: myFp, exported: now.toISOString(),
+                  contents: "everything you sent in this chat, and the private messages sent to you", messages };
+    files.unshift({ name: "messages.json", data: new TextEncoder().encode(JSON.stringify(doc, null, 2) + "\n") });
+    const url = URL.createObjectURL(zip(files, now));
+    const a = el("a");
+    a.href = url;
+    a.download = `hush-mydata-${chatName}-${now.toISOString().slice(0, 10)}.zip`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    status.textContent = `saved your data: ${messages.length} messages, ${files.length - 1} images`;
+  } catch (e) {
+    status.className = "warn";
+    status.textContent = `! couldn't save your data: ${e.message}`;
+  } finally {
+    $("mydata").disabled = false;
+  }
+}
+
+// ---- the waitlist ---------------------------------------------------------------
+
+function showRequests() {
+  const box = $("requests");
+  box.replaceChildren();
+  if (chat && chat.admin)
+    for (const [name, fp] of chat.pending) {
+      const row = el("div", "request");
+      const approve = el("button", "approve", "Approve"), deny = el("button", "deny", "Deny");
+      approve.type = deny.type = "button";
+      approve.onclick = () => { approve.disabled = deny.disabled = true; chat.decide(name, true); };
+      deny.onclick = () => { approve.disabled = deny.disabled = true; chat.decide(name, false); };
+      row.append(el("span", "who", `${name} wants to join`), el("span", "fp", fp), approve, deny);
+      box.append(row);
+    }
+  box.hidden = !box.childElementCount;
+}
+
+function showWaiting(label) {
+  $("login").hidden = true;
+  $("chat").hidden = true;
+  $("waiting").hidden = false;
+  $("wait-label").textContent = label;
+  $("wait-fp").textContent = myFp;
+  document.title = "hush · waiting";
+}
+
 // ---- people -------------------------------------------------------------------
 
 function showPeer(ev) {
@@ -236,6 +317,7 @@ function showLogin(err) {
   lastId = 0;
   shown.clear();
   $("chat").hidden = true;
+  $("waiting").hidden = true;
   $("login").hidden = false;
   $("join").disabled = false;
   $("join").textContent = "Join";
@@ -257,8 +339,18 @@ function connect(name, key) {
 }
 
 function onEvent(ev, name, key) {
-  const inChat = !$("chat").hidden;
+  const inChat = !$("chat").hidden, waiting = !$("waiting").hidden;
   switch (ev.type) {
+  case "waiting":
+    retries = 0;
+    local.set("hush.name", name);
+    tab.set("hush.key", key);
+    showWaiting(ev.label);
+    break;
+  case "pending":
+    if (ev.waiting) line("sys", `* ${ev.name} wants to join, with fingerprint ${ev.fp}`);
+    showRequests();
+    break;
   case "ready":
     retries = 0;
     local.set("hush.name", name);
@@ -267,16 +359,19 @@ function onEvent(ev, name, key) {
     $("label").textContent = ev.label;
     document.title = `hush · ${ev.label}`;
     setStatus("on");
+    $("waiting").hidden = true;
     if (inChat) line("sys", "* reconnected");
     else {
       $("login").hidden = true;
       $("chat").hidden = false;
       $("msgs").replaceChildren();
       $("older").hidden = true;
-      line("info", `connected as ${name} to the chat "${ev.label}"\nyour fingerprint: ${myFp}\ntype /help for commands`);
+      line("info", `connected as ${name} to the chat "${ev.label}"\nyour fingerprint: ${myFp}\ntype /help for commands` +
+        (ev.admin ? "\nyou're an admin: people who want to join show up at the top" : ""));
       $("msg").focus();
     }
     showOnline();
+    showRequests();
     break;
   case "history":
     if (ev.dir === 0) {
@@ -298,6 +393,8 @@ function onEvent(ev, name, key) {
     if (ev.quit || ev.error) { // left, or the server said no: don't retry
       tab.del("hush.key");
       showLogin(ev.error ? capitalize(ev.error) + "." : "");
+    } else if (waiting) { // keep our place in line
+      retryTimer = setTimeout(() => connect(name, key), 5000);
     } else if (!inChat) {
       showLogin("Couldn't reach the server. Try again in a moment.");
     } else { // dropped: try again with backoff, then fetch what was missed
@@ -364,6 +461,13 @@ $("older").addEventListener("click", () => {
 $("viewer").addEventListener("click", e => { if (e.target === $("viewer")) closeViewer(); });
 $("viewer-close").addEventListener("click", closeViewer);
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("viewer").hidden) closeViewer(); });
+
+$("mydata").addEventListener("click", saveMyData);
+$("wait-cancel").addEventListener("click", () => {
+  if (chat && chat.ws.readyState < 2) chat.close();
+  tab.del("hush.key");
+  showLogin();
+});
 
 $("leave").addEventListener("click", () => {
   if (chat && chat.ws.readyState < 2) return chat.close();

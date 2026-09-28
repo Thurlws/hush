@@ -11,6 +11,7 @@
  * Trust: the first key seen for a name is pinned in known_peers. A later
  * different key is refused until the user runs /trust. Comparing
  * fingerprints out of band (/fp, /verify) rules out a lying server. */
+#include "msg.h"
 #include "proto.h"
 
 #include <errno.h>
@@ -32,11 +33,10 @@
 #define MAX_PEERS  256
 #define SEEN_MAX   4096 /* message ids remembered, to drop repeats */
 #define IMAGES_MAX 256  /* images remembered for /save */
-#define NONCE      crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-#define MAC        crypto_aead_xchacha20poly1305_ietf_ABYTES
-/* Plaintext before the names and content: version, kind, time, id. */
-#define PLAIN_HEAD (1 + 1 + 8 + 16)
-#define PLAIN_MAX  (PLAIN_HEAD + 2 * (1 + HUSH_NAME_MAX) + 60 + HUSH_MAX_TEXT + crypto_sign_BYTES)
+#define WAITING_MAX 64 /* people shown to an admin as waiting to join */
+#define NONCE      MSG_NONCE
+#define MAC        MSG_MAC
+#define PLAIN_HEAD MSG_HEAD
 #define HISTORY_PAGE 30
 
 enum { TRUST_OK, TRUST_CHANGED, TRUST_BAD };
@@ -79,6 +79,9 @@ static struct image images[IMAGES_MAX];
 static size_t nimages;
 static uint64_t oldest_id; /* for /more */
 static int more_history;
+static int am_admin;
+static char waiting[WAITING_MAX][HUSH_NAME_MAX + 1];
+static size_t nwaiting;
 
 /* One image going up, one coming down. */
 static struct {
@@ -89,10 +92,21 @@ static struct {
     char mime[32], caption[HUSH_MAX_TEXT + 1];
 } upload;
 static struct {
-    int active;
+    int active, for_mydata;
     struct image img;
     struct buf data;
+    char path[4300]; /* where to save it; empty: ~/Downloads */
 } download;
+/* /mydata: everything you sent, and DMs sent to you, saved to a folder. */
+static struct {
+    int active;
+    char dir[4200];
+    FILE *json;
+    long count;
+    uint64_t last_id;
+    struct image *queue;
+    size_t nqueue, next;
+} mydata;
 
 static int sock = -1;
 static struct buf rx, tx;
@@ -437,10 +451,32 @@ static void handshake(void)
     net_send(T_AUTH, &b);
     buf_free(&b);
 
-    expect(T_WELCOME, &p, &n, &fs);
-    if (name_get(p, n, chat_label) < 0)
-        die("bad welcome from server");
-    buf_consume(&rx, fs);
+    /* In, or first on the waitlist until an admin decides. */
+    for (;;) {
+        uint8_t type;
+        read_frame(&type, &p, &n, &fs);
+        if (type == T_ERROR) {
+            char msg[HUSH_MAX_FRAME + 1];
+            sanitize(p, n, msg);
+            die("server refused login: %s", msg);
+        }
+        int k = name_get(p, n, chat_label);
+        if (k < 0 || (type != T_WAITING && type != T_WELCOME))
+            die("unexpected reply from server during login");
+        if (type == T_WELCOME) {
+            am_admin = (size_t)k < n && (p[k] & WELCOME_ADMIN);
+            buf_consume(&rx, fs);
+            return;
+        }
+        char fp[HUSH_FP_LEN];
+        fingerprint(my_pk, fp);
+        printf("You're on the waitlist for \"%s\": an admin has to let you in.\n"
+               "They'll see your fingerprint, %s, so they can check it's you.\n"
+               "Waiting... (Ctrl-C to give up)\n",
+               chat_label, fp);
+        fflush(stdout);
+        buf_consume(&rx, fs);
+    }
 }
 
 static void request_history(int dir, uint64_t anchor, uint16_t limit)
@@ -536,15 +572,6 @@ static void on_leave(const uint8_t *p, size_t n)
 
 /* ---- messages ------------------------------------------------------------ */
 
-static const char *mime_ext(const char *mime)
-{
-    return !strcmp(mime, "image/jpeg") ? "jpg"
-         : !strcmp(mime, "image/png")  ? "png"
-         : !strcmp(mime, "image/gif")  ? "gif"
-         : !strcmp(mime, "image/webp") ? "webp"
-                                       : NULL;
-}
-
 static void sign_data(struct buf *d, const uint8_t *plain, size_t n)
 {
     d->len = 0;
@@ -604,123 +631,290 @@ static int seen_before(const uint8_t *id)
     return 0;
 }
 
-static void show_image(uint64_t msg_id, uint64_t ms, const char *from, const char *to,
-                       const uint8_t *c, size_t n)
+/* A MSG frame, decrypted and checked. The plaintext lives in opened_plain
+ * until the next one is opened. */
+struct opened {
+    uint64_t id;
+    int live;
+    char from[HUSH_NAME_MAX + 1], to[HUSH_NAME_MAX + 1];
+    struct hush_msg m;
+};
+static uint8_t opened_plain[HUSH_MAX_FRAME];
+
+/* 0 with o filled in, or -1 after saying why the message isn't shown. */
+static int open_msg(const uint8_t *p, size_t n, struct opened *o)
 {
-    /* file key | blob id | u32 size | u16 w | u16 h | u8 len + mime | caption */
-    if (n < 32 + 16 + 4 + 4 + 1 || c[56] == 0 || c[56] >= 32 || n < 57u + c[56]) {
-        say("! dropped a malformed image message from %s", from);
+    if (n < 17)
+        return -1;
+    o->id = get_u64(p);
+    o->live = p[16];
+    int k1 = name_get(p + 17, n - 17, o->from), k2;
+    if (k1 < 0 || (k2 = name_get_opt(p + 17 + k1, n - 17 - k1, o->to)) < 0)
+        return -1;
+    const uint8_t *body = p + 17 + k1 + k2;
+    size_t bl = n - 17 - (size_t)k1 - (size_t)k2;
+
+    int mine = !strcmp(o->from, my_name);
+    struct peer *pe = mine ? NULL : peer_find(o->from);
+    if (!mine && (!pe || pe->trust != TRUST_OK)) {
+        say("! a message from %s isn't shown: %s", o->from,
+            pe ? "their key changed (see /help)" : "unknown sender");
+        return -1;
+    }
+    const uint8_t *dm_key = NULL;
+    if (*o->to) {
+        struct peer *dm = peer_find(mine ? o->to : o->from);
+        if (dm && dm->trust == TRUST_OK)
+            dm_key = dm->key;
+    }
+    long pl = (*o->to && !dm_key) || bl > sizeof opened_plain ? -1
+                                                               : msg_decrypt(body, bl, chat_key, dm_key, opened_plain);
+    if (pl < 0) {
+        say("! a message from %s failed to decrypt (tampered with?)", o->from);
+        return -1;
+    }
+    if (msg_parse(opened_plain, (size_t)pl, &o->m) != 0 || strcmp(o->m.from, o->from) ||
+        strcmp(o->m.to, o->to)) {
+        say("! dropped a message relabelled as coming from %s", o->from);
+        return -1;
+    }
+    if (msg_verify(opened_plain, &o->m, chat_id, mine ? my_pk : pe->pk) != 0) {
+        say("! a message claiming to be from %s has a bad signature", o->from);
+        return -1;
+    }
+    return 0;
+}
+
+static void remember_image(uint64_t msg_id, const struct hush_image *hi, struct image *im)
+{
+    im->msg_id = msg_id;
+    memcpy(im->file_key, hi->file_key, 32);
+    memcpy(im->blob, hi->blob, HUSH_BLOB_ID);
+    im->size = hi->size;
+    strcpy(im->mime, hi->mime);
+}
+
+static void show_msg(const struct opened *o)
+{
+    const struct hush_msg *m = &o->m;
+    char text[HUSH_MAX_TEXT + 200], caption[HUSH_MAX_TEXT + 1];
+    struct hush_image hi;
+    if (m->kind == KIND_TEXT) {
+        sanitize(m->content, m->content_len > HUSH_MAX_TEXT ? HUSH_MAX_TEXT : m->content_len, text);
+    } else if (m->kind == KIND_IMAGE && image_parse(m->content, m->content_len, &hi) == 0) {
+        remember_image(o->id, &hi, &images[nimages++ % IMAGES_MAX]);
+        sanitize(hi.caption, hi.caption_len > HUSH_MAX_TEXT ? HUSH_MAX_TEXT : hi.caption_len, caption);
+        snprintf(text, sizeof text, "%s[image %ux%u, %.1f MB, /save %llu]%s%s%s", col("\033[36m"), hi.width,
+                 hi.height, hi.size / 1048576.0, (unsigned long long)o->id, col("\033[0m"), *caption ? " " : "",
+                 caption);
+    } else {
+        snprintf(text, sizeof text, "[something this version can't show]");
+    }
+    show_line(m->time, o->from, o->to, text);
+}
+
+static void iso_time(uint64_t ms, char *out, size_t n)
+{
+    time_t t = (time_t)(ms / 1000);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+static void mydata_entry(const uint8_t *p, size_t n)
+{
+    struct opened o;
+    if (n >= 8)
+        mydata.last_id = get_u64(p);
+    FILE *f = mydata.json;
+    fprintf(f, "%s\n    {\"id\": %llu", mydata.count++ ? "," : "", (unsigned long long)mydata.last_id);
+    if (open_msg(p, n, &o) != 0) {
+        fprintf(f, ", \"error\": \"could not be decrypted or verified\"}");
         return;
     }
-    struct image *im = &images[nimages++ % IMAGES_MAX];
-    im->msg_id = msg_id;
-    memcpy(im->file_key, c, 32);
-    memcpy(im->blob, c + 32, 16);
-    im->size = get_u32(c + 48);
-    memcpy(im->mime, c + 57, c[56]);
-    im->mime[c[56]] = '\0';
-    char caption[HUSH_MAX_TEXT + 1], mime[64], text[HUSH_MAX_TEXT + 200];
-    sanitize(c + 57 + c[56], n - 57 - c[56] > HUSH_MAX_TEXT ? HUSH_MAX_TEXT : n - 57 - c[56], caption);
-    sanitize((const uint8_t *)im->mime, strlen(im->mime), mime);
-    if (!mime_ext(im->mime)) {
-        snprintf(text, sizeof text, "[a file of type %s, not shown]", mime);
-        im->msg_id = 0;
-    } else {
-        snprintf(text, sizeof text, "%s[image %ux%u, %.1f MB, /save %llu]%s%s%s", col("\033[36m"),
-                 get_u16(c + 52), get_u16(c + 54), im->size / 1048576.0, (unsigned long long)msg_id,
-                 col("\033[0m"), *caption ? " " : "", caption);
+    char when[64];
+    struct hush_image hi;
+    iso_time(o.m.time, when, sizeof when);
+    fprintf(f, ", \"time\": \"%s\", \"from\": ", when);
+    json_string(f, (const uint8_t *)o.from, strlen(o.from));
+    if (*o.to) {
+        fprintf(f, ", \"to\": ");
+        json_string(f, (const uint8_t *)o.to, strlen(o.to));
     }
-    show_line(ms, from, to, text);
+    if (o.m.kind == KIND_TEXT) {
+        fprintf(f, ", \"text\": ");
+        json_string(f, o.m.content, o.m.content_len);
+    } else if (o.m.kind == KIND_IMAGE && image_parse(o.m.content, o.m.content_len, &hi) == 0) {
+        struct image *q = realloc(mydata.queue, (mydata.nqueue + 1) * sizeof *q);
+        if (!q)
+            die("out of memory");
+        mydata.queue = q;
+        remember_image(o.id, &hi, &q[mydata.nqueue++]);
+        fprintf(f, ", \"image\": \"images/%llu.%s\", \"caption\": ", (unsigned long long)o.id, image_ext(hi.mime));
+        json_string(f, hi.caption, hi.caption_len);
+    }
+    fprintf(f, "}");
+}
+
+static void start_download(const struct image *im, const char *path, int for_mydata)
+{
+    download.active = 1;
+    download.for_mydata = for_mydata;
+    download.img = *im;
+    download.data.len = 0;
+    snprintf(download.path, sizeof download.path, "%s", path ? path : "");
+    net_send_raw(T_FETCH, im->blob, HUSH_BLOB_ID);
+}
+
+/* Fetch the queued images one at a time, then close the file. */
+static void mydata_next(void)
+{
+    if (mydata.next < mydata.nqueue) {
+        const struct image *im = &mydata.queue[mydata.next++];
+        char path[4300];
+        snprintf(path, sizeof path, "%s/images/%llu.%s", mydata.dir, (unsigned long long)im->msg_id,
+                 image_ext(im->mime));
+        start_download(im, path, 1);
+        return;
+    }
+    fprintf(mydata.json, "\n  ]\n}\n");
+    if (fclose(mydata.json) != 0)
+        say("! cannot write %s/messages.json: %s", mydata.dir, strerror(errno));
+    else
+        say("saved your data (%ld messages, %zu images) to %s", mydata.count, mydata.nqueue, mydata.dir);
+    free(mydata.queue);
+    memset(&mydata, 0, sizeof mydata);
+}
+
+static void cmd_mydata(void)
+{
+    if (mydata.active || download.active) {
+        say("! wait for the download that's running to finish");
+        return;
+    }
+    char base[4096], stamp[32], path[4300], fp[HUSH_FP_LEN];
+    const char *home = getenv("HOME");
+    struct stat st;
+    time_t now = time(NULL);
+    snprintf(base, sizeof base, "%s/Downloads", home ? home : ".");
+    if (!home || stat(base, &st) < 0 || !S_ISDIR(st.st_mode))
+        strcpy(base, ".");
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
+    snprintf(mydata.dir, sizeof mydata.dir, "%s/hush-mydata-%s-%s", base, chat_label, stamp);
+    snprintf(path, sizeof path, "%s/images", mydata.dir);
+    if (mkdir(mydata.dir, 0700) < 0 || mkdir(path, 0700) < 0) {
+        say("! cannot create %s: %s", path, strerror(errno));
+        return;
+    }
+    snprintf(path, sizeof path, "%s/messages.json", mydata.dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 || !(mydata.json = fdopen(fd, "w"))) {
+        say("! cannot create %s: %s", path, strerror(errno));
+        return;
+    }
+    char when[64];
+    iso_time((uint64_t)now * 1000, when, sizeof when);
+    fingerprint(my_pk, fp);
+    fprintf(mydata.json, "{\n  \"chat\": ");
+    json_string(mydata.json, (const uint8_t *)chat_label, strlen(chat_label));
+    fprintf(mydata.json, ",\n  \"name\": ");
+    json_string(mydata.json, (const uint8_t *)my_name, strlen(my_name));
+    fprintf(mydata.json, ",\n  \"fingerprint\": \"%s\",\n  \"exported\": \"%s\",\n"
+                         "  \"contents\": \"everything you sent in this chat, and the private messages sent to you\",\n"
+                         "  \"messages\": [", fp, when);
+    mydata.active = 1;
+    say("saving your data to %s ...", mydata.dir);
+    request_history(HIST_MINE, 0, HUSH_HISTORY_MAX);
 }
 
 static void on_msg(const uint8_t *p, size_t n)
 {
-    char from[HUSH_NAME_MAX + 1], to[HUSH_NAME_MAX + 1];
     if (n < 17)
         return;
+    if (mydata.active && !p[16]) { /* a page of /mydata */
+        mydata_entry(p, n);
+        return;
+    }
     uint64_t id = get_u64(p);
-    int k1 = name_get(p + 17, n - 17, from), k2;
-    if (k1 < 0 || (k2 = name_get_opt(p + 17 + k1, n - 17 - k1, to)) < 0)
-        return;
-    const uint8_t *body = p + 17 + k1 + k2;
-    size_t bl = n - 17 - (size_t)k1 - (size_t)k2;
-    if (!oldest_id || id < oldest_id)
+    if (!p[16] && (!oldest_id || id < oldest_id))
         oldest_id = id;
-
-    int mine = !strcmp(from, my_name);
-    const char *other = *to ? (mine ? to : from) : from;
-    struct peer *pe = mine ? NULL : peer_find(from);
-    if (!mine && (!pe || pe->trust != TRUST_OK)) {
-        say("! a message from %s isn't shown: %s", from, pe ? "their key changed (see /help)" : "unknown sender");
-        return;
-    }
-    if (bl < NONCE + MAC || bl > NONCE + MAC + PLAIN_MAX) {
-        say("! dropped a malformed message from %s", from);
-        return;
-    }
-
-    uint8_t plain[PLAIN_MAX];
-    size_t pl = 0;
-    int ok;
-    if (*to) {
-        struct peer *dm = peer_find(other);
-        ok = dm && dm->trust == TRUST_OK &&
-             crypto_box_open_easy_afternm(plain, body + NONCE, bl - NONCE, body, dm->key) == 0;
-        pl = bl - NONCE - crypto_box_MACBYTES;
-    } else {
-        unsigned long long l;
-        ok = crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &l, NULL, body + NONCE, bl - NONCE, NULL,
-                                                        0, body, chat_key) == 0;
-        pl = (size_t)l;
-    }
-    if (!ok) {
-        say("! a message from %s failed to decrypt (tampered with?)", from);
-        return;
-    }
-
-    /* version | kind | time | id | from | to | content | signature */
-    char pfrom[HUSH_NAME_MAX + 1], pto[HUSH_NAME_MAX + 1];
-    int a = -1, b = -1;
-    if (pl >= PLAIN_HEAD + 2 + crypto_sign_BYTES && plain[0] == HUSH_MSG_VERSION)
-        a = name_get(plain + PLAIN_HEAD, pl - PLAIN_HEAD - crypto_sign_BYTES, pfrom);
-    if (a > 0)
-        b = name_get_opt(plain + PLAIN_HEAD + a, pl - PLAIN_HEAD - a - crypto_sign_BYTES, pto);
-    if (b < 0 || strcmp(pfrom, from) || strcmp(pto, to)) {
-        say("! dropped a message relabelled as coming from %s", from);
-        return;
-    }
-    struct buf sd = { 0 };
-    size_t signed_len = pl - crypto_sign_BYTES;
-    sign_data(&sd, plain, signed_len);
-    ok = crypto_sign_verify_detached(plain + signed_len, sd.data, sd.len, mine ? my_pk : pe->pk) == 0;
-    buf_free(&sd);
-    if (!ok) {
-        say("! a message claiming to be from %s has a bad signature", from);
-        return;
-    }
-    if (seen_before(plain + 10))
-        return;
-
-    uint64_t ms = get_u64(plain + 2);
-    const uint8_t *content = plain + PLAIN_HEAD + a + b;
-    size_t cn = signed_len - PLAIN_HEAD - (size_t)a - (size_t)b;
-    if (plain[1] == KIND_TEXT) {
-        char clean[HUSH_MAX_TEXT + 1];
-        sanitize(content, cn > HUSH_MAX_TEXT ? HUSH_MAX_TEXT : cn, clean);
-        show_line(ms, from, to, clean);
-    } else if (plain[1] == KIND_IMAGE) {
-        show_image(id, ms, from, to, content, cn);
-    }
-    sodium_memzero(plain, sizeof plain);
+    struct opened o;
+    if (open_msg(p, n, &o) == 0 && !seen_before(o.m.uid))
+        show_msg(&o);
+    sodium_memzero(opened_plain, sizeof opened_plain);
 }
 
 static void on_history_end(const uint8_t *p, size_t n)
 {
-    if (n == 2 && p[0] == 0) {
+    if (n != 2)
+        return;
+    if (p[0] == HIST_MINE && mydata.active) {
+        if (p[1])
+            request_history(HIST_MINE, mydata.last_id, HUSH_HISTORY_MAX);
+        else
+            mydata_next();
+    } else if (p[0] == HIST_OLDER) {
         more_history = p[1];
         if (more_history)
             say("%s(older messages: /more)%s", col("\033[2m"), col("\033[0m"));
     }
+}
+
+/* ---- the waitlist (admins) ----------------------------------------------- */
+
+static void on_pending(const uint8_t *p, size_t n)
+{
+    char name[HUSH_NAME_MAX + 1], fp[HUSH_FP_LEN];
+    int k = n >= 1 ? name_get(p + 1, n - 1, name) : -1;
+    if (k < 0 || n - 1 - (size_t)k != crypto_sign_PUBLICKEYBYTES)
+        return;
+    size_t i = 0;
+    while (i < nwaiting && strcmp(waiting[i], name))
+        i++;
+    if (!p[0]) { /* decided */
+        if (i < nwaiting)
+            memmove(waiting[i], waiting[i + 1], (--nwaiting - i) * sizeof *waiting);
+        return;
+    }
+    if (i == nwaiting && nwaiting < WAITING_MAX)
+        strcpy(waiting[nwaiting++], name);
+    fingerprint(p + 1 + k, fp);
+    say("%s* %s wants to join, with fingerprint %s%s\n"
+        "  If that's who you think, /approve %s, otherwise /deny %s",
+        col("\033[1;33m"), name, fp, col("\033[0m"), name, name);
+}
+
+static void cmd_decide(const char *name, int approve)
+{
+    if (!am_admin) {
+        say("! only an admin can do that");
+        return;
+    }
+    if (!*name) {
+        say("usage: /%s NAME", approve ? "approve" : "deny");
+        return;
+    }
+    struct buf b = { 0 };
+    uint8_t a = (uint8_t)approve;
+    buf_put(&b, &a, 1);
+    name_put(&b, name);
+    if (name_valid(name, strlen(name)))
+        net_send(T_DECIDE, &b);
+    else
+        say("! %s isn't a name", name);
+    buf_free(&b);
+}
+
+static void cmd_waiting(void)
+{
+    if (!am_admin) {
+        say("! only an admin can see the waitlist");
+        return;
+    }
+    if (!nwaiting)
+        say("nobody is waiting to join");
+    for (size_t i = 0; i < nwaiting; i++)
+        say("  %s is waiting: /approve %s or /deny %s", waiting[i], waiting[i], waiting[i]);
 }
 
 /* ---- images ---------------------------------------------------------------- */
@@ -936,14 +1130,47 @@ static void cmd_save(const char *arg)
         say("usage: /save N, with N from an [image ...] line");
         return;
     }
-    if (download.active) {
-        say("! wait for the image you're saving to finish");
+    if (download.active || mydata.active) {
+        say("! wait for the download that's running to finish");
         return;
     }
-    download.active = 1;
-    download.img = *im;
-    download.data.len = 0;
-    net_send_raw(T_FETCH, im->blob, HUSH_BLOB_ID);
+    start_download(im, NULL, 0);
+}
+
+/* Write a finished download where it was meant to go. */
+static void save_image(const uint8_t *img, size_t n)
+{
+    char dir[4096], path[4300];
+    int fd = -1;
+    if (*download.path) {
+        snprintf(path, sizeof path, "%s", download.path);
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    } else {
+        const char *home = getenv("HOME");
+        struct stat st;
+        snprintf(dir, sizeof dir, "%s/Downloads", home ? home : ".");
+        if (!home || stat(dir, &st) < 0 || !S_ISDIR(st.st_mode))
+            strcpy(dir, ".");
+        const char *ext = image_ext(download.img.mime);
+        for (int i = 0; i < 100 && fd < 0; i++) {
+            if (i)
+                snprintf(path, sizeof path, "%s/hush-%llu-%d.%s", dir, (unsigned long long)download.img.msg_id, i, ext);
+            else
+                snprintf(path, sizeof path, "%s/hush-%llu.%s", dir, (unsigned long long)download.img.msg_id, ext);
+            fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        }
+    }
+    if (fd < 0 || write(fd, img, n) != (ssize_t)n || close(fd) < 0)
+        say("! cannot save %s: %s", path, strerror(errno));
+    else if (!download.for_mydata)
+        say("saved %s", path);
+}
+
+static void download_done(void)
+{
+    download.active = 0;
+    if (download.for_mydata)
+        mydata_next();
 }
 
 static void on_blob(const uint8_t *p, size_t n)
@@ -952,50 +1179,29 @@ static void on_blob(const uint8_t *p, size_t n)
         return;
     int status = p[HUSH_BLOB_ID];
     if (status == BLOB_MISSING) {
-        say("! the server doesn't have that image any more");
-        download.active = 0;
+        say("! the server doesn't have image %llu any more", (unsigned long long)download.img.msg_id);
+        download_done();
         return;
     }
     buf_put(&download.data, p + HUSH_BLOB_ID + 1, n - HUSH_BLOB_ID - 1);
     if (download.data.len > HUSH_MAX_IMAGE + NONCE + MAC) {
-        say("! that image is too big; not saved");
-        download.active = 0;
+        say("! image %llu is too big; not saved", (unsigned long long)download.img.msg_id);
+        download_done();
         return;
     }
     if (status != BLOB_LAST)
         return;
-    download.active = 0;
 
     struct buf *d = &download.data;
     uint8_t *img = d->len >= NONCE + MAC ? malloc(d->len) : NULL;
     unsigned long long il;
     if (!img || crypto_aead_xchacha20poly1305_ietf_decrypt(img, &il, NULL, d->data + NONCE, d->len - NONCE,
-                                                           NULL, 0, d->data, download.img.file_key) != 0) {
-        say("! the image failed to decrypt (tampered with?)");
-        free(img);
-        return;
-    }
-    char dir[4096], path[4200];
-    const char *home = getenv("HOME");
-    struct stat st;
-    snprintf(dir, sizeof dir, "%s/Downloads", home ? home : ".");
-    if (!home || stat(dir, &st) < 0 || !S_ISDIR(st.st_mode))
-        strcpy(dir, ".");
-    int fd = -1;
-    for (int i = 0; i < 100 && fd < 0; i++) {
-        if (i)
-            snprintf(path, sizeof path, "%s/hush-%llu-%d.%s", dir, (unsigned long long)download.img.msg_id, i,
-                     mime_ext(download.img.mime));
-        else
-            snprintf(path, sizeof path, "%s/hush-%llu.%s", dir, (unsigned long long)download.img.msg_id,
-                     mime_ext(download.img.mime));
-        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    }
-    if (fd < 0 || write(fd, img, (size_t)il) != (ssize_t)il || close(fd) < 0)
-        say("! cannot save %s: %s", path, strerror(errno));
+                                                           NULL, 0, d->data, download.img.file_key) != 0)
+        say("! image %llu failed to decrypt (tampered with?)", (unsigned long long)download.img.msg_id);
     else
-        say("saved %s", path);
+        save_image(img, (size_t)il);
     free(img);
+    download_done();
 }
 
 /* ---- incoming ---------------------------------------------------------------- */
@@ -1021,6 +1227,8 @@ static void process_frames(void)
             on_uploaded(p, n);
         else if (type == T_BLOB)
             on_blob(p, n);
+        else if (type == T_PENDING)
+            on_pending(p, n);
         else if (type == T_ERROR) {
             char msg[HUSH_MAX_FRAME + 1];
             sanitize(p, n, msg);
@@ -1060,12 +1268,18 @@ static void cmd_help(void)
         "  /img FILE [text] send an image (jpeg, png, gif or webp, up to 25 MB)\n"
         "  /save N          save image N to ~/Downloads\n"
         "  /more            show older messages\n"
+        "  /mydata          save everything you sent, and DMs sent to you, to a folder\n"
         "  /who             who's in the chat, with fingerprints\n"
         "  /fp [NAME]       show your fingerprint, or NAME's\n"
         "  /verify NAME     mark NAME's key as verified after comparing fingerprints\n"
         "  /trust NAME      accept NAME's new key after it changed (verify it first!)\n"
         "  /quit            leave (also Ctrl-C)\n"
         "  //text           send a message that starts with /");
+    if (am_admin)
+        say("As an admin:\n"
+            "  /waiting         who's waiting to join\n"
+            "  /approve NAME    let NAME in (check their fingerprint first)\n"
+            "  /deny NAME       turn NAME away");
 }
 
 static void cmd_who(void)
@@ -1203,8 +1417,18 @@ static void submit(void)
             cmd_img(arg);
         else if (!strcmp(cmd, "save"))
             cmd_save(arg);
+        else if (!strcmp(cmd, "mydata"))
+            cmd_mydata();
+        else if (!strcmp(cmd, "waiting"))
+            cmd_waiting();
+        else if (!strcmp(cmd, "approve"))
+            cmd_decide(arg, 1);
+        else if (!strcmp(cmd, "deny"))
+            cmd_decide(arg, 0);
         else if (!strcmp(cmd, "more")) {
-            if (more_history && oldest_id) {
+            if (mydata.active) {
+                say("! wait for /mydata to finish");
+            } else if (more_history && oldest_id) {
                 say("%s--- older messages ---%s", col("\033[2m"), col("\033[0m"));
                 request_history(0, oldest_id, HISTORY_PAGE);
             } else {
@@ -1404,8 +1628,9 @@ int main(int argc, char **argv)
     interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     char fp[HUSH_FP_LEN];
     fingerprint(my_pk, fp);
-    say("%sconnected to %s:%s as %s, chat: %s%s\nyour fingerprint: %s\ntype /help for commands",
-        col("\033[1m"), host, port, my_name, chat_label, col("\033[0m"), fp);
+    say("%sconnected to %s:%s as %s, chat: %s%s\nyour fingerprint: %s\ntype /help for commands%s",
+        col("\033[1m"), host, port, my_name, chat_label, col("\033[0m"), fp,
+        am_admin ? "\nyou're an admin: people who want to join show up here" : "");
     if (interactive)
         term_raw();
     ui_ready = 1;

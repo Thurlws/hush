@@ -4,9 +4,11 @@
 // this in Node.
 
 const T = {
-  HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6,
+  HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6, DECIDE: 7,
   CHALLENGE: 10, WELCOME: 11, PEER: 12, LEAVE: 13, MSG: 14, ERROR: 15, HISTORY_END: 16, UPLOADED: 17, BLOB: 18,
+  WAITING: 19, PENDING: 20,
 };
+const HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2, WELCOME_ADMIN = 1;
 const PEER_ONLINE = 1, PEER_NEW = 2, UP_FIRST = 1, UP_LAST = 2, BLOB_LAST = 1, BLOB_MISSING = 2;
 const KIND_TEXT = 0, KIND_IMAGE = 1, VERSION = 3;
 const AUTH_CONTEXT = "hush-auth-v3", MSG_CONTEXT = "hush-msg-v3";
@@ -74,7 +76,9 @@ function readName(p, off = 0, emptyOk = false) {
 }
 
 // Events passed to onEvent, as { type, ... }:
-//   ready {label}             logged in to the chat called label
+//   waiting {label}           on the chat's waitlist until an admin decides
+//   ready {label, admin}      logged in to the chat called label
+//   pending {name, fp, waiting}   admins: someone wants in (waiting) or was decided
 //   peer {name, online, joined, first, trust: "ok"|"changed"|"bad", verified, fp, oldFp, wasOnline}
 //   leave {name}              went offline
 //   message {msg}             a new message (msg: see openMessage)
@@ -106,6 +110,9 @@ export class Session {
     this.lastError = null;
     this.quit = false;
     this.upload = null;
+    this.admin = false;
+    this.pending = new Map(); // admins: name -> fingerprint of people waiting
+    this.exporting = null;
     this.fetches = new Map(); // blob id hex -> {image, resolve, reject, parts, size}
     this.fetchQueue = [];
     this.ws = new WS(url);
@@ -116,6 +123,7 @@ export class Session {
     this.ws.onclose = e => {
       const err = new Error("disconnected");
       if (this.upload) this.upload.reject(err);
+      if (this.exporting) this.exporting.reject(err);
       for (const f of this.fetches.values()) f.reject(err);
       for (const f of this.fetchQueue) f.reject(err);
       this.fetches.clear();
@@ -144,7 +152,7 @@ export class Session {
   }
 
   // Messages older than the ones seen so far; answered with a "history" event.
-  loadOlder() { if (this.oldestId) this.history(0, this.oldestId); }
+  loadOlder() { if (this.oldestId && !this.exporting) this.history(HIST_OLDER, this.oldestId); }
 
   onFrame(f) {
     if (!f.length) return;
@@ -156,13 +164,17 @@ export class Session {
     } else if (!this.ready) {
       if (type === T.CHALLENGE && p.length === 32) {
         this.send(T.AUTH, this.s.crypto_sign_detached(concat(enc.encode(AUTH_CONTEXT), p), this.sk));
+      } else if (type === T.WAITING && readName(p)) {
+        this.emit({ type: "waiting", label: readName(p)[0] });
       } else if (type === T.WELCOME && readName(p)) {
+        const [label, off] = readName(p);
         this.ready = true;
+        this.admin = off < p.length && (p[off] & WELCOME_ADMIN) !== 0;
         this.lastError = null;
-        this.emit({ type: "ready", label: readName(p)[0] });
+        this.emit({ type: "ready", label, admin: this.admin });
         // Catch up after a reconnect, or start with the latest page.
-        if (this.sinceId) this.history(1, this.sinceId, 200);
-        else this.history(0, 0);
+        if (this.sinceId) this.history(HIST_NEWER, this.sinceId, 200);
+        else this.history(HIST_OLDER, 0);
       } else {
         this.lastError = "unexpected reply from the server";
         this.ws.close();
@@ -173,6 +185,33 @@ export class Session {
     else if (type === T.HISTORY_END && p.length === 2) this.onHistoryEnd(p[0], p[1] === 1);
     else if (type === T.UPLOADED && p.length === 16 && this.upload) this.upload.resolve(p.slice());
     else if (type === T.BLOB && p.length >= 17) this.onBlob(p);
+    else if (type === T.PENDING) this.onPending(p);
+  }
+
+  onPending(p) {
+    const r = p.length > 1 && readName(p, 1);
+    if (!r || p.length - r[1] !== 32) return;
+    const name = r[0], fp = fingerprint(this.s, p.subarray(r[1]));
+    if (p[0]) this.pending.set(name, fp);
+    else this.pending.delete(name);
+    this.emit({ type: "pending", name, fp, waiting: p[0] === 1 });
+  }
+
+  // Admins: let someone on the waitlist in, or turn them away.
+  decide(name, approve) {
+    if (!this.admin) return this.notice("only an admin can do that", "warn");
+    if (!NAME_RE.test(name)) return this.notice(`usage: /${approve ? "approve" : "deny"} NAME`);
+    this.send(T.DECIDE, Uint8Array.of(approve ? 1 : 0), nameBytes(name));
+  }
+
+  // Everything you sent in this chat and the DMs sent to you, decrypted:
+  // resolves to a list of messages (see openMessage), oldest first.
+  exportMine() {
+    if (this.exporting) return Promise.reject(new Error("already exporting"));
+    return new Promise((resolve, reject) => {
+      this.exporting = { items: [], lastId: 0, resolve, reject };
+      this.history(HIST_MINE, 0, 200);
+    });
   }
 
   onPeer(p) {
@@ -216,7 +255,14 @@ export class Session {
     const id = Number(view(p).getBigUint64(0)), live = p[16] === 1;
     const a = readName(p, 17), b = a && readName(p, a[1], true);
     if (!b) return;
-    this.oldestId = this.oldestId ? Math.min(this.oldestId, id) : id;
+    if (this.exporting && !live) {
+      const e = this.exporting;
+      e.lastId = id;
+      e.items.push(this.openMessage(id, a[0], b[0], p.subarray(b[1]), false) ||
+                   { id, from: a[0], to: b[0], error: "could not be decrypted or verified" });
+      return;
+    }
+    if (!live) this.oldestId = this.oldestId ? Math.min(this.oldestId, id) : id;
     this.newestId = Math.max(this.newestId, id);
     const msg = this.openMessage(id, a[0], b[0], p.subarray(b[1]));
     if (!msg) return;
@@ -225,16 +271,22 @@ export class Session {
   }
 
   onHistoryEnd(dir, more) {
+    if (dir === HIST_MINE && this.exporting) {
+      const e = this.exporting;
+      if (more) this.history(HIST_MINE, e.lastId, 200);
+      else { this.exporting = null; e.resolve(e.items); }
+      return;
+    }
     const messages = this.batch;
     this.batch = [];
     this.emit({ type: "history", messages, dir, more });
-    if (dir === 1 && more) this.history(1, this.newestId, 200); // keep catching up
+    if (dir === HIST_NEWER && more) this.history(HIST_NEWER, this.newestId, 200); // keep catching up
   }
 
   // Decrypt and check one stored message. Returns
   // {id, time, from, to, dm, text} or {..., image: {fileKey, blob, size, width, height, mime, caption}},
   // or null (after a notice) if it can't be trusted.
-  openMessage(id, from, to, body) {
+  openMessage(id, from, to, body, dedupe = true) {
     const s = this.s, mine = from === this.name;
     const pe = mine ? null : this.peers.get(from);
     if (!mine && (!pe || pe.trust !== "ok")) {
@@ -269,8 +321,8 @@ export class Session {
       return null;
     }
     const uid = s.to_hex(plain.subarray(10, 26));
-    if (this.seen.has(uid)) return null;
-    this.seen.add(uid);
+    if (dedupe && this.seen.has(uid)) return null;
+    if (dedupe) this.seen.add(uid);
 
     const msg = { id, time: Number(view(plain).getBigUint64(2)), from, to, dm: to !== "" };
     const c = head.subarray(b[1]);
@@ -400,6 +452,9 @@ export class Session {
       else if (cmd === "fp") this.fp(arg);
       else if (cmd === "verify") this.verify(arg);
       else if (cmd === "trust") this.trust(arg);
+      else if (cmd === "approve") this.decide(arg, true);
+      else if (cmd === "deny") this.decide(arg, false);
+      else if (cmd === "waiting") this.listWaiting();
       else this.notice("unknown command; try /help", "warn");
       return;
     }
@@ -422,7 +477,17 @@ export class Session {
       "  /trust NAME      accept NAME's new key after it changed (verify it first!)\n" +
       "  /quit            leave\n" +
       "  //text           send a message that starts with /\n" +
-      "Send an image with the + button, or paste one.");
+      "Send an image with the + button, or paste one. \"My data\" downloads everything you sent." +
+      (this.admin ? "\nAs an admin:\n" +
+        "  /waiting         who's waiting to join\n" +
+        "  /approve NAME    let NAME in (check their fingerprint first)\n" +
+        "  /deny NAME       turn NAME away" : ""));
+  }
+
+  listWaiting() {
+    if (!this.admin) return this.notice("only an admin can see the waitlist", "warn");
+    if (!this.pending.size) return this.notice("nobody is waiting to join");
+    this.notice([...this.pending].map(([n, fp]) => `  ${n} (${fp}): /approve ${n} or /deny ${n}`).join("\n"));
   }
 
   who() {

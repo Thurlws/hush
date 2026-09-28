@@ -29,9 +29,12 @@ button {
   border: 1px solid var(--line); border-radius: 6px; background: none; padding: .35em .8em; cursor: pointer;
 }
 
-/* login */
-#login { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
-#login-form { width: 100%; max-width: 380px; display: flex; flex-direction: column; }
+/* login and waiting */
+#login, #waiting { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
+#login-form, #waiting .card { width: 100%; max-width: 380px; display: flex; flex-direction: column; }
+#waiting p { margin: 0 0 .8em; }
+.fp-big { font-size: 1.1em; font-weight: 600; letter-spacing: .03em; }
+#wait-cancel { align-self: flex-start; margin-top: .6em; }
 h1 { margin: 0; font-size: 1.6em; letter-spacing: .02em; }
 .sub { margin: .1em 0 1.6em; color: var(--dim); }
 label { margin: .9em 0 .35em; font-weight: 600; }
@@ -54,6 +57,13 @@ header b { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-sp
 #dot { flex: none; width: .55em; height: .55em; border-radius: 50%; background: var(--dim); }
 #dot.on { background: var(--n1); }
 #dot.off { background: var(--warn); }
+
+/* admins: people waiting to join */
+#requests { border-bottom: 1px solid var(--line); padding: .5em 16px; }
+.request { display: flex; flex-wrap: wrap; align-items: center; gap: .3em .7em; padding: .25em 0; }
+.request .who { font-weight: 600; }
+.request .fp { color: var(--dim); font-size: .9em; flex: 1; }
+.request .approve { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 #log { flex: 1; overflow-y: auto; padding: .8em 16px; }
 #msgs > div { white-space: pre-wrap; overflow-wrap: anywhere; }
 #older { display: block; margin: 0 auto .8em; color: var(--dim); }

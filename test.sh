@@ -31,13 +31,25 @@ client() { # name datadir [key]
     HOME="$T/home" XDG_DATA_HOME="$T/$2" ./hush -n "$1" -k "${3:-$K1}" 127.0.0.1 "$PORT"
 }
 web() { # name [key]
-    node test-web.mjs "$1" "${2:-$K1}" "ws://127.0.0.1:$WPORT/ws" "http://127.0.0.1:$WPORT"
+    node test-web.mjs "$1" "${2:-$K1}" "ws://127.0.0.1:$WPORT/ws" "http://127.0.0.1:$WPORT" "$T/web-$1.id"
 }
 newkey() { # label -> prints the key
     admin newkey "$1" | sed -n 's/^    \([0-9a-z-]*\)$/\1/p'
 }
 code() { # curl args... -> HTTP status
     curl -s -o /dev/null -w "%{http_code}" "$@"
+}
+fingerprint() { # identity file (terminal: binary, web: hex) -> fingerprint
+    python3 - "$1" <<'EOF'
+import hashlib, sys
+d = open(sys.argv[1], "rb").read()
+sk = bytes.fromhex(d.decode()) if len(d) == 128 else d
+print(hashlib.blake2b(sk[32:], digest_size=16).hexdigest())
+EOF
+}
+trusted() { # datadir: give a terminal identity admin rights, so it skips the waitlist
+    HOME="$T/home" XDG_DATA_HOME="$T/$1" ./hush -n x -k "$K1" 127.0.0.1 1 >/dev/null 2>&1 # creates the identity
+    admin admin "$(fingerprint "$T/$1/hush/identity.key")" >/dev/null
 }
 
 # A JPEG whose EXIF block holds a (fake) GPS position.
@@ -59,6 +71,20 @@ K2=$(newkey other)
 absent "$S/hushd-keys.txt" "$K1" "the keys file holds no plaintext keys"
 
 server "$S"
+
+# The first person in, before there's an admin: they wait, until the operator
+# makes their key an admin from the command line.
+(sleep 3) | client alice a >"$T/alice0.out" 2>&1 &
+a=$!
+sleep 1
+check "$T/alice0.out" "on the waitlist" "without an admin, even the first person waits"
+admin admin "$(sed -n 's/.*fingerprint, \(.*\), so.*/\1/p' "$T/alice0.out")" >"$T/admin.out"
+check "$T/admin.out" "now an admin" "hushd admin takes a fingerprint as shown to users"
+wait $a
+check "$T/alice0.out" "you're an admin" "...and lets them in as an admin, without a restart"
+admin admins >"$T/admins.out"
+check "$T/admins.out" "alice" "hushd admins lists admins by fingerprint and name"
+for who in b c d e; do trusted $who; done
 
 (sleep 1; echo "hello from alice"; sleep 1; echo "/msg bob just for you"; sleep 2) | client alice a >"$T/alice.out" 2>&1 &
 a=$!
@@ -84,6 +110,34 @@ check  "$T/dave.out" "alice: hello from alice" "a newcomer sees the chat's histo
 check  "$T/dave.out" "bob: hi alice"           "...all of it"
 absent "$T/dave.out" "just for you"            "...but not DMs between others"
 
+# The waitlist: amy is let in from the chat, zed is turned away, cli from the command line.
+(sleep 2; echo "/waiting"; sleep 0.5; echo "/approve amy"; sleep 1.5; echo "/deny zed"; sleep 2) | client alice a >"$T/alice-wl.out" 2>&1 &
+a=$!
+sleep 0.5
+(sleep 4; echo "/approve zed"; echo "hi, amy here"; sleep 1) | client amy am >"$T/amy.out" 2>&1 &
+m=$!
+sleep 0.3
+(sleep 4) | client zed z >"$T/zed.out" 2>&1 &
+z=$!
+wait $a $m $z
+check  "$T/alice-wl.out" "amy wants to join, with fingerprint" "admins see who wants to join, with their fingerprint"
+check  "$T/alice-wl.out" "zed is waiting"                      "/waiting lists the waitlist"
+check  "$T/amy.out"      "on the waitlist"                     "newcomers wait for approval"
+check  "$T/amy.out"      "alice: hello from alice"             "once approved, they get the history"
+check  "$T/amy.out"      "only an admin can do that"           "people who aren't admins can't approve anyone"
+check  "$T/zed.out"      "didn't let you into this chat"       "a denied person is turned away"
+absent "$T/zed.out"      "hello from alice"                    "people waiting see nothing of the chat"
+sleep 1 | client zed z >"$T/zed2.out" 2>&1
+check  "$T/zed2.out"     "didn't let you into this chat"       "...and stays turned away"
+(sleep 3) | client cli cl >"$T/cli.out" 2>&1 &
+c=$!
+sleep 1
+admin pending >"$T/pending.out"
+check "$T/pending.out" "cli" "hushd pending lists who's waiting"
+admin approve main cli >/dev/null
+wait $c
+check "$T/cli.out" "chat: main" "hushd approve lets someone in within a second"
+
 # Offline delivery: a DM to someone who isn't connected waits for them.
 (sleep 0.5; echo "/msg alice while you were out"; sleep 1) | client bob b >/dev/null 2>&1
 sleep 2 | client alice a >"$T/alice-back.out" 2>&1
@@ -99,6 +153,29 @@ check  "$T/bob-save.out" "the view" "with its caption"
 absent "$T/home/Downloads/hush-$id.jpg" "GPS" "photo location data is stripped before sending"
 cmp -s <(tail -c 1004 "$T/photo.jpg") <(tail -c 1004 "$T/home/Downloads/hush-$id.jpg") &&
     echo "ok   - the picture itself is unchanged" || { echo "FAIL - image data changed"; fail=1; }
+
+# My data: everything you sent, and DMs to you, but nobody else's messages.
+(sleep 1; echo "/mydata"; sleep 2) | client alice a >"$T/alice-my.out" 2>&1
+my=$(ls -d "$T"/home/Downloads/hush-mydata-main-* | head -1)
+check  "$T/alice-my.out"      "saved your data"       "/mydata saves your data"
+check  "$my/messages.json"    "hello from alice"      "...with your messages"
+check  "$my/messages.json"    "while you were out"    "...and DMs sent to you"
+absent "$my/messages.json"    "hi alice"              "...but not other people's messages"
+[ -f "$my/images/$id.jpg" ] && echo "ok   - ...and your images" || { echo "FAIL - /mydata images"; fail=1; }
+python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$my/messages.json" &&
+    echo "ok   - ...as valid JSON" || { echo "FAIL - /mydata JSON"; fail=1; }
+
+# The operator exports a chat with its key.
+HUSH_KEY=zzzz-zzzz-zzzz-zzzz-zzzz-zzzz admin export main "$T/export" >"$T/export.out" 2>&1
+check "$T/export.out" "isn't the key" "hushd export needs the chat's key"
+HUSH_KEY="$K1" admin export main "$T/export" >"$T/export.out" 2>&1
+check  "$T/export.out"              "exported"                  "hushd export decrypts a chat"
+check  "$T/export/messages.txt"     "alice: hello from alice"   "...into a readable transcript"
+check  "$T/export/messages.txt"     "alice -> bob: [private"    "...with DMs listed, not readable"
+absent "$T/export/messages.txt"     "just for you"              "...since the chat key can't open DMs"
+check  "$T/export/messages.json"    "\"signature\": \"valid\""  "...and signatures checked"
+cmp -s "$T/export/images/$id.jpg" "$T/home/Downloads/hush-$id.jpg" &&
+    echo "ok   - ...and images decrypted" || { echo "FAIL - export images"; fail=1; }
 
 # Nothing readable is stored.
 cat "$S"/hushd.db* "$S"/blobs/* >"$T/stored"
@@ -120,7 +197,11 @@ check "$T/eve3.out" "isn't a chat key" "a malformed key is caught before connect
 # `hushd forget` frees a name.
 admin forget bob >/dev/null
 sleep 1.2
-sleep 1 | client bob mallory >"$T/mallory1.out" 2>&1
+(sleep 1.5) | client bob mallory >"$T/mallory1.out" 2>&1 &
+m=$!
+sleep 0.7
+admin approve main bob >/dev/null
+wait $m
 check "$T/mallory1.out" "chat: main" "hushd forget frees a name, without a restart"
 
 # The server forgets its registrations (or lies): "bob" shows up with a new key.
@@ -128,12 +209,15 @@ kill $srv
 wait $srv 2>/dev/null
 S="$T/s2"
 mkdir -p "$S"
-cp "$T/s1/hushd-keys.txt" "$S/"
+cp "$T/s1/hushd-keys.txt" "$T/s1/hushd-admins.txt" "$S/"
 server "$S"
-(sleep 1; echo "/msg bob can you read this?"; sleep 1.5) | client alice a >"$T/alice2.out" 2>&1 &
-a=$!
-(sleep 0.5; echo "i am totally bob"; sleep 2) | client bob b2 >"$T/mallory2.out" 2>&1 &
+sleep 1 | client alice a >/dev/null 2>&1
+(sleep 0.6; echo "i am totally bob"; sleep 2.5) | client bob b2 >"$T/mallory2.out" 2>&1 &
 m=$!
+sleep 0.3
+admin approve main bob >/dev/null
+(sleep 2; echo "/msg bob can you read this?"; sleep 1.5) | client alice a >"$T/alice2.out" 2>&1 &
+a=$!
 wait $a $m
 check  "$T/alice2.out"   "key has CHANGED"                     "alice is warned when bob's key changes"
 check  "$T/alice2.out"   "a message from bob isn't shown"      "alice doesn't show messages from the changed key"
@@ -150,30 +234,41 @@ check "$T/headers"    "X-Content-Type-Options: nosniff" "sends nosniff"
 check "$T/headers"    "frame-ancestors 'none'"          "can't be framed"
 {
     echo "traversal $(code --path-as-is "$B/../src/server.c") $(code --path-as-is "$B/%2e%2e/Makefile")"
-    echo "unknown $(code "$B/test.sh") $(code "$B/blobs/x") $(code "$B/hushd.db")"
+    echo "unknown $(code "$B/test.sh") $(code "$B/blobs/x") $(code "$B/hushd.db") $(code "$B/hushd-admins.txt")"
     echo "post $(code -X POST "$B/")"
     echo "origin $(code -H 'Upgrade: websocket' -H 'Connection: Upgrade' -H 'Sec-WebSocket-Version: 13' \
         -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Origin: https://evil.example' "$B/ws")"
     echo "garbage $(code -H $'X-Bad: a\x01b' "$B/")"
 } >"$T/http.out"
 check "$T/http.out" "traversal 404 404" "no files outside the web client are served"
-check "$T/http.out" "unknown 404 404 404" "unknown paths, images and the database are 404"
+check "$T/http.out" "unknown 404 404 404 404" "unknown paths, images and server files are 404"
 check "$T/http.out" "post 405"          "only GET and HEAD"
 check "$T/http.out" "origin 403"        "WebSockets from other sites are refused"
 check "$T/http.out" "garbage 400"       "control characters in headers are refused"
 
 if command -v node >/dev/null; then
-    (sleep 1; echo "hello from a browser"; sleep 0.5; echo "/img $T/photo.jpg from the web"; sleep 1; echo "/msg alice web dm"; sleep 1.5) \
-        | web wendy >"$T/wendy.out" 2>&1 &
-    w=$!
-    (sleep 1.3; echo "hello from a terminal"; sleep 3) | client alice a >"$T/alice3.out" 2>&1 &
+    # A web admin lets a web newcomer in.
+    echo | web wally >/dev/null 2>&1 # creates wally's identity (he waits, then leaves)
+    admin admin "$(fingerprint "$T/web-wally.id")" >/dev/null
+    (sleep 2.5; echo "/approve wendy"; sleep 4) | web wally >"$T/wally.out" 2>&1 &
+    w1=$!
+    sleep 1
+    (sleep 3; echo "hello from a browser"; sleep 0.5; echo "/img $T/photo.jpg from the web"; sleep 1;
+     echo "/msg alice web dm"; sleep 0.5; echo "/mydata $T/wendy-my.json"; sleep 1) | web wendy >"$T/wendy.out" 2>&1 &
+    w2=$!
+    (sleep 4; echo "hello from a terminal"; sleep 3) | client alice a >"$T/alice3.out" 2>&1 &
     a=$!
-    wait $w $a
+    wait $w1 $w2 $a
+    check  "$T/wally.out"  "wendy wants to join"           "a web admin sees who wants to join"
+    check  "$T/wendy.out"  "waiting for approval"          "a web newcomer waits"
+    check  "$T/wendy.out"  "connected as wendy"            "...and is let in by the web admin"
     check  "$T/alice3.out" "wendy: hello from a browser"   "terminal receives a web client's message"
     check  "$T/alice3.out" "[dm] wendy: web dm"            "terminal receives a web client's DM"
     check  "$T/alice3.out" "from the web"                  "terminal receives a web client's image"
     check  "$T/wendy.out"  "alice: hello from a terminal"  "web client receives a terminal message"
-    (sleep 1; echo "/save $T/web-saved.jpg"; sleep 1.5) | web walter >"$T/walter.out" 2>&1
+    check  "$T/wendy-my.json" "hello from a browser"       "web \"My data\" has your messages"
+    absent "$T/wendy-my.json" "hello from a terminal"      "...and not other people's"
+    (sleep 1; echo "/save $T/web-saved.jpg"; sleep 1.5) | web wally >"$T/walter.out" 2>&1
     check  "$T/walter.out" "wendy: hello from a browser"   "web client gets history"
     check  "$T/walter.out" "saved"                         "web client downloads an image"
     cmp -s "$T/photo.jpg" "$T/web-saved.jpg" && echo "ok   - ...and it decrypts to the same bytes" ||
@@ -210,7 +305,7 @@ kill $srv
 wait $srv 2>/dev/null
 S="$T/s3"
 mkdir -p "$S"
-cp "$T/s1/hushd-keys.txt" "$S/"
+cp "$T/s1/hushd-keys.txt" "$T/s1/hushd-admins.txt" "$S/"
 server "$S"
 for i in 1 2 3 4 5 6; do sleep 0.2 | client x x zzzz-zzzz-zzzz-zzzz-zzzz-zzzz >"$T/guess$i.out" 2>&1; done
 sleep 1 | client alice a >"$T/guess-right.out" 2>&1

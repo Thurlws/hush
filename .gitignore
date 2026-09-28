@@ -3,9 +3,10 @@ hush
 hushd
 src/*.o
 
-# server state: chat key hashes and name->key registrations
+# server state: chat key hashes, name->key registrations, admins, messages, images
 hushd-keys.txt
 hushd-users.txt
 *.tmp
 hushd.db*
 blobs/
+hushd-admins.txt

@@ -14,6 +14,10 @@
  *   CHALLENGE 32 random bytes
  *   AUTH      ed25519 signature over HUSH_AUTH_CONTEXT || challenge
  *   WELCOME   chat label, then one PEER for every member of the chat
+ * Someone new to a chat gets WAITING instead and waits, seeing nothing,
+ * until an admin approves them (then WELCOME follows) or denies them.
+ * Admins are identity keys the server operator listed by fingerprint;
+ * they get PENDING for each person waiting and answer with DECIDE.
  *
  * After that, clients POST messages; the server stores them and sends a
  * MSG to everyone concerned who is online. HISTORY asks for stored ones.
@@ -60,12 +64,14 @@ enum {
     T_HELLO = 1,   /* name, pk[32], token[32] */
     T_AUTH = 2,    /* sig[64] */
     T_POST = 3,    /* to (name, empty for the chat), body */
-    T_HISTORY = 4, /* u8 dir, u64 anchor id, u16 limit: dir 0 = older than anchor (0: newest), 1 = newer */
+    T_HISTORY = 4, /* u8 dir, u64 anchor id, u16 limit: dir 0 = older than anchor (0: newest), 1 = newer,
+                      2 = newer, only messages you sent or that were sent to you */
     T_UPLOAD = 5,  /* u8 flags (UP_FIRST, UP_LAST), data */
     T_FETCH = 6,   /* blob id[16] */
+    T_DECIDE = 7,  /* admins: u8 approve, name */
     /* server -> client */
     T_CHALLENGE = 10,   /* challenge[32] */
-    T_WELCOME = 11,     /* chat label (same rules as a name) */
+    T_WELCOME = 11,     /* chat label (same rules as a name), u8 flags (WELCOME_ADMIN) */
     T_PEER = 12,        /* name, pk[32], u8 flags (PEER_ONLINE, PEER_NEW) */
     T_LEAVE = 13,       /* name: went offline */
     T_MSG = 14,         /* u64 id, u64 server time (ms), u8 live, from, to, body */
@@ -73,10 +79,14 @@ enum {
     T_HISTORY_END = 16, /* u8 dir, u8 more */
     T_UPLOADED = 17,    /* blob id[16] */
     T_BLOB = 18,        /* blob id[16], u8 status (BLOB_*), data */
+    T_WAITING = 19,     /* chat label: you're on the waitlist */
+    T_PENDING = 20,     /* admins: u8 waiting (1) or decided (0), name, pk[32] */
 };
 
 enum { PEER_ONLINE = 1, PEER_NEW = 2 };
 enum { UP_FIRST = 1, UP_LAST = 2 };
+enum { WELCOME_ADMIN = 1 };
+enum { HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2 };
 enum { BLOB_PART = 0, BLOB_LAST = 1, BLOB_MISSING = 2 };
 enum { KIND_TEXT = 0, KIND_IMAGE = 1 };
 #define HUSH_MSG_VERSION 3

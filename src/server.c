@@ -3,6 +3,7 @@
  * encrypted messages and images, and passes them on. It never holds a key
  * that can decrypt anything. It also serves the web client, which speaks
  * the same protocol over a WebSocket. */
+#include "msg.h"
 #include "proto.h"
 #include "web.h"
 
@@ -21,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,6 +33,7 @@
 #define SEND_TIMEOUT 60 /* ... downloading a response */
 #define MIN_FREE_DISK (1ull << 30) /* refuse uploads below this */
 #define MAX_FETCHES  16 /* queued image downloads per connection */
+#define MAX_WAITING  50 /* people on one chat's waitlist */
 
 /* Per-address limits. IPv6 addresses count per /64, since one machine
  * usually has a whole /64 to pick from. */
@@ -45,7 +48,9 @@
 #define REQ_BURST 60.0
 #define REQ_RATE  5.0
 
-enum cstate { ST_HTTP, ST_HELLO, ST_AUTH, ST_READY };
+enum cstate { ST_HTTP, ST_HELLO, ST_AUTH, ST_WAITING, ST_READY };
+/* A name's standing in a chat (members.state). */
+enum { MEMBER_NONE = -1, MEMBER_WAITING = 0, MEMBER_IN = 1, MEMBER_DENIED = 2 };
 
 struct client {
     int fd;
@@ -55,6 +60,7 @@ struct client {
     int counted;  /* holds one of its address's connection slots */
     int dead, closing;
     int refused;     /* dropped with an error; web clients shouldn't reconnect */
+    int admin;       /* its identity key is on the admin list */
     time_t deadline; /* drop the connection after this; 0 for never */
     uint8_t ip[16];  /* rate-limit key */
     char addr[INET6_ADDRSTRLEN];
@@ -102,8 +108,11 @@ static size_t nusers;
 static struct room *rooms;
 static size_t nrooms;
 static const char *users_path = "hushd-users.txt", *keys_path = "hushd-keys.txt";
-static const char *db_path = "hushd.db", *blob_dir = "blobs";
-static struct stat users_st, keys_st;
+static const char *db_path = "hushd.db", *blob_dir = "blobs", *admins_path = "hushd-admins.txt";
+static struct stat users_st, keys_st, admins_st;
+/* Admins are identity keys, listed by fingerprint (BLAKE2b-128 of the key). */
+static uint8_t (*admins)[16];
+static size_t nadmins;
 static int trust_proxy;
 
 #define LIMIT_SLOTS 4096
@@ -371,6 +380,64 @@ static void users_write(FILE *f)
     }
 }
 
+/* A fingerprint as shown to users ("6937 b1d5 ...", any case, spaces
+ * optional) to its 16 bytes. */
+static int fingerprint_parse(const char *s, uint8_t out[16])
+{
+    char hex[33];
+    size_t k = 0;
+    for (; *s; s++) {
+        if (*s == ' ')
+            continue;
+        if (k == 32)
+            return -1;
+        hex[k++] = *s;
+    }
+    hex[k] = '\0';
+    size_t bl;
+    return k == 32 && sodium_hex2bin(out, 16, hex, 32, NULL, &bl, NULL) == 0 && bl == 16 ? 0 : -1;
+}
+
+static void admins_load(void)
+{
+    nadmins = 0;
+    FILE *f = fopen(admins_path, "r");
+    if (!f)
+        return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "#\r\n")] = '\0';
+        uint8_t fp[16];
+        if (fingerprint_parse(line, fp) != 0)
+            continue;
+        void *p = realloc(admins, (nadmins + 1) * sizeof *admins);
+        if (!p)
+            die("out of memory");
+        admins = p;
+        memcpy(admins[nadmins++], fp, 16);
+    }
+    fclose(f);
+}
+
+static void admins_write(FILE *f)
+{
+    for (size_t i = 0; i < nadmins; i++) {
+        char hex[33];
+        sodium_bin2hex(hex, sizeof hex, admins[i], 16);
+        fprintf(f, "%s\n", hex);
+    }
+}
+
+static int is_admin(const uint8_t pk[crypto_sign_PUBLICKEYBYTES])
+{
+    uint8_t fp[16];
+    crypto_generichash(fp, sizeof fp, pk, crypto_sign_PUBLICKEYBYTES, NULL, 0);
+    for (size_t i = 0; i < nadmins; i++)
+        if (!sodium_memcmp(admins[i], fp, sizeof fp))
+            return 1;
+    return 0;
+}
+
 static int file_changed(const char *path, struct stat *last)
 {
     struct stat st;
@@ -389,7 +456,8 @@ static int file_changed(const char *path, struct stat *last)
 
 static sqlite3 *db;
 enum {
-    Q_INSERT_MSG, Q_OLDER, Q_NEWER, Q_ADD_MEMBER, Q_MEMBERS, Q_IS_MEMBER,
+    Q_INSERT_MSG, Q_OLDER, Q_NEWER, Q_MINE, Q_ADD_MEMBER, Q_MEMBERS, Q_IS_MEMBER,
+    Q_MEMBER_STATE, Q_SET_STATE, Q_WAITING, Q_COUNT_WAITING,
     Q_ADD_BLOB, Q_BLOB_ROOM, NQUERIES
 };
 static const char *const query_sql[NQUERIES] = {
@@ -398,9 +466,15 @@ static const char *const query_sql[NQUERIES] = {
                 "AND (recipient IS NULL OR recipient = ?3 OR sender = ?3) ORDER BY id DESC LIMIT ?4",
     [Q_NEWER] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id > ?2 "
                 "AND (recipient IS NULL OR recipient = ?3 OR sender = ?3) ORDER BY id ASC LIMIT ?4",
-    [Q_ADD_MEMBER] = "INSERT OR IGNORE INTO members (room, name) VALUES (?1, ?2)",
-    [Q_MEMBERS] = "SELECT name FROM members WHERE room = ?1 ORDER BY name",
-    [Q_IS_MEMBER] = "SELECT 1 FROM members WHERE room = ?1 AND name = ?2",
+    [Q_MINE] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id > ?2 "
+               "AND (sender = ?3 OR recipient = ?3) ORDER BY id ASC LIMIT ?4",
+    [Q_ADD_MEMBER] = "INSERT OR IGNORE INTO members (room, name, state) VALUES (?1, ?2, ?3)",
+    [Q_MEMBERS] = "SELECT name FROM members WHERE room = ?1 AND state = 1 ORDER BY name",
+    [Q_IS_MEMBER] = "SELECT 1 FROM members WHERE room = ?1 AND name = ?2 AND state = 1",
+    [Q_MEMBER_STATE] = "SELECT state FROM members WHERE room = ?1 AND name = ?2",
+    [Q_SET_STATE] = "UPDATE members SET state = ?3 WHERE room = ?1 AND name = ?2",
+    [Q_WAITING] = "SELECT name FROM members WHERE room = ?1 AND state = 0 ORDER BY name",
+    [Q_COUNT_WAITING] = "SELECT count(*) FROM members WHERE room = ?1 AND state = 0",
     [Q_ADD_BLOB] = "INSERT INTO blobs (id, room, size, time) VALUES (?1, ?2, ?3, ?4)",
     [Q_BLOB_ROOM] = "SELECT room FROM blobs WHERE id = ?1",
 };
@@ -425,10 +499,17 @@ static void db_open(void)
             "  recipient TEXT, time INTEGER NOT NULL, body BLOB NOT NULL);"
             "CREATE INDEX IF NOT EXISTS messages_room ON messages (room, id);"
             "CREATE TABLE IF NOT EXISTS members ("
-            "  room BLOB NOT NULL, name TEXT NOT NULL, PRIMARY KEY (room, name));"
+            "  room BLOB NOT NULL, name TEXT NOT NULL, state INTEGER NOT NULL DEFAULT 1,"
+            "  PRIMARY KEY (room, name));"
             "CREATE TABLE IF NOT EXISTS blobs ("
             "  id BLOB PRIMARY KEY, room BLOB NOT NULL, size INTEGER NOT NULL, time INTEGER NOT NULL);"
             "CREATE INDEX IF NOT EXISTS blobs_room ON blobs (room);");
+    /* Members from before the waitlist existed stay in. */
+    sqlite3_stmt *probe;
+    if (sqlite3_prepare_v2(db, "SELECT state FROM members LIMIT 0", -1, &probe, NULL) != SQLITE_OK)
+        db_exec("ALTER TABLE members ADD COLUMN state INTEGER NOT NULL DEFAULT 1");
+    else
+        sqlite3_finalize(probe);
     for (int i = 0; i < NQUERIES; i++)
         if (sqlite3_prepare_v3(db, query_sql[i], -1, SQLITE_PREPARE_PERSISTENT, &queries[i], NULL) !=
             SQLITE_OK)
@@ -453,6 +534,27 @@ static int is_member(const uint8_t *room, const char *name)
     int yes = sqlite3_step(s) == SQLITE_ROW;
     sqlite3_reset(s); /* an unfinished statement would pin an old snapshot of the database */
     return yes;
+}
+
+static int member_state(const uint8_t *room, const char *name)
+{
+    sqlite3_stmt *s = q(Q_MEMBER_STATE);
+    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    int state = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int(s, 0) : MEMBER_NONE;
+    sqlite3_reset(s);
+    return state;
+}
+
+static void set_member_state(const uint8_t *room, const char *name, int state)
+{
+    sqlite3_stmt *s = q(member_state(room, name) == MEMBER_NONE ? Q_ADD_MEMBER : Q_SET_STATE);
+    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int(s, 3, state);
+    if (sqlite3_step(s) != SQLITE_DONE)
+        note("updating chat members failed: %s", sqlite3_errmsg(db));
+    sqlite3_reset(s);
 }
 
 static void blob_path(const uint8_t id[HUSH_BLOB_ID], char *out, size_t n)
@@ -562,45 +664,44 @@ static void on_hello(struct client *c, const uint8_t *p, size_t n)
     c->st = ST_AUTH;
 }
 
-static void on_auth(struct client *c, const uint8_t *p, size_t n)
+/* Tell the admins in c's chat that name is waiting (1) or was decided (0). */
+static void notify_admins(const uint8_t *room, uint8_t waiting, const char *name, const uint8_t *pk)
 {
-    uint8_t msg[sizeof HUSH_AUTH_CONTEXT - 1 + HUSH_CHALLENGE_LEN];
-    memcpy(msg, HUSH_AUTH_CONTEXT, sizeof HUSH_AUTH_CONTEXT - 1);
-    memcpy(msg + sizeof HUSH_AUTH_CONTEXT - 1, c->challenge, HUSH_CHALLENGE_LEN);
-    if (n != crypto_sign_BYTES || crypto_sign_verify_detached(p, msg, sizeof msg, c->pk) != 0) {
-        send_error(c, "authentication failed", 1);
-        return;
+    struct buf b = { 0 };
+    buf_put(&b, &waiting, 1);
+    name_put(&b, name);
+    buf_put(&b, pk, crypto_sign_PUBLICKEYBYTES);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (o && !o->dead && o->st == ST_READY && o->admin && !memcmp(o->room, room, 32))
+            send_to(o, T_PENDING, b.data, b.len);
     }
+    buf_free(&b);
+}
+
+/* Let c into its chat: welcome, members, and (for admins) the waitlist. */
+static void admit(struct client *c, int is_new)
+{
     const struct room *r = room_find(c->room);
     if (!r) {
         send_error(c, "this chat's key was revoked", 1);
         return;
     }
-    if (client_find(c->name)) {
-        send_error(c, "that name is already connected", 1);
-        return;
-    }
-    if (!user_find(c->name)) {
-        user_pin(c->name, c->pk);
-        note("%s: registered new user %s", c->addr, c->name);
-    }
-    sqlite3_stmt *s = q(Q_ADD_MEMBER);
-    sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
-    sqlite3_bind_text(s, 2, c->name, -1, SQLITE_STATIC);
-    int is_new = sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(db) > 0;
     c->st = ST_READY;
     c->deadline = 0;
     c->req_tokens = REQ_BURST;
     c->req_t = now_mono();
-    note("%s: %s joined %s", c->addr, c->name, r->label);
+    note("%s: %s joined %s%s", c->addr, c->name, r->label, c->admin ? " (admin)" : "");
 
     struct buf b = { 0 };
+    uint8_t flags = c->admin ? WELCOME_ADMIN : 0;
     name_put(&b, r->label);
+    buf_put(&b, &flags, 1);
     send_to(c, T_WELCOME, b.data, b.len);
     buf_free(&b);
 
     /* Everyone in the chat, online or not, so DMs can be encrypted for them. */
-    s = q(Q_MEMBERS);
+    sqlite3_stmt *s = q(Q_MEMBERS);
     sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
     while (sqlite3_step(s) == SQLITE_ROW) {
         const char *name = (const char *)sqlite3_column_text(s, 0);
@@ -616,6 +717,146 @@ static void on_auth(struct client *c, const uint8_t *p, size_t n)
         if (o && o != c && !o->dead && o->st == ST_READY && same_room(o, c))
             send_peer(o, c->name, c->pk, PEER_ONLINE | (is_new ? PEER_NEW : 0));
     }
+    if (!c->admin)
+        return;
+    s = q(Q_WAITING);
+    sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
+    b = (struct buf){ 0 };
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(s, 0);
+        const struct user *u = name ? user_find(name) : NULL;
+        if (!u)
+            continue;
+        uint8_t waiting = 1;
+        b.len = 0;
+        buf_put(&b, &waiting, 1);
+        name_put(&b, u->name);
+        buf_put(&b, u->pk, sizeof u->pk);
+        send_to(c, T_PENDING, b.data, b.len);
+    }
+    sqlite3_reset(s);
+    buf_free(&b);
+}
+
+static void refuse_denied(struct client *c)
+{
+    note("%s: %s was not let into the chat", c->addr, c->name);
+    send_error(c, "the admin didn't let you into this chat", 1);
+}
+
+static void on_auth(struct client *c, const uint8_t *p, size_t n)
+{
+    uint8_t msg[sizeof HUSH_AUTH_CONTEXT - 1 + HUSH_CHALLENGE_LEN];
+    memcpy(msg, HUSH_AUTH_CONTEXT, sizeof HUSH_AUTH_CONTEXT - 1);
+    memcpy(msg + sizeof HUSH_AUTH_CONTEXT - 1, c->challenge, HUSH_CHALLENGE_LEN);
+    if (n != crypto_sign_BYTES || crypto_sign_verify_detached(p, msg, sizeof msg, c->pk) != 0) {
+        send_error(c, "authentication failed", 1);
+        return;
+    }
+    const struct room *r = room_find(c->room);
+    if (!r) {
+        send_error(c, "this chat's key was revoked", 1);
+        return;
+    }
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (o && o != c && !o->dead && (o->st == ST_READY || o->st == ST_WAITING) &&
+            !strcmp(o->name, c->name)) {
+            send_error(c, "that name is already connected", 1);
+            return;
+        }
+    }
+    if (!user_find(c->name)) {
+        user_pin(c->name, c->pk);
+        note("%s: registered new user %s", c->addr, c->name);
+    }
+    c->admin = is_admin(c->pk);
+    int state = member_state(c->room, c->name);
+    if (state == MEMBER_IN) {
+        admit(c, 0);
+        return;
+    }
+    if (c->admin) { /* admins don't wait */
+        set_member_state(c->room, c->name, MEMBER_IN);
+        admit(c, 1);
+        return;
+    }
+    if (state == MEMBER_DENIED) {
+        refuse_denied(c);
+        return;
+    }
+    if (state == MEMBER_NONE) {
+        sqlite3_stmt *s = q(Q_COUNT_WAITING);
+        sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
+        int waiting = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int(s, 0) : 0;
+        sqlite3_reset(s);
+        if (waiting >= MAX_WAITING) {
+            send_error(c, "the waitlist for this chat is full; try again later", 1);
+            return;
+        }
+        set_member_state(c->room, c->name, MEMBER_WAITING);
+        notify_admins(c->room, 1, c->name, c->pk);
+    }
+    c->st = ST_WAITING;
+    c->deadline = 0;
+    note("%s: %s is waiting to join %s", c->addr, c->name, r->label);
+    struct buf b = { 0 };
+    name_put(&b, r->label);
+    send_to(c, T_WAITING, b.data, b.len);
+    buf_free(&b);
+}
+
+/* Someone waiting may have been approved or denied (here, by `hushd
+ * approve`, or by becoming an admin): act on it. */
+static void recheck_waiting(struct client *c)
+{
+    c->admin = is_admin(c->pk);
+    int state = member_state(c->room, c->name);
+    if (c->admin && state != MEMBER_IN) {
+        set_member_state(c->room, c->name, MEMBER_IN);
+        notify_admins(c->room, 0, c->name, c->pk);
+        state = MEMBER_IN;
+    }
+    if (state == MEMBER_IN)
+        admit(c, 1);
+    else if (state == MEMBER_DENIED || state == MEMBER_NONE)
+        refuse_denied(c);
+}
+
+static void on_decide(struct client *c, const uint8_t *p, size_t n)
+{
+    char name[HUSH_NAME_MAX + 1];
+    if (n < 2 || p[0] > 1 || name_get(p + 1, n - 1, name) != (int)n - 1) {
+        send_error(c, "malformed decision", 1);
+        return;
+    }
+    if (!c->admin) {
+        send_error(c, "only an admin can do that", 0);
+        return;
+    }
+    const struct user *u = user_find(name);
+    if (!u || member_state(c->room, name) != MEMBER_WAITING) {
+        char msg[64 + HUSH_NAME_MAX];
+        snprintf(msg, sizeof msg, "%s isn't waiting to join", name);
+        send_error(c, msg, 0);
+        return;
+    }
+    set_member_state(c->room, name, p[0] ? MEMBER_IN : MEMBER_DENIED);
+    note("%s: %s %s %s", c->addr, c->name, p[0] ? "approved" : "denied", name);
+    notify_admins(c->room, 0, name, u->pk);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (o && !o->dead && o->st == ST_WAITING && same_room(o, c) && !strcmp(o->name, name)) {
+            recheck_waiting(o);
+            return;
+        }
+    }
+    if (p[0]) /* not connected right now: tell the chat they're in */
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            struct client *o = clients[i];
+            if (o && !o->dead && o->st == ST_READY && same_room(o, c))
+                send_peer(o, u->name, u->pk, PEER_NEW);
+        }
 }
 
 static void msg_frame(struct buf *b, int64_t id, int64_t time, uint8_t live, const char *from,
@@ -680,7 +921,7 @@ static void on_post(struct client *c, const uint8_t *p, size_t n)
 
 static void on_history(struct client *c, const uint8_t *p, size_t n)
 {
-    if (n != 11 || p[0] > 1) {
+    if (n != 11 || p[0] > HIST_MINE) {
         send_error(c, "malformed history request", 1);
         return;
     }
@@ -696,7 +937,7 @@ static void on_history(struct client *c, const uint8_t *p, size_t n)
     if (anchor > INT64_MAX)
         anchor = INT64_MAX;
 
-    sqlite3_stmt *s = q(dir == 0 ? Q_OLDER : Q_NEWER);
+    sqlite3_stmt *s = q(dir == HIST_OLDER ? Q_OLDER : dir == HIST_NEWER ? Q_NEWER : Q_MINE);
     sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
     sqlite3_bind_int64(s, 2, (int64_t)anchor);
     sqlite3_bind_text(s, 3, c->name, -1, SQLITE_STATIC);
@@ -900,6 +1141,8 @@ static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_
         on_upload(c, p, n);
     else if (c->st == ST_READY && type == T_FETCH)
         on_fetch(c, p, n);
+    else if (c->st == ST_READY && type == T_DECIDE)
+        on_decide(c, p, n);
     else
         send_error(c, "protocol violation", 1);
 }
@@ -1305,6 +1548,296 @@ static void cmd_forget(const char *name)
     printf("forgot %s; the next person to log in with that name gets it\n", name);
 }
 
+static struct room *room_or_die(const char *label)
+{
+    keys_load();
+    struct room *r = label ? room_by_label(label) : NULL;
+    if (!r || r->old)
+        die("no chat called %s (see hushd keys)", label ? label : "?");
+    return r;
+}
+
+static void print_fingerprint(const uint8_t fp[16])
+{
+    char hex[33];
+    sodium_bin2hex(hex, sizeof hex, fp, 16);
+    for (int i = 0; i < 32; i += 4)
+        printf("%s%.4s", i ? " " : "", hex + i);
+}
+
+static void cmd_admin(const char *text, int add)
+{
+    uint8_t fp[16];
+    if (!text || fingerprint_parse(text, fp) != 0)
+        die("give a fingerprint as shown on the login page, e.g. hushd admin \"6937 b1d5 ... f284\"");
+    admins_load();
+    size_t i = 0;
+    while (i < nadmins && sodium_memcmp(admins[i], fp, 16))
+        i++;
+    if (add && i < nadmins)
+        die("that key is already an admin");
+    if (!add && i == nadmins)
+        die("that key isn't an admin (see hushd admins)");
+    if (add) {
+        void *p = realloc(admins, (nadmins + 1) * sizeof *admins);
+        if (!p)
+            die("out of memory");
+        admins = p;
+        memcpy(admins[nadmins++], fp, 16);
+    } else {
+        memcpy(admins[i], admins[--nadmins], 16);
+    }
+    file_replace(admins_path, admins_write);
+    if (add)
+        printf("added: that key is now an admin in every chat, skips the waitlist and can let people in\n");
+    else
+        printf("removed: that key is no longer an admin\n");
+}
+
+static void cmd_admins(void)
+{
+    admins_load();
+    users_load();
+    if (!nadmins)
+        printf("no admins yet; add yourself with: hushd admin \"YOUR FINGERPRINT\"\n");
+    for (size_t i = 0; i < nadmins; i++) {
+        print_fingerprint(admins[i]);
+        for (size_t j = 0; j < nusers; j++) {
+            uint8_t fp[16];
+            crypto_generichash(fp, sizeof fp, users[j].pk, sizeof users[j].pk, NULL, 0);
+            if (!sodium_memcmp(fp, admins[i], 16))
+                printf("  %s", users[j].name);
+        }
+        printf("\n");
+    }
+}
+
+static void cmd_pending(void)
+{
+    keys_load();
+    users_load();
+    int any = 0;
+    for (size_t i = 0; i < nrooms; i++) {
+        if (rooms[i].old)
+            continue;
+        sqlite3_stmt *s = q(Q_WAITING);
+        sqlite3_bind_blob(s, 1, rooms[i].hash, 32, SQLITE_STATIC);
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(s, 0);
+            const struct user *u = name ? user_find(name) : NULL;
+            if (!u)
+                continue;
+            uint8_t fp[16];
+            crypto_generichash(fp, sizeof fp, u->pk, sizeof u->pk, NULL, 0);
+            printf("%-24s  %-24s  ", rooms[i].label, u->name);
+            print_fingerprint(fp);
+            printf("\n");
+            any = 1;
+        }
+        sqlite3_reset(s);
+    }
+    if (!any)
+        printf("nobody is waiting\n");
+}
+
+static void cmd_decide(const char *label, const char *name, int approve)
+{
+    struct room *r = room_or_die(label);
+    int state = name ? member_state(r->hash, name) : MEMBER_NONE;
+    if (state != MEMBER_WAITING && !(approve && state == MEMBER_DENIED))
+        die("%s isn't waiting to join %s (see hushd pending)", name ? name : "?", label);
+    set_member_state(r->hash, name, approve ? MEMBER_IN : MEMBER_DENIED);
+    printf("%s %s; if they're waiting right now, they find out within a second\n", name,
+           approve ? "is in" : "was turned away");
+}
+
+/* The chat key, from $HUSH_KEY or asked for on the terminal without echo. */
+static void read_chat_key(char *out, size_t n)
+{
+    const char *env = getenv("HUSH_KEY");
+    if (env && *env) {
+        snprintf(out, n, "%s", env);
+        return;
+    }
+    if (!isatty(STDIN_FILENO))
+        die("give the chat key in HUSH_KEY");
+    struct termios t, off;
+    int hide = tcgetattr(STDIN_FILENO, &t) == 0;
+    fputs("chat key: ", stderr);
+    if (hide) {
+        off = t;
+        off.c_lflag &= ~(tcflag_t)ECHO;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &off);
+    }
+    char *ok = fgets(out, (int)n, stdin);
+    if (hide)
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
+    fputc('\n', stderr);
+    if (!ok)
+        die("no chat key given");
+    out[strcspn(out, "\r\n")] = '\0';
+}
+
+static void iso_time(uint64_t ms, char *out, size_t n, int local)
+{
+    time_t t = (time_t)(ms / 1000);
+    struct tm tm;
+    if (local)
+        localtime_r(&t, &tm);
+    else
+        gmtime_r(&t, &tm);
+    strftime(out, n, local ? "%Y-%m-%d %H:%M" : "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+/* Text for messages.txt: control characters become spaces. */
+static void txt_write(FILE *f, const uint8_t *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        fputc(s[i] < 0x20 || s[i] == 0x7f ? ' ' : s[i], f);
+}
+
+/* Decrypt a chat's messages and images with its key, into dir. DMs can't
+ * be read with the chat key, so they're listed without their contents. */
+static void cmd_export(const char *label, const char *dir)
+{
+    struct room *r = room_or_die(label);
+    if (!dir)
+        die("give a new directory to export into: hushd export CHAT DIR");
+    users_load();
+    char key[HUSH_KEY_MAX + 2];
+    uint8_t token[32], chat_key[32], chat_id[32], check[32];
+    read_chat_key(key, sizeof key);
+    if (chat_key_derive(key, strlen(key), token, chat_key) != 0)
+        die("that isn't a chat key");
+    sodium_memzero(key, sizeof key);
+    chat_verifier(token, check);
+    if (sodium_memcmp(check, r->hash, 32))
+        die("that isn't the key for %s", label);
+    crypto_generichash(chat_id, sizeof chat_id, chat_key, sizeof chat_key, NULL, 0);
+
+    char path[4200];
+    if (mkdir(dir, 0700) < 0)
+        die("cannot create %s: %s (give a new directory)", dir, strerror(errno));
+    snprintf(path, sizeof path, "%s/images", dir);
+    if (mkdir(path, 0700) < 0)
+        die("cannot create %s: %s", path, strerror(errno));
+    snprintf(path, sizeof path, "%s/messages.json", dir);
+    FILE *js = fopen(path, "w");
+    snprintf(path, sizeof path, "%s/messages.txt", dir);
+    FILE *tx = fopen(path, "w");
+    if (!js || !tx)
+        die("cannot write in %s: %s", dir, strerror(errno));
+
+    char when[64];
+    iso_time(now_ms(), when, sizeof when, 0);
+    fprintf(js, "{\n  \"chat\": ");
+    json_string(js, (const uint8_t *)label, strlen(label));
+    fprintf(js, ",\n  \"exported\": \"%s\",\n  \"messages\": [", when);
+    fprintf(tx, "hush chat \"%s\", exported %s\n\n", label, when);
+
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db, "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 ORDER BY id",
+                           -1, &s, NULL) != SQLITE_OK)
+        die("database: %s", sqlite3_errmsg(db));
+    sqlite3_bind_blob(s, 1, r->hash, 32, SQLITE_STATIC);
+    static uint8_t plain[HUSH_MAX_FRAME];
+    long count = 0, images = 0, unreadable = 0;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        long long id = sqlite3_column_int64(s, 0);
+        const char *from = (const char *)sqlite3_column_text(s, 2);
+        const char *to = (const char *)sqlite3_column_text(s, 3);
+        const uint8_t *body = sqlite3_column_blob(s, 4);
+        size_t bl = (size_t)sqlite3_column_bytes(s, 4);
+        if (!from)
+            continue;
+        iso_time((uint64_t)sqlite3_column_int64(s, 1), when, sizeof when, 1);
+        fprintf(js, "%s\n    {\"id\": %lld, \"from\": ", count++ ? "," : "", id);
+        json_string(js, (const uint8_t *)from, strlen(from));
+        if (to) {
+            fprintf(js, ", \"to\": ");
+            json_string(js, (const uint8_t *)to, strlen(to));
+            iso_time((uint64_t)sqlite3_column_int64(s, 1), when, sizeof when, 0);
+            fprintf(js, ", \"stored\": \"%s\", \"dm\": \"end-to-end encrypted, not readable with the chat key\"}", when);
+            iso_time((uint64_t)sqlite3_column_int64(s, 1), when, sizeof when, 1);
+            fprintf(tx, "%s  %s -> %s: [private message; can't be read with the chat key]\n", when, from, to);
+            continue;
+        }
+        struct hush_msg m;
+        long pl = body && bl <= sizeof plain ? msg_decrypt(body, bl, chat_key, NULL, plain) : -1;
+        if (pl < 0 || msg_parse(plain, (size_t)pl, &m) != 0 || strcmp(m.from, from) || *m.to) {
+            fprintf(js, ", \"error\": \"could not be decrypted\"}");
+            fprintf(tx, "%s  %s: [could not be decrypted]\n", when, from);
+            unreadable++;
+            continue;
+        }
+        const struct user *u = user_find(from);
+        const char *sig = !u ? "unknown sender" : msg_verify(plain, &m, chat_id, u->pk) == 0 ? "valid" : "INVALID";
+        iso_time(m.time, when, sizeof when, 0);
+        fprintf(js, ", \"time\": \"%s\", \"signature\": \"%s\"", when, sig);
+        iso_time(m.time, when, sizeof when, 1);
+        fprintf(tx, "%s  %s: ", when, from);
+        struct hush_image im;
+        if (m.kind == KIND_TEXT) {
+            fprintf(js, ", \"text\": ");
+            json_string(js, m.content, m.content_len);
+            txt_write(tx, m.content, m.content_len);
+        } else if (m.kind == KIND_IMAGE && image_parse(m.content, m.content_len, &im) == 0) {
+            char file[64], bp[128];
+            snprintf(file, sizeof file, "images/%lld.%s", id, image_ext(im.mime));
+            blob_path(im.blob, bp, sizeof bp);
+            struct buf enc = { 0 };
+            FILE *bf = fopen(bp, "rb");
+            size_t got;
+            if (bf) {
+                do {
+                    buf_reserve(&enc, 1 << 20);
+                    got = fread(enc.data + enc.len, 1, enc.cap - enc.len, bf);
+                    enc.len += got;
+                } while (got > 0 && enc.len <= HUSH_MAX_IMAGE + MSG_NONCE + MSG_MAC);
+                fclose(bf);
+            }
+            uint8_t *img = enc.len >= MSG_NONCE + MSG_MAC ? malloc(enc.len) : NULL;
+            unsigned long long il;
+            snprintf(path, sizeof path, "%s/%s", dir, file);
+            FILE *out = NULL;
+            if (img && crypto_aead_xchacha20poly1305_ietf_decrypt(img, &il, NULL, enc.data + MSG_NONCE,
+                                                                  enc.len - MSG_NONCE, NULL, 0, enc.data,
+                                                                  im.file_key) == 0 &&
+                (out = fopen(path, "wb")) && fwrite(img, 1, (size_t)il, out) == il && fclose(out) == 0) {
+                fprintf(js, ", \"image\": \"%s\"", file);
+                fprintf(tx, "[image %s]", file);
+                images++;
+            } else {
+                if (out)
+                    fclose(out);
+                fprintf(js, ", \"image\": null, \"error\": \"image missing or could not be decrypted\"");
+                fprintf(tx, "[image missing]");
+            }
+            free(img);
+            buf_free(&enc);
+            fprintf(js, ", \"caption\": ");
+            json_string(js, im.caption, im.caption_len);
+            if (im.caption_len)
+                fputc(' ', tx);
+            txt_write(tx, im.caption, im.caption_len);
+        } else {
+            fprintf(js, ", \"error\": \"unknown kind of message\"");
+            fprintf(tx, "[unknown kind of message]");
+        }
+        fprintf(js, "}");
+        fprintf(tx, "%s\n", strcmp(sig, "INVALID") ? "" : "  (signature NOT valid)");
+    }
+    sqlite3_finalize(s);
+    fprintf(js, "\n  ]\n}\n");
+    if (fclose(js) != 0 || fclose(tx) != 0)
+        die("cannot write in %s: %s", dir, strerror(errno));
+    sodium_memzero(chat_key, sizeof chat_key);
+    printf("exported %ld messages and %ld images to %s", count, images, dir);
+    if (unreadable)
+        printf(" (%ld couldn't be decrypted)", unreadable);
+    printf("\nThat folder is the chat in readable form: copy it somewhere safe and delete it from the server.\n");
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -1314,14 +1847,20 @@ static void usage(void)
             "       hushd [options] clear NAME   delete a chat's messages and images, keep the key\n"
             "       hushd [options] revoke NAME  delete a chat: its key, messages and images\n"
             "       hushd [options] forget USER  free up a name (e.g. a friend lost their key)\n"
+            "       hushd [options] admin FP     make the identity key with fingerprint FP an admin\n"
+            "       hushd [options] unadmin FP   ...or not any more\n"
+            "       hushd [options] admins       list admins\n"
+            "       hushd [options] pending      who's waiting to join which chat\n"
+            "       hushd [options] approve CHAT USER, deny CHAT USER\n"
+            "       hushd [options] export CHAT DIR   decrypt a chat into DIR (asks for its key)\n"
             "options:\n"
             "  -C dir        work in dir: keys, users, database and images live there\n"
             "  -p port       port for terminal clients (default " HUSH_DEFAULT_PORT ")\n"
             "  -w port       port for the web client, 0 for none (default " HUSH_DEFAULT_WEB ")\n"
             "  -d dir        web client files (default ./web, else ../share/hush/web from hushd)\n"
             "  -x            trust X-Forwarded-For from a reverse proxy on this machine\n"
-            "files, relative to -C: %s (chat key hashes), %s, %s, %s/\n",
-            keys_path, users_path, db_path, blob_dir);
+            "files, relative to -C: %s (chat key hashes), %s, %s, %s, %s/\n",
+            keys_path, users_path, admins_path, db_path, blob_dir);
     exit(2);
 }
 
@@ -1350,7 +1889,17 @@ int main(int argc, char **argv)
 
     if (optind < argc) {
         const char *cmd = argv[optind], *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
-        if (argc - optind > 2)
+        const char *arg2 = optind + 2 < argc ? argv[optind + 2] : NULL;
+        int nargs = argc - optind - 1;
+        if (!strcmp(cmd, "admin") || !strcmp(cmd, "unadmin")) {
+            /* the fingerprint may come quoted or as eight separate groups */
+            static char fp[128];
+            for (int i = optind + 1; i < argc && strlen(fp) + strlen(argv[i]) + 2 < sizeof fp; i++)
+                strcat(strcat(fp, *fp ? " " : ""), argv[i]);
+            cmd_admin(fp, !strcmp(cmd, "admin"));
+            return 0;
+        }
+        if (nargs > 2 || (nargs == 2 && strcmp(cmd, "approve") && strcmp(cmd, "deny") && strcmp(cmd, "export")))
             usage();
         if (!strcmp(cmd, "newkey")) {
             cmd_newkey(arg);
@@ -1359,6 +1908,14 @@ int main(int argc, char **argv)
         db_open();
         if (!strcmp(cmd, "keys") && !arg)
             cmd_keys();
+        else if (!strcmp(cmd, "admins") && !arg)
+            cmd_admins();
+        else if (!strcmp(cmd, "pending") && !arg)
+            cmd_pending();
+        else if ((!strcmp(cmd, "approve") || !strcmp(cmd, "deny")) && arg2)
+            cmd_decide(arg, arg2, !strcmp(cmd, "approve"));
+        else if (!strcmp(cmd, "export") && arg2)
+            cmd_export(arg, arg2);
         else if (!strcmp(cmd, "revoke"))
             cmd_revoke(arg);
         else if (!strcmp(cmd, "clear"))
@@ -1374,8 +1931,10 @@ int main(int argc, char **argv)
     db_open();
     users_load();
     keys_load();
+    admins_load();
     file_changed(users_path, &users_st);
     file_changed(keys_path, &keys_st);
+    file_changed(admins_path, &admins_st);
 
     int web = strcmp(web_port, "0") != 0;
     if (web) {
@@ -1390,8 +1949,10 @@ int main(int argc, char **argv)
     if (web)
         note("hushd: web client on port %s (files from %s)%s", web_port, web_dir,
              trust_proxy ? ", trusting X-Forwarded-For from localhost" : "");
-    note("hushd: %zu chats in %s, %zu registered users in %s", nrooms, keys_path, nusers,
-         users_path);
+    note("hushd: %zu chats in %s, %zu registered users in %s, %zu admins", nrooms, keys_path, nusers,
+         users_path, nadmins);
+    if (!nadmins)
+        note("hushd: no admins yet, so nobody can approve new people; see hushd admin");
     for (size_t i = 0; i < nrooms; i++)
         if (rooms[i].old)
             note("hushd: the key for %s is from an older version and no longer works; "
@@ -1438,15 +1999,25 @@ int main(int argc, char **argv)
                 pump_downloads(c);
         }
 
-        /* Pick up `hushd newkey/revoke/forget` run while we're up. */
+        /* Pick up `hushd newkey/revoke/forget/admin/approve` run while we're up. */
         if (file_changed(users_path, &users_st))
             users_load();
+        if (file_changed(admins_path, &admins_st)) {
+            admins_load();
+            for (int i = 0; i < MAX_CLIENTS; i++)
+                if (clients[i] && clients[i]->st == ST_READY)
+                    clients[i]->admin = is_admin(clients[i]->pk);
+        }
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (clients[i] && !clients[i]->dead && clients[i]->st == ST_WAITING)
+                recheck_waiting(clients[i]);
         if (file_changed(keys_path, &keys_st)) {
             keys_load();
             note("hushd: reloaded %s (%zu chats)", keys_path, nrooms);
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 struct client *c = clients[i];
-                if (c && (c->st == ST_AUTH || c->st == ST_READY) && !room_find(c->room))
+                if (c && (c->st == ST_AUTH || c->st == ST_WAITING || c->st == ST_READY) &&
+                    !room_find(c->room))
                     send_error(c, "this chat's key was revoked", 1);
             }
         }

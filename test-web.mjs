@@ -2,7 +2,8 @@
 // the way test.sh drives hush: stdin lines are typed, events are printed.
 //   node test-web.mjs NAME KEY URL ORIGIN [IDENTITY-FILE]
 // Besides the chat commands: "/img FILE [caption]" sends an image as is,
-// and "/save FILE" saves the newest image seen.
+// "/save FILE" saves the newest image seen, and "/mydata FILE" writes what
+// "My data" would put in messages.json.
 import { readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import sodium from "./web/sodium.mjs";
@@ -39,7 +40,12 @@ function show(m) {
 const queue = [];
 const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket: WS }, ev => {
   switch (ev.type) {
-  case "ready": console.log(`connected as ${name}, chat: ${ev.label}`); queue.splice(0).forEach(run); break;
+  case "waiting": console.log(`waiting for approval to join ${ev.label}`); break;
+  case "ready":
+    console.log(`connected as ${name}, chat: ${ev.label}${ev.admin ? " (admin)" : ""}`);
+    queue.splice(0).forEach(run);
+    break;
+  case "pending": if (ev.waiting) console.log(`* ${ev.name} wants to join`); break;
   case "peer":
     if (ev.trust === "changed") console.log(`!!! WARNING: ${ev.name}'s key has CHANGED !!!`);
     else if (ev.first || ev.joined || (ev.online && !ev.wasOnline)) console.log(`* ${ev.name} ${ev.online ? "is online" : "is in this chat"}`);
@@ -54,12 +60,16 @@ const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket:
 });
 
 async function run(l) {
-  const img = /^\/img (\S+) ?(.*)$/.exec(l), save = /^\/save (\S+)$/.exec(l);
+  const img = /^\/img (\S+) ?(.*)$/.exec(l), save = /^\/save (\S+)$/.exec(l), mine = /^\/mydata (\S+)$/.exec(l);
   try {
     if (img) {
       const mime = { jpg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp" }[img[1].split(".").pop()];
       await s.sendImage(new Uint8Array(readFileSync(img[1])), { mime, width: 1, height: 1, caption: img[2] });
       console.log("image sent");
+    } else if (mine) {
+      const items = await s.exportMine();
+      writeFileSync(mine[1], JSON.stringify(items.map(m => ({ from: m.from, to: m.to, text: m.text, image: !!m.image })), null, 1));
+      console.log(`my data: ${items.length} messages`);
     } else if (save) {
       writeFileSync(save[1], await s.fetchImage(lastImage));
       console.log(`saved ${save[1]}`);

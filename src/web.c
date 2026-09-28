@@ -22,6 +22,7 @@ static struct asset {
     { "/hush.js", "hush.js", "text/javascript; charset=utf-8", NULL, 0 },
     { "/sodium.mjs", "sodium.mjs", "text/javascript; charset=utf-8", NULL, 0 },
     { "/libsodium.mjs", "libsodium.mjs", "text/javascript; charset=utf-8", NULL, 0 },
+    { "/zip.js", "zip.js", "text/javascript; charset=utf-8", NULL, 0 },
 };
 
 /* Sent with every response. The page only loads its own scripts and styles,

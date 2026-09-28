@@ -6,7 +6,7 @@
 const T = {
   HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6, DECIDE: 7, NEWCHAT: 8,
   CHALLENGE: 10, WELCOME: 11, PEER: 12, LEAVE: 13, MSG: 14, ERROR: 15, HISTORY_END: 16, UPLOADED: 17, BLOB: 18,
-  WAITING: 19, PENDING: 20, CREATED: 21,
+  WAITING: 19, PENDING: 20, CREATED: 21, ADMIN: 22,
 };
 const HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2, WELCOME_ADMIN = 1;
 const PEER_ONLINE = 1, PEER_NEW = 2, UP_FIRST = 1, UP_LAST = 2, BLOB_LAST = 1, BLOB_MISSING = 2;
@@ -101,6 +101,38 @@ function readName(p, off = 0, emptyOk = false) {
   return NAME_RE.test(s) ? [s, off + 1 + p[off]] : null;
 }
 
+// Admins: create a chat without being in one (the home page's "Create your
+// own"). Logs in with no chat key, which the server allows only for admins.
+// The key is made here; only its login token is sent. Resolves to {label, key}.
+export function createChat({ sodium, url, name, secretKey, WebSocket: WS = globalThis.WebSocket }, label) {
+  if (!NAME_RE.test(label)) return Promise.reject(new Error("a chat name is 1-24 letters, digits, _ . or -"));
+  const key = newChatKey(sodium), { token } = deriveChatKey(sodium, key);
+  return new Promise((resolve, reject) => {
+    const ws = new WS(url);
+    let done = false;
+    const finish = (err, value) => {
+      if (done) return;
+      done = true;
+      ws.close();
+      if (err) reject(new Error(err));
+      else resolve(value);
+    };
+    const send = (type, ...parts) => ws.send(concat(Uint8Array.of(type), ...parts));
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => send(T.HELLO, nameBytes(name), publicKey(secretKey), new Uint8Array(32));
+    ws.onmessage = e => {
+      const f = new Uint8Array(e.data), type = f[0], p = f.subarray(1);
+      if (type === T.ERROR) finish(clean(dec.decode(p)));
+      else if (type === T.CHALLENGE && p.length === 32)
+        send(T.AUTH, sodium.crypto_sign_detached(concat(enc.encode(AUTH_CONTEXT), p), secretKey));
+      else if (type === T.ADMIN) send(T.NEWCHAT, nameBytes(label), token);
+      else if (type === T.CREATED && readName(p) && readName(p)[0] === label) finish(null, { label, key });
+      else finish("unexpected reply from the server");
+    };
+    ws.onclose = () => finish("couldn't reach the server");
+  });
+}
+
 // Events passed to onEvent, as { type, ... }:
 //   waiting {label}           on the chat's waitlist until an admin decides
 //   ready {label, admin}      logged in to the chat called label
@@ -139,7 +171,6 @@ export class Session {
     this.admin = false;
     this.pending = new Map(); // admins: name -> fingerprint of people waiting
     this.exporting = null;
-    this.creating = null;
     this.fetches = new Map(); // blob id hex -> {image, resolve, reject, parts, size}
     this.fetchQueue = [];
     this.ws = new WS(url);
@@ -151,7 +182,6 @@ export class Session {
       const err = new Error("disconnected");
       if (this.upload) this.upload.reject(err);
       if (this.exporting) this.exporting.reject(err);
-      if (this.creating) this.creating.reject(err);
       for (const f of this.fetches.values()) f.reject(err);
       for (const f of this.fetchQueue) f.reject(err);
       this.fetches.clear();
@@ -188,10 +218,6 @@ export class Session {
     if (type === T.ERROR) {
       this.lastError = clean(dec.decode(p));
       if (this.upload && /image/.test(this.lastError)) this.upload.reject(new Error(this.lastError));
-      if (this.creating && /chat/.test(this.lastError)) {
-        this.creating.reject(new Error(this.lastError));
-        this.creating = null;
-      }
       this.emit({ type: "error", text: this.lastError });
     } else if (!this.ready) {
       if (type === T.CHALLENGE && p.length === 32) {
@@ -218,24 +244,6 @@ export class Session {
     else if (type === T.UPLOADED && p.length === 16 && this.upload) this.upload.resolve(p.slice());
     else if (type === T.BLOB && p.length >= 17) this.onBlob(p);
     else if (type === T.PENDING) this.onPending(p);
-    else if (type === T.CREATED && this.creating && readName(p) && readName(p)[0] === this.creating.label) {
-      const { label, key, resolve } = this.creating;
-      this.creating = null;
-      resolve({ label, key });
-    }
-  }
-
-  // Admins: make a new chat. The key is made here and only its login token
-  // goes to the server. Resolves to {label, key}.
-  createChat(label) {
-    if (!this.admin) return Promise.reject(new Error("only an admin can create chats"));
-    if (!NAME_RE.test(label)) return Promise.reject(new Error("a chat name is 1-24 letters, digits, _ . or -"));
-    if (this.creating) return Promise.reject(new Error("already creating a chat"));
-    const key = newChatKey(this.s), { token } = deriveChatKey(this.s, key);
-    return new Promise((resolve, reject) => {
-      this.creating = { label, key, resolve, reject };
-      this.send(T.NEWCHAT, nameBytes(label), token);
-    });
   }
 
   onPending(p) {
@@ -532,7 +540,7 @@ export class Session {
         "  /waiting         who's waiting to join\n" +
         "  /approve NAME    let NAME in (check their fingerprint first)\n" +
         "  /deny NAME       turn NAME away\n" +
-        "Create chats with the New chat button." : ""));
+        "Create chats on the home page: + Add session, then Create your own." : ""));
   }
 
   listWaiting() {

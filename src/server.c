@@ -48,7 +48,7 @@
 #define REQ_BURST 60.0
 #define REQ_RATE  5.0
 
-enum cstate { ST_HTTP, ST_HELLO, ST_AUTH, ST_WAITING, ST_READY };
+enum cstate { ST_HTTP, ST_HELLO, ST_AUTH, ST_WAITING, ST_READY, ST_ADMIN };
 /* A name's standing in a chat (members.state). */
 enum { MEMBER_NONE = -1, MEMBER_WAITING = 0, MEMBER_IN = 1, MEMBER_DENIED = 2 };
 
@@ -61,6 +61,7 @@ struct client {
     int dead, closing;
     int refused;     /* dropped with an error; web clients shouldn't reconnect */
     int admin;       /* its identity key is on the admin list */
+    int no_chat;     /* logged in with a zero token, to create chats */
     time_t deadline; /* drop the connection after this; 0 for never */
     uint8_t ip[16];  /* rate-limit key */
     char addr[INET6_ADDRSTRLEN];
@@ -656,8 +657,10 @@ static void on_hello(struct client *c, const uint8_t *p, size_t n)
         send_error(c, "too many wrong keys from your address; wait a few minutes", 1);
         return;
     }
-    chat_verifier(p + k + crypto_sign_PUBLICKEYBYTES, c->room);
-    if (!room_find(c->room)) {
+    c->no_chat = sodium_is_zero(p + k + crypto_sign_PUBLICKEYBYTES, 32);
+    if (!c->no_chat)
+        chat_verifier(p + k + crypto_sign_PUBLICKEYBYTES, c->room);
+    if (!c->no_chat && !room_find(c->room)) {
         l->auth -= 1;
         note("%s: wrong key", c->addr);
         send_error(c, "wrong key", 1);
@@ -761,6 +764,21 @@ static void on_auth(struct client *c, const uint8_t *p, size_t n)
     memcpy(msg + sizeof HUSH_AUTH_CONTEXT - 1, c->challenge, HUSH_CHALLENGE_LEN);
     if (n != crypto_sign_BYTES || crypto_sign_verify_detached(p, msg, sizeof msg, c->pk) != 0) {
         send_error(c, "authentication failed", 1);
+        return;
+    }
+    if (c->no_chat) { /* admins creating a chat from the home page */
+        c->admin = is_admin(c->pk);
+        if (!c->admin) {
+            limit_get(c->ip)->auth -= 1;
+            note("%s: %s tried to create a chat without being an admin", c->addr, c->name);
+            send_error(c, "only an admin can create chats", 1);
+            return;
+        }
+        c->st = ST_ADMIN;
+        c->deadline = time(NULL) + 60;
+        c->req_tokens = REQ_BURST;
+        c->req_t = now_mono();
+        send_to(c, T_ADMIN, NULL, 0);
         return;
     }
     const struct room *r = room_find(c->room);
@@ -1192,7 +1210,7 @@ static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_
         on_fetch(c, p, n);
     else if (c->st == ST_READY && type == T_DECIDE)
         on_decide(c, p, n);
-    else if (c->st == ST_READY && type == T_NEWCHAT)
+    else if ((c->st == ST_READY || c->st == ST_ADMIN) && type == T_NEWCHAT)
         on_newchat(c, p, n);
     else
         send_error(c, "protocol violation", 1);
@@ -2065,7 +2083,7 @@ int main(int argc, char **argv)
             note("hushd: reloaded %s (%zu chats)", keys_path, nrooms);
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 struct client *c = clients[i];
-                if (c && (c->st == ST_AUTH || c->st == ST_WAITING || c->st == ST_READY) &&
+                if (c && !c->no_chat && (c->st == ST_AUTH || c->st == ST_WAITING || c->st == ST_READY) &&
                     !room_find(c->room))
                     send_error(c, "this chat's key was revoked", 1);
             }

@@ -1,6 +1,6 @@
 // The page: login form, chat log, input and images. The protocol is in hush.js.
 import sodium from "./sodium.mjs";
-import { Session, NAME_RE, KEY_MAX, MAX_IMAGE, IMAGE_TYPES, fingerprint, publicKey, normalizeKey } from "./hush.js";
+import { Session, NAME_RE, KEY_MAX, MAX_IMAGE, IMAGE_TYPES, fingerprint, publicKey, normalizeKey, createChat } from "./hush.js";
 import { zip } from "./zip.js";
 
 const $ = id => document.getElementById(id);
@@ -261,7 +261,7 @@ async function saveMyData() {
 // Admins only: a Waitlist button with a count, which opens the list.
 function showWaitlist() {
   const admin = !!(chat && chat.admin), n = admin ? chat.pending.size : 0;
-  $("waitlist-btn").hidden = $("newchat-btn").hidden = !admin;
+  $("waitlist-btn").hidden = !admin;
   $("waitlist-count").textContent = n ? String(n) : "";
   $("waitlist-count").hidden = !n;
   const list = $("waitlist-list");
@@ -279,54 +279,13 @@ function showWaitlist() {
       list.append(row);
     }
   $("waitlist-empty").hidden = n > 0;
-  if (!admin) $("waitlist").hidden = $("newchat").hidden = true;
+  if (!admin) $("waitlist").hidden = true;
 }
 
-// Admin panels drop down from the header, one at a time.
-const PANELS = ["waitlist", "newchat"];
-function togglePanel(id, open = $(id).hidden) {
-  for (const p of PANELS) {
-    $(p).hidden = !(open && p === id);
-    $(p + "-btn").setAttribute("aria-expanded", String(open && p === id));
-  }
-  if (open) (id === "newchat" && $("newchat-result").hidden ? $("newchat-name") : $(id + "-close")).focus();
-}
-
-// ---- new chats (admins) ----------------------------------------------------------
-
-let switchTo = null; // a chat to join once this one is closed
-
-async function createChat(e) {
-  e.preventDefault();
-  const label = $("newchat-name").value.trim();
-  $("newchat-error").textContent = "";
-  $("newchat-create").disabled = true;
-  try {
-    const { key } = await chat.createChat(label);
-    rememberSession(key, chat.name, label);
-    $("newchat-label").textContent = label;
-    $("newchat-key").textContent = key;
-    $("newchat-form").hidden = true;
-    $("newchat-result").hidden = false;
-    $("newchat-join").onclick = () => {
-      togglePanel("newchat", false);
-      switchTo = { name: chat.name, key };
-      chat.close();
-    };
-    $("newchat-close").focus();
-  } catch (err) {
-    $("newchat-error").textContent = capitalize(err.message) + ".";
-  } finally {
-    $("newchat-create").disabled = false;
-  }
-}
-
-function resetNewChat() {
-  $("newchat-form").hidden = false;
-  $("newchat-result").hidden = true;
-  $("newchat-name").value = "";
-  $("newchat-error").textContent = "";
-  $("newchat-key").textContent = "";
+function toggleWaitlist(open = $("waitlist").hidden) {
+  $("waitlist").hidden = !open;
+  $("waitlist-btn").setAttribute("aria-expanded", String(open));
+  if (open) $("waitlist-close").focus();
 }
 
 function showWaiting(label) {
@@ -373,14 +332,55 @@ function showLogin(err) {
   shown.clear();
   $("chat").hidden = true;
   $("waiting").hidden = true;
-  $("waitlist").hidden = $("newchat").hidden = true;
+  $("waitlist").hidden = true;
   $("login").hidden = false;
   $("join").disabled = false;
-  $("join").textContent = "Join";
+  $("join").textContent = mode === "create" ? "Create" : "Join";
   $("login-error").textContent = err || "";
   document.title = "hush";
   showSessions();
-  if (!$("login-form").hidden) ($("name").value ? $("key") : $("name")).focus();
+  if (!$("login-form").hidden) focusForm();
+}
+
+// The Add session form joins with a key, or (admins) creates a new chat.
+let mode = "join";
+function setMode(m) {
+  mode = m;
+  $("join-fields").hidden = m !== "join";
+  $("create-fields").hidden = m !== "create";
+  $("join").textContent = m === "join" ? "Join" : "Create";
+  $("mode").textContent = m === "join" ? "Create your own" : "Join with a key instead";
+  $("login-error").textContent = "";
+}
+
+function focusForm() {
+  (!$("name").value ? $("name") : mode === "create" ? $("chat-name") : $("key")).focus();
+}
+
+const wsUrl = () => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+
+function create(name, label) {
+  if (!NAME_RE.test(label)) return showLogin("A chat name can be 1-24 letters, digits, _ . or -");
+  $("join").disabled = true;
+  $("join").textContent = "Creating…";
+  $("login-error").textContent = "";
+  setTimeout(async () => { // making the key takes a moment (Argon2id); show "Creating…" first
+    try {
+      const { key } = await createChat({ sodium, url: wsUrl(), name, secretKey: sk }, label);
+      local.set("hush.name", name);
+      rememberSession(key, name, label);
+      showSessions();
+      $("sessions-box").hidden = $("login-form").hidden = true;
+      $("created").hidden = false;
+      $("created-label").textContent = label;
+      $("created-key").textContent = key;
+      $("created-join").onclick = () => { adding = false; setMode("join"); connect(name, key); };
+      $("created-copy").focus();
+      $("chat-name").value = "";
+    } catch (e) {
+      showLogin(capitalize(e.message) + ".");
+    }
+  }, 30);
 }
 
 // ---- saved chats ----------------------------------------------------------------
@@ -433,6 +433,7 @@ function showSessions() {
   const listed = sessions.length > 0 && !adding;
   $("sessions-box").hidden = !listed;
   $("login-form").hidden = listed;
+  $("created").hidden = true;
   $("cancel-add").hidden = !sessions.length;
 }
 
@@ -441,7 +442,7 @@ function connect(name, key) {
   $("join").disabled = true;
   $("join").textContent = "Connecting…";
   $("login-error").textContent = "";
-  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  const url = wsUrl();
   // Reading a short key takes a moment (Argon2id), so let the page show "Connecting…" first.
   retryTimer = setTimeout(() => {
     const s = new Session({ sodium, url, name, key, secretKey: sk, known, sinceId: lastId }, ev => {
@@ -503,12 +504,7 @@ function onEvent(ev, name, key) {
   case "notice": line(ev.level, ev.text); break;
   case "error": if (inChat && chat && chat.ready) line("warn", `! server: ${ev.text}`); break;
   case "closed":
-    if (ev.quit && switchTo) { // left to join another chat
-      const { name: n, key: k } = switchTo;
-      switchTo = null;
-      showLogin();
-      connect(n, k);
-    } else if (ev.quit || ev.error) { // left, or the server said no: don't retry
+    if (ev.quit || ev.error) { // left, or the server said no: don't retry
       tab.del("hush.session");
       showLogin(ev.error ? capitalize(ev.error) + "." : "");
     } else if (waiting) { // keep our place in line
@@ -533,6 +529,7 @@ $("login-form").addEventListener("submit", e => {
   e.preventDefault();
   const key = $("key").value.trim(), name = $("name").value.trim();
   if (!NAME_RE.test(name)) return showLogin("Your name can be 1-24 letters, digits, _ . or -");
+  if (mode === "create") return create(name, $("chat-name").value.trim());
   if (!key || key.length > KEY_MAX || !normalizeKey(key))
     return showLogin("That isn't a key. It looks like xxxx-xxxx.");
   connect(name, key);
@@ -581,28 +578,13 @@ $("viewer-close").addEventListener("click", closeViewer);
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
   if (!$("viewer").hidden) closeViewer();
-  else for (const p of PANELS) if (!$(p).hidden) togglePanel(p, false);
+  else if (!$("waitlist").hidden) toggleWaitlist(false);
 });
-for (const p of PANELS) {
-  $(p + "-btn").addEventListener("click", () => {
-    if (p === "newchat" && $(p).hidden) resetNewChat();
-    togglePanel(p);
-  });
-  $(p + "-close").addEventListener("click", () => togglePanel(p, false));
-}
-document.addEventListener("click", e => { // clicking outside a panel closes it
-  for (const p of PANELS)
-    if (!$(p).hidden && !$(p).contains(e.target) && !$(p + "-btn").contains(e.target)) togglePanel(p, false);
-});
-$("newchat-form").addEventListener("submit", createChat);
-$("newchat-copy").addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText($("newchat-key").textContent);
-    $("newchat-copy").textContent = "Copied";
-  } catch { // no clipboard (e.g. plain http): select it for copying by hand
-    getSelection().selectAllChildren($("newchat-key"));
-  }
-  setTimeout(() => { $("newchat-copy").textContent = "Copy"; }, 1500);
+$("waitlist-btn").addEventListener("click", () => toggleWaitlist());
+$("waitlist-close").addEventListener("click", () => toggleWaitlist(false));
+document.addEventListener("click", e => { // clicking outside the panel closes it
+  if (!$("waitlist").hidden && !$("waitlist").contains(e.target) && !$("waitlist-btn").contains(e.target))
+    toggleWaitlist(false);
 });
 
 $("mydata").addEventListener("click", saveMyData);
@@ -620,12 +602,26 @@ $("leave").addEventListener("click", () => {
 
 $("add-session").addEventListener("click", () => {
   adding = true;
-  $("login-error").textContent = "";
+  setMode("join");
   showSessions();
-  ($("name").value ? $("key") : $("name")).focus();
+  focusForm();
+});
+$("mode").addEventListener("click", () => {
+  setMode(mode === "join" ? "create" : "join");
+  focusForm();
+});
+$("created-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("created-key").textContent);
+    $("created-copy").textContent = "Copied";
+  } catch { // no clipboard (e.g. plain http): select it for copying by hand
+    getSelection().selectAllChildren($("created-key"));
+  }
+  setTimeout(() => { $("created-copy").textContent = "Copy"; }, 1500);
 });
 $("cancel-add").addEventListener("click", () => {
   adding = false;
+  setMode("join");
   $("login-error").textContent = "";
   showSessions();
 });

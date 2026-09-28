@@ -107,9 +107,9 @@ Names and fingerprints stay the same. People who were already in a chat don't ha
 
 ## Managing chats
 
-Each key opens one chat, and looks like `k3x7-9fqa`. Admins create chats in the page with the
-**New chat** button (or `/newchat NAME` in the terminal): the key is made on their device, and the
-server only ever gets a hash of a value derived from it. On the server:
+Each key opens one chat, and looks like `k3x7-9fqa`. Admins create chats on the home page: **+ Add
+session**, then **Create your own** (or `/newchat NAME` in the terminal). The key is made on their
+device, and the server only ever gets a hash of a value derived from it. On the server:
 
 ```sh
 hushd newkey NAME     # new chat; prints its key once (the server keeps only a hash)
@@ -184,7 +184,7 @@ Back it up. If you lose it, your friends will get a "key changed" warning.
 | `/trust NAME` | accept NAME's new key after it changed |
 | `/quit` | leave (also the Leave button, or Ctrl-C in the terminal) |
 | `/waiting`, `/approve NAME`, `/deny NAME` | admins: the waitlist |
-| `/newchat NAME` | admins: create a chat and get its key (terminal; the page has a New chat button) |
+| `/newchat NAME` | admins: create a chat and get its key (in the page: + Add session, Create your own) |
 
 In the browser, chats you've joined are saved on the login page: click one to rejoin, or
 **+ Add session** to join another with its key. Send an image with the **+** button or by pasting it; whatever is typed in the box

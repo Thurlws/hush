@@ -21,6 +21,8 @@
  * until an admin approves them (then WELCOME follows) or denies them.
  * Admins are identity keys the server operator listed by fingerprint;
  * they get PENDING for each person waiting and answer with DECIDE.
+ * A HELLO with an all-zero token asks for no chat at all: only admins get
+ * through (ADMIN instead of WELCOME), and can then only send NEWCHAT.
  *
  * After that, clients POST messages; the server stores them and sends a
  * MSG to everyone concerned who is online. HISTORY asks for stored ones.
@@ -87,6 +89,7 @@ enum {
     T_WAITING = 19,     /* chat label: you're on the waitlist */
     T_PENDING = 20,     /* admins: u8 waiting (1) or decided (0), name, pk[32] */
     T_CREATED = 21,     /* admins: chat label, after NEWCHAT */
+    T_ADMIN = 22,       /* admins: logged in without a chat (empty) */
 };
 
 enum { PEER_ONLINE = 1, PEER_NEW = 2 };

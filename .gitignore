@@ -7,3 +7,5 @@ src/*.o
 hushd-keys.txt
 hushd-users.txt
 *.tmp
+hushd.db*
+blobs/

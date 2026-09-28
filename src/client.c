@@ -1,8 +1,12 @@
-/* hush: end-to-end encrypted terminal chat client.
+/* hush: end-to-end encrypted chat client for the terminal.
  *
  * Identity: one ed25519 keypair per user (~/.local/share/hush/identity.key).
- * It signs the server's login challenge and, converted to X25519, is used
- * with crypto_box to encrypt every message separately for each recipient.
+ * It signs the server's login challenge and every message you send, and,
+ * converted to X25519, encrypts DMs with crypto_box.
+ *
+ * Chat messages are encrypted with a key derived from the chat key, which
+ * the server never sees (see proto.h), so everyone in the chat, including
+ * people who join later, can read the history the server stores.
  *
  * Trust: the first key seen for a name is pinned in known_peers. A later
  * different key is refused until the user runs /trust. Comparing
@@ -25,17 +29,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_TEXT  4000
-#define MAX_PEERS 256
-/* Plaintext: u8 kind | u64 counter | u8 len | sender name | text.
- * The pairwise key is the same in both directions, so the sender's name is
- * sealed inside; otherwise the server could bounce your own message back
- * to you as if the other person had said it. */
-#define PLAIN_MIN 10
-#define PLAIN_MAX (PLAIN_MIN + HUSH_NAME_MAX + MAX_TEXT)
-#define BLOB_OVERHEAD (crypto_box_NONCEBYTES + crypto_box_MACBYTES)
+#define MAX_PEERS  256
+#define SEEN_MAX   4096 /* message ids remembered, to drop repeats */
+#define IMAGES_MAX 256  /* images remembered for /save */
+#define NONCE      crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+#define MAC        crypto_aead_xchacha20poly1305_ietf_ABYTES
+/* Plaintext before the names and content: version, kind, time, id. */
+#define PLAIN_HEAD (1 + 1 + 8 + 16)
+#define PLAIN_MAX  (PLAIN_HEAD + 2 * (1 + HUSH_NAME_MAX) + 60 + HUSH_MAX_TEXT + crypto_sign_BYTES)
+#define HISTORY_PAGE 30
 
-enum { KIND_ROOM = 0, KIND_DM = 1 };
 enum { TRUST_OK, TRUST_CHANGED, TRUST_BAD };
 
 struct known {
@@ -47,9 +50,15 @@ struct known {
 struct peer {
     char name[HUSH_NAME_MAX + 1];
     uint8_t pk[crypto_sign_PUBLICKEYBYTES]; /* key the server announced */
-    uint8_t key[crypto_box_BEFORENMBYTES];  /* precomputed shared key */
+    uint8_t key[crypto_box_BEFORENMBYTES];  /* precomputed DM key */
     int online, trust;
-    uint64_t last_ctr; /* highest counter seen, to reject replays */
+};
+
+struct image {
+    uint64_t msg_id;
+    uint8_t file_key[32], blob[HUSH_BLOB_ID];
+    uint32_t size;
+    char mime[32];
 };
 
 static struct known *known;
@@ -59,10 +68,31 @@ static struct peer peers[MAX_PEERS];
 static size_t npeers;
 
 static char my_name[HUSH_NAME_MAX + 1];
-static char chat_key[HUSH_KEY_MAX + 2], chat_label[HUSH_NAME_MAX + 1];
+static char chat_key_text[HUSH_KEY_MAX + 2], chat_label[HUSH_NAME_MAX + 1];
 static uint8_t my_pk[crypto_sign_PUBLICKEYBYTES], my_sk[crypto_sign_SECRETKEYBYTES];
 static uint8_t my_xsk[crypto_scalarmult_BYTES];
-static uint64_t my_ctr;
+static uint8_t token[32], chat_key[32], chat_id[32];
+
+static uint8_t seen[SEEN_MAX][16];
+static size_t nseen;
+static struct image images[IMAGES_MAX];
+static size_t nimages;
+static uint64_t oldest_id; /* for /more */
+static int more_history;
+
+/* One image going up, one coming down. */
+static struct {
+    int active;
+    uint8_t file_key[32];
+    uint32_t size;
+    uint16_t w, h;
+    char mime[32], caption[HUSH_MAX_TEXT + 1];
+} upload;
+static struct {
+    int active;
+    struct image img;
+    struct buf data;
+} download;
 
 static int sock = -1;
 static struct buf rx, tx;
@@ -70,7 +100,7 @@ static int interactive, ui_ready;
 static volatile sig_atomic_t running = 1;
 static struct termios orig_tio;
 static int raw_on;
-static char line[MAX_TEXT + 1];
+static char line[HUSH_MAX_TEXT + 1];
 static size_t line_len;
 static int esc_state;
 
@@ -187,15 +217,27 @@ static int name_color(const char *name)
     return 31 + h % 6;
 }
 
-static void show_msg(const char *from, const char *tag, const uint8_t *text, size_t n)
+/* "14:05" today, else "Mar 3 14:05". */
+static void format_time(uint64_t ms, char *out, size_t n)
 {
-    char ts[8], clean[MAX_TEXT + 1], color[16];
-    time_t t = time(NULL);
-    strftime(ts, sizeof ts, "%H:%M", localtime(&t));
-    sanitize(text, n > MAX_TEXT ? MAX_TEXT : n, clean);
+    time_t t = (time_t)(ms / 1000), now = time(NULL);
+    struct tm a, b;
+    localtime_r(&t, &a);
+    localtime_r(&now, &b);
+    strftime(out, n, a.tm_yday == b.tm_yday && a.tm_year == b.tm_year ? "%H:%M" : "%b %e %H:%M", &a);
+}
+
+static void show_line(uint64_t ms, const char *from, const char *to, const char *text)
+{
+    char ts[32], color[16], tag[64] = "";
+    format_time(ms, ts, sizeof ts);
     snprintf(color, sizeof color, "\033[1;%dm", name_color(from));
+    if (*to && !strcmp(from, my_name))
+        snprintf(tag, sizeof tag, "%s[dm to %s]%s ", col("\033[35m"), to, col("\033[0m"));
+    else if (*to)
+        snprintf(tag, sizeof tag, "%s[dm]%s ", col("\033[35m"), col("\033[0m"));
     say("%s%s%s %s%s%s%s: %s", col("\033[2m"), ts, col("\033[0m"), tag, col(color), from,
-        col("\033[0m"), clean);
+        col("\033[0m"), text);
 }
 
 /* ---- identity and pinned keys ------------------------------------------ */
@@ -315,10 +357,10 @@ static int dial(const char *host, const char *port)
     return fd;
 }
 
-static void net_send(uint8_t type, const struct buf *payload)
+static void net_send_raw(uint8_t type, const void *p, size_t n)
 {
     tx.len = 0;
-    frame_put(&tx, type, payload->data, payload->len);
+    frame_put(&tx, type, p, n);
     for (size_t off = 0; off < tx.len;) {
         ssize_t r = send(sock, tx.data + off, tx.len - off, MSG_NOSIGNAL);
         if (r < 0 && errno == EINTR)
@@ -330,6 +372,11 @@ static void net_send(uint8_t type, const struct buf *payload)
         }
         off += (size_t)r;
     }
+}
+
+static void net_send(uint8_t type, const struct buf *payload)
+{
+    net_send_raw(type, payload->data, payload->len);
 }
 
 /* Block until a whole frame is buffered (handshake only). */
@@ -370,14 +417,10 @@ static void handshake(void)
     const uint8_t *p;
     size_t n, fs;
 
-    uint8_t kl = (uint8_t)strlen(chat_key);
     name_put(&b, my_name);
     buf_put(&b, my_pk, sizeof my_pk);
-    buf_put(&b, &kl, 1);
-    buf_put(&b, chat_key, kl);
+    buf_put(&b, token, sizeof token);
     net_send(T_HELLO, &b);
-    sodium_memzero(b.data, b.len);
-    sodium_memzero(chat_key, sizeof chat_key);
 
     expect(T_CHALLENGE, &p, &n, &fs);
     if (n != HUSH_CHALLENGE_LEN)
@@ -400,7 +443,16 @@ static void handshake(void)
     buf_consume(&rx, fs);
 }
 
-/* ---- peers and messages -------------------------------------------------- */
+static void request_history(int dir, uint64_t anchor, uint16_t limit)
+{
+    uint8_t p[11];
+    p[0] = (uint8_t)dir;
+    put_u64(p + 1, anchor);
+    put_u16(p + 9, limit);
+    net_send_raw(T_HISTORY, p, sizeof p);
+}
+
+/* ---- peers --------------------------------------------------------------- */
 
 static struct peer *peer_find(const char *name)
 {
@@ -419,51 +471,6 @@ static int peer_derive(struct peer *pe)
     return 0;
 }
 
-static uint64_t now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
-}
-
-/* Encrypt text for every online trusted peer (or just `only`). Returns how
- * many copies were sent. */
-static int send_text(int kind, const struct peer *only, const char *text)
-{
-    size_t tl = strlen(text), nl = strlen(my_name), pl = PLAIN_MIN + nl + tl;
-    uint8_t plain[PLAIN_MAX], blob[BLOB_OVERHEAD + PLAIN_MAX];
-    uint64_t now = now_us();
-    my_ctr = now > my_ctr ? now : my_ctr + 1;
-    plain[0] = (uint8_t)kind;
-    put_u64(plain + 1, my_ctr);
-    plain[9] = (uint8_t)nl;
-    memcpy(plain + PLAIN_MIN, my_name, nl);
-    memcpy(plain + PLAIN_MIN + nl, text, tl);
-
-    int sent = 0;
-    struct buf b = { 0 };
-    for (size_t i = 0; i < npeers && running; i++) {
-        struct peer *pe = &peers[i];
-        if ((only && pe != only) || !pe->online)
-            continue;
-        if (pe->trust != TRUST_OK) {
-            say("%s! not sent to %s: their key changed, see /help trust%s", col("\033[1;31m"),
-                pe->name, col("\033[0m"));
-            continue;
-        }
-        randombytes_buf(blob, crypto_box_NONCEBYTES);
-        crypto_box_easy_afternm(blob + crypto_box_NONCEBYTES, plain, pl, blob, pe->key);
-        b.len = 0;
-        name_put(&b, pe->name);
-        buf_put(&b, blob, BLOB_OVERHEAD + pl);
-        net_send(T_SEND, &b);
-        sent++;
-    }
-    buf_free(&b);
-    sodium_memzero(plain, sizeof plain);
-    return sent;
-}
-
 static void on_peer(const uint8_t *p, size_t n)
 {
     char name[HUSH_NAME_MAX + 1], fp[HUSH_FP_LEN], oldfp[HUSH_FP_LEN];
@@ -471,7 +478,7 @@ static void on_peer(const uint8_t *p, size_t n)
     if (k < 0 || n - k != crypto_sign_PUBLICKEYBYTES + 1 || !strcmp(name, my_name))
         return;
     const uint8_t *pk = p + k;
-    int joined = p[k + crypto_sign_PUBLICKEYBYTES];
+    int flags = p[k + crypto_sign_PUBLICKEYBYTES];
 
     struct peer *pe = peer_find(name);
     if (!pe) {
@@ -481,8 +488,9 @@ static void on_peer(const uint8_t *p, size_t n)
         memset(pe, 0, sizeof *pe);
         strcpy(pe->name, name);
     }
+    int was_online = pe->online;
     memcpy(pe->pk, pk, sizeof pe->pk);
-    pe->online = 1;
+    pe->online = flags & PEER_ONLINE;
     fingerprint(pk, fp);
 
     struct known *kn = known_find(name);
@@ -495,14 +503,14 @@ static void on_peer(const uint8_t *p, size_t n)
     if (pe->trust == TRUST_OK && peer_derive(pe) != 0)
         pe->trust = TRUST_BAD;
 
-    const char *what = joined ? "joined" : "is here";
+    const char *what = flags & PEER_NEW ? "joined the chat" : pe->online ? "is online" : "is in this chat";
     if (pe->trust == TRUST_BAD) {
         say("%s! %s presented an invalid key; ignoring them%s", col("\033[1;31m"), name, col("\033[0m"));
     } else if (pe->trust == TRUST_CHANGED) {
         fingerprint(kn->pk, oldfp);
         say("%s!!! WARNING: %s's key has CHANGED !!!%s\n"
             "    Either they reset their identity, or someone (the server?) is trying to\n"
-            "    read your messages. Nothing will be sent to or accepted from them.\n"
+            "    pose as them. Nothing will be sent to or accepted from them.\n"
             "    pinned: %s\n    now:    %s\n"
             "    Call them, compare the new fingerprint, then run /trust %s",
             col("\033[1;31m"), name, col("\033[0m"), oldfp, fp, name);
@@ -510,7 +518,7 @@ static void on_peer(const uint8_t *p, size_t n)
         say("%s* %s %s%s. First time seeing them: fingerprint %s%s%s\n"
             "  Compare it with them on another channel (e.g. a call), then run /verify %s",
             col("\033[33m"), name, what, col("\033[0m"), col("\033[1m"), fp, col("\033[0m"), name);
-    } else {
+    } else if (pe->online && !was_online) {
         say("%s* %s %s%s%s", col("\033[33m"), name, what, kn->verified ? "" : " (unverified)",
             col("\033[0m"));
     }
@@ -523,55 +531,477 @@ static void on_leave(const uint8_t *p, size_t n)
     if (name_get(p, n, name) < 0 || !(pe = peer_find(name)))
         return;
     pe->online = 0;
-    say("%s* %s left%s", col("\033[33m"), name, col("\033[0m"));
+    say("%s* %s went offline%s", col("\033[33m"), name, col("\033[0m"));
 }
 
-static void on_deliver(const uint8_t *p, size_t n)
-{
-    char name[HUSH_NAME_MAX + 1];
-    int k = name_get(p, n, name);
-    if (k < 0)
-        return;
-    const uint8_t *blob = p + k;
-    size_t bl = n - (size_t)k;
+/* ---- messages ------------------------------------------------------------ */
 
-    struct peer *pe = peer_find(name);
-    if (!pe || pe->trust != TRUST_OK) {
-        say("! dropped a message from %s (key not trusted)", name);
-        return;
-    }
-    if (bl < BLOB_OVERHEAD + PLAIN_MIN || bl > BLOB_OVERHEAD + PLAIN_MAX) {
-        say("! dropped a malformed message from %s", name);
-        return;
-    }
-    uint8_t plain[PLAIN_MAX];
-    size_t pl = bl - BLOB_OVERHEAD;
-    if (crypto_box_open_easy_afternm(plain, blob + crypto_box_NONCEBYTES,
-                                     bl - crypto_box_NONCEBYTES, blob, pe->key) != 0) {
-        say("! a message from %s failed to decrypt (tampered with?)", name);
-        return;
-    }
-    uint64_t ctr = get_u64(plain + 1);
-    size_t nl = plain[9], hdr = PLAIN_MIN + nl;
-    if (hdr > pl || nl != strlen(name) || memcmp(plain + PLAIN_MIN, name, nl) != 0) {
-        say("! dropped a message relabelled as coming from %s", name);
-    } else if (ctr <= pe->last_ctr) {
-        say("! dropped a replayed message from %s", name);
+static const char *mime_ext(const char *mime)
+{
+    return !strcmp(mime, "image/jpeg") ? "jpg"
+         : !strcmp(mime, "image/png")  ? "png"
+         : !strcmp(mime, "image/gif")  ? "gif"
+         : !strcmp(mime, "image/webp") ? "webp"
+                                       : NULL;
+}
+
+static void sign_data(struct buf *d, const uint8_t *plain, size_t n)
+{
+    d->len = 0;
+    buf_put(d, HUSH_MSG_CONTEXT, sizeof HUSH_MSG_CONTEXT - 1);
+    buf_put(d, chat_id, sizeof chat_id);
+    buf_put(d, plain, n);
+}
+
+/* Build, sign, encrypt and post a message. to is "" for the chat. */
+static void post(const struct peer *to, int kind, const void *content, size_t cn)
+{
+    struct buf plain = { 0 }, sd = { 0 }, out = { 0 };
+    uint8_t head[PLAIN_HEAD];
+    head[0] = HUSH_MSG_VERSION;
+    head[1] = (uint8_t)kind;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    put_u64(head + 2, (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000);
+    randombytes_buf(head + 10, 16);
+    buf_put(&plain, head, sizeof head);
+    name_put(&plain, my_name);
+    name_put(&plain, to ? to->name : "");
+    buf_put(&plain, content, cn);
+    uint8_t sig[crypto_sign_BYTES];
+    sign_data(&sd, plain.data, plain.len);
+    crypto_sign_detached(sig, NULL, sd.data, sd.len, my_sk);
+    buf_put(&plain, sig, sizeof sig);
+
+    name_put(&out, to ? to->name : "");
+    size_t at = out.len;
+    buf_reserve(&out, NONCE + plain.len + MAC);
+    uint8_t *nonce = out.data + at, *ct = nonce + NONCE;
+    randombytes_buf(nonce, NONCE);
+    if (to) {
+        crypto_box_easy_afternm(ct, plain.data, plain.len, nonce, to->key);
+        out.len = at + NONCE + plain.len + crypto_box_MACBYTES;
     } else {
-        pe->last_ctr = ctr;
-        if (plain[0] == KIND_DM) {
-            char tag[32];
-            snprintf(tag, sizeof tag, "%s[dm]%s ", col("\033[35m"), col("\033[0m"));
-            show_msg(name, tag, plain + hdr, pl - hdr);
-        } else {
-            show_msg(name, "", plain + hdr, pl - hdr);
-        }
+        unsigned long long cl;
+        crypto_aead_xchacha20poly1305_ietf_encrypt(ct, &cl, plain.data, plain.len, NULL, 0, NULL, nonce,
+                                                   chat_key);
+        out.len = at + NONCE + (size_t)cl;
+    }
+    net_send(T_POST, &out);
+    sodium_memzero(plain.data, plain.len);
+    buf_free(&plain);
+    buf_free(&sd);
+    buf_free(&out);
+}
+
+static int seen_before(const uint8_t *id)
+{
+    size_t n = nseen < SEEN_MAX ? nseen : SEEN_MAX;
+    for (size_t i = 0; i < n; i++)
+        if (!memcmp(seen[i], id, 16))
+            return 1;
+    memcpy(seen[nseen++ % SEEN_MAX], id, 16);
+    return 0;
+}
+
+static void show_image(uint64_t msg_id, uint64_t ms, const char *from, const char *to,
+                       const uint8_t *c, size_t n)
+{
+    /* file key | blob id | u32 size | u16 w | u16 h | u8 len + mime | caption */
+    if (n < 32 + 16 + 4 + 4 + 1 || c[56] == 0 || c[56] >= 32 || n < 57u + c[56]) {
+        say("! dropped a malformed image message from %s", from);
+        return;
+    }
+    struct image *im = &images[nimages++ % IMAGES_MAX];
+    im->msg_id = msg_id;
+    memcpy(im->file_key, c, 32);
+    memcpy(im->blob, c + 32, 16);
+    im->size = get_u32(c + 48);
+    memcpy(im->mime, c + 57, c[56]);
+    im->mime[c[56]] = '\0';
+    char caption[HUSH_MAX_TEXT + 1], mime[64], text[HUSH_MAX_TEXT + 200];
+    sanitize(c + 57 + c[56], n - 57 - c[56] > HUSH_MAX_TEXT ? HUSH_MAX_TEXT : n - 57 - c[56], caption);
+    sanitize((const uint8_t *)im->mime, strlen(im->mime), mime);
+    if (!mime_ext(im->mime)) {
+        snprintf(text, sizeof text, "[a file of type %s, not shown]", mime);
+        im->msg_id = 0;
+    } else {
+        snprintf(text, sizeof text, "%s[image %ux%u, %.1f MB, /save %llu]%s%s%s", col("\033[36m"),
+                 get_u16(c + 52), get_u16(c + 54), im->size / 1048576.0, (unsigned long long)msg_id,
+                 col("\033[0m"), *caption ? " " : "", caption);
+    }
+    show_line(ms, from, to, text);
+}
+
+static void on_msg(const uint8_t *p, size_t n)
+{
+    char from[HUSH_NAME_MAX + 1], to[HUSH_NAME_MAX + 1];
+    if (n < 17)
+        return;
+    uint64_t id = get_u64(p);
+    int k1 = name_get(p + 17, n - 17, from), k2;
+    if (k1 < 0 || (k2 = name_get_opt(p + 17 + k1, n - 17 - k1, to)) < 0)
+        return;
+    const uint8_t *body = p + 17 + k1 + k2;
+    size_t bl = n - 17 - (size_t)k1 - (size_t)k2;
+    if (!oldest_id || id < oldest_id)
+        oldest_id = id;
+
+    int mine = !strcmp(from, my_name);
+    const char *other = *to ? (mine ? to : from) : from;
+    struct peer *pe = mine ? NULL : peer_find(from);
+    if (!mine && (!pe || pe->trust != TRUST_OK)) {
+        say("! a message from %s isn't shown: %s", from, pe ? "their key changed (see /help)" : "unknown sender");
+        return;
+    }
+    if (bl < NONCE + MAC || bl > NONCE + MAC + PLAIN_MAX) {
+        say("! dropped a malformed message from %s", from);
+        return;
+    }
+
+    uint8_t plain[PLAIN_MAX];
+    size_t pl = 0;
+    int ok;
+    if (*to) {
+        struct peer *dm = peer_find(other);
+        ok = dm && dm->trust == TRUST_OK &&
+             crypto_box_open_easy_afternm(plain, body + NONCE, bl - NONCE, body, dm->key) == 0;
+        pl = bl - NONCE - crypto_box_MACBYTES;
+    } else {
+        unsigned long long l;
+        ok = crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &l, NULL, body + NONCE, bl - NONCE, NULL,
+                                                        0, body, chat_key) == 0;
+        pl = (size_t)l;
+    }
+    if (!ok) {
+        say("! a message from %s failed to decrypt (tampered with?)", from);
+        return;
+    }
+
+    /* version | kind | time | id | from | to | content | signature */
+    char pfrom[HUSH_NAME_MAX + 1], pto[HUSH_NAME_MAX + 1];
+    int a = -1, b = -1;
+    if (pl >= PLAIN_HEAD + 2 + crypto_sign_BYTES && plain[0] == HUSH_MSG_VERSION)
+        a = name_get(plain + PLAIN_HEAD, pl - PLAIN_HEAD - crypto_sign_BYTES, pfrom);
+    if (a > 0)
+        b = name_get_opt(plain + PLAIN_HEAD + a, pl - PLAIN_HEAD - a - crypto_sign_BYTES, pto);
+    if (b < 0 || strcmp(pfrom, from) || strcmp(pto, to)) {
+        say("! dropped a message relabelled as coming from %s", from);
+        return;
+    }
+    struct buf sd = { 0 };
+    size_t signed_len = pl - crypto_sign_BYTES;
+    sign_data(&sd, plain, signed_len);
+    ok = crypto_sign_verify_detached(plain + signed_len, sd.data, sd.len, mine ? my_pk : pe->pk) == 0;
+    buf_free(&sd);
+    if (!ok) {
+        say("! a message claiming to be from %s has a bad signature", from);
+        return;
+    }
+    if (seen_before(plain + 10))
+        return;
+
+    uint64_t ms = get_u64(plain + 2);
+    const uint8_t *content = plain + PLAIN_HEAD + a + b;
+    size_t cn = signed_len - PLAIN_HEAD - (size_t)a - (size_t)b;
+    if (plain[1] == KIND_TEXT) {
+        char clean[HUSH_MAX_TEXT + 1];
+        sanitize(content, cn > HUSH_MAX_TEXT ? HUSH_MAX_TEXT : cn, clean);
+        show_line(ms, from, to, clean);
+    } else if (plain[1] == KIND_IMAGE) {
+        show_image(id, ms, from, to, content, cn);
     }
     sodium_memzero(plain, sizeof plain);
 }
 
+static void on_history_end(const uint8_t *p, size_t n)
+{
+    if (n == 2 && p[0] == 0) {
+        more_history = p[1];
+        if (more_history)
+            say("%s(older messages: /more)%s", col("\033[2m"), col("\033[0m"));
+    }
+}
+
+/* ---- images ---------------------------------------------------------------- */
+
+/* Drop metadata (EXIF with the GPS position, XMP, comments) before an image
+ * leaves this machine. Each returns the new length. */
+static size_t strip_jpeg(uint8_t *d, size_t n)
+{
+    size_t i = 2, o = 2;
+    while (i + 4 <= n && d[i] == 0xFF && d[i + 1] != 0xDA && d[i + 1] != 0xFF) {
+        uint8_t m = d[i + 1];
+        if (m == 0x01 || (m >= 0xD0 && m <= 0xD8)) { /* markers without a length */
+            memmove(d + o, d + i, 2);
+            o += 2, i += 2;
+            continue;
+        }
+        size_t len = (size_t)d[i + 2] << 8 | d[i + 3];
+        if (len < 2 || len > n - i - 2)
+            break;
+        if (m != 0xE1 && m != 0xED && m != 0xFE) { /* APP1 EXIF/XMP, APP13 IPTC, comment */
+            memmove(d + o, d + i, 2 + len);
+            o += 2 + len;
+        }
+        i += 2 + len;
+    }
+    memmove(d + o, d + i, n - i);
+    return o + n - i;
+}
+
+static size_t strip_png(uint8_t *d, size_t n)
+{
+    static const char *const drop[] = { "eXIf", "tEXt", "zTXt", "iTXt", "tIME" };
+    size_t i = 8, o = 8;
+    while (i + 12 <= n) {
+        uint32_t len = get_u32(d + i);
+        if (len > n - i - 12)
+            break;
+        int keep = 1;
+        for (size_t j = 0; j < sizeof drop / sizeof *drop; j++)
+            keep &= memcmp(d + i + 4, drop[j], 4) != 0;
+        if (keep) {
+            memmove(d + o, d + i, 12 + (size_t)len);
+            o += 12 + len;
+        }
+        i += 12 + len;
+    }
+    memmove(d + o, d + i, n - i);
+    return o + n - i;
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static size_t strip_webp(uint8_t *d, size_t n)
+{
+    size_t i = 12, o = 12;
+    while (i + 8 <= n) {
+        uint32_t len = le32(d + i + 4);
+        if (len > n - i - 8 || len + (len & 1) > n - i - 8)
+            break;
+        size_t full = 8 + len + (len & 1);
+        if (!memcmp(d + i, "VP8X", 4) && len >= 1)
+            d[i + 8] &= (uint8_t)~0x0C; /* no EXIF or XMP chunks follow */
+        if (memcmp(d + i, "EXIF", 4) && memcmp(d + i, "XMP ", 4)) {
+            memmove(d + o, d + i, full);
+            o += full;
+        }
+        i += full;
+    }
+    memmove(d + o, d + i, n - i);
+    o += n - i;
+    uint32_t riff = (uint32_t)(o - 8);
+    for (int j = 0; j < 4; j++)
+        d[4 + j] = (uint8_t)(riff >> (8 * j));
+    return o;
+}
+
+/* Work out the type and size, and strip metadata. Returns -1 if it isn't a supported image. */
+static int image_prepare(uint8_t *d, size_t *n, char mime[32], uint16_t *w, uint16_t *h)
+{
+    *w = *h = 0;
+    if (*n > 12 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF) {
+        strcpy(mime, "image/jpeg");
+        *n = strip_jpeg(d, *n);
+        for (size_t i = 2; i + 9 < *n && d[i] == 0xFF;) {
+            uint8_t m = d[i + 1];
+            if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                *h = get_u16(d + i + 5);
+                *w = get_u16(d + i + 7);
+                break;
+            }
+            if (m == 0xDA)
+                break;
+            i += 2 + ((size_t)d[i + 2] << 8 | d[i + 3]);
+        }
+    } else if (*n > 24 && !memcmp(d, "\x89PNG\r\n\x1a\n", 8)) {
+        strcpy(mime, "image/png");
+        uint32_t pw = get_u32(d + 16), ph = get_u32(d + 20);
+        *w = pw > 65535 ? 65535 : (uint16_t)pw;
+        *h = ph > 65535 ? 65535 : (uint16_t)ph;
+        *n = strip_png(d, *n);
+    } else if (*n > 10 && (!memcmp(d, "GIF87a", 6) || !memcmp(d, "GIF89a", 6))) {
+        strcpy(mime, "image/gif");
+        *w = (uint16_t)(d[6] | d[7] << 8);
+        *h = (uint16_t)(d[8] | d[9] << 8);
+    } else if (*n > 16 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4)) {
+        strcpy(mime, "image/webp");
+        *n = strip_webp(d, *n);
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static void cmd_img(char *arg)
+{
+    if (upload.active) {
+        say("! wait for the image you're sending to finish");
+        return;
+    }
+    char *caption = strchr(arg, ' ');
+    if (caption) {
+        *caption++ = '\0';
+        caption += strspn(caption, " ");
+    }
+    if (!*arg) {
+        say("usage: /img FILE [caption]   (jpeg, png, gif or webp, up to 25 MB)");
+        return;
+    }
+    FILE *f = fopen(arg, "rb");
+    if (!f) {
+        say("! cannot open %s: %s", arg, strerror(errno));
+        return;
+    }
+    struct buf img = { 0 };
+    size_t r;
+    do {
+        buf_reserve(&img, 1 << 20);
+        r = fread(img.data + img.len, 1, img.cap - img.len, f);
+        img.len += r;
+    } while (r > 0 && img.len <= HUSH_MAX_IMAGE);
+    fclose(f);
+    if (img.len > HUSH_MAX_IMAGE) {
+        say("! %s is too big (25 MB at most)", arg);
+        buf_free(&img);
+        return;
+    }
+    if (image_prepare(img.data, &img.len, upload.mime, &upload.w, &upload.h) < 0) {
+        say("! %s isn't a jpeg, png, gif or webp image", arg);
+        buf_free(&img);
+        return;
+    }
+    if (caption && strlen(caption) > HUSH_MAX_TEXT - 100)
+        caption[HUSH_MAX_TEXT - 100] = '\0';
+    snprintf(upload.caption, sizeof upload.caption, "%s", caption ? caption : "");
+    upload.size = (uint32_t)img.len;
+    crypto_aead_xchacha20poly1305_ietf_keygen(upload.file_key);
+
+    /* nonce | ciphertext, sent in pieces */
+    struct buf enc = { 0 };
+    unsigned long long cl;
+    buf_reserve(&enc, NONCE + img.len + MAC);
+    randombytes_buf(enc.data, NONCE);
+    crypto_aead_xchacha20poly1305_ietf_encrypt(enc.data + NONCE, &cl, img.data, img.len, NULL, 0, NULL,
+                                               enc.data, upload.file_key);
+    enc.len = NONCE + (size_t)cl;
+    buf_free(&img);
+    upload.active = 1;
+    say("sending %s (%.1f MB)...", arg, enc.len / 1048576.0);
+    uint8_t piece[1 + HUSH_CHUNK];
+    for (size_t off = 0; off < enc.len && running;) {
+        size_t n = enc.len - off < HUSH_CHUNK ? enc.len - off : HUSH_CHUNK;
+        piece[0] = (uint8_t)((off == 0 ? UP_FIRST : 0) | (off + n == enc.len ? UP_LAST : 0));
+        memcpy(piece + 1, enc.data + off, n);
+        net_send_raw(T_UPLOAD, piece, 1 + n);
+        off += n;
+    }
+    buf_free(&enc);
+}
+
+static void on_uploaded(const uint8_t *p, size_t n)
+{
+    if (!upload.active || n != HUSH_BLOB_ID)
+        return;
+    struct buf c = { 0 };
+    uint8_t meta[4 + 2 + 2 + 1];
+    buf_put(&c, upload.file_key, 32);
+    buf_put(&c, p, HUSH_BLOB_ID);
+    put_u32(meta, upload.size);
+    put_u16(meta + 4, upload.w);
+    put_u16(meta + 6, upload.h);
+    meta[8] = (uint8_t)strlen(upload.mime);
+    buf_put(&c, meta, sizeof meta);
+    buf_put(&c, upload.mime, meta[8]);
+    buf_put(&c, upload.caption, strlen(upload.caption));
+    post(NULL, KIND_IMAGE, c.data, c.len);
+    sodium_memzero(c.data, c.len);
+    buf_free(&c);
+    sodium_memzero(&upload, sizeof upload);
+}
+
+static void cmd_save(const char *arg)
+{
+    char *end;
+    unsigned long long id = strtoull(arg, &end, 10);
+    struct image *im = NULL;
+    for (size_t i = 0; i < IMAGES_MAX && id && !*end; i++)
+        if (images[i].msg_id == id)
+            im = &images[i];
+    if (!im) {
+        say("usage: /save N, with N from an [image ...] line");
+        return;
+    }
+    if (download.active) {
+        say("! wait for the image you're saving to finish");
+        return;
+    }
+    download.active = 1;
+    download.img = *im;
+    download.data.len = 0;
+    net_send_raw(T_FETCH, im->blob, HUSH_BLOB_ID);
+}
+
+static void on_blob(const uint8_t *p, size_t n)
+{
+    if (!download.active || n < HUSH_BLOB_ID + 1 || memcmp(p, download.img.blob, HUSH_BLOB_ID))
+        return;
+    int status = p[HUSH_BLOB_ID];
+    if (status == BLOB_MISSING) {
+        say("! the server doesn't have that image any more");
+        download.active = 0;
+        return;
+    }
+    buf_put(&download.data, p + HUSH_BLOB_ID + 1, n - HUSH_BLOB_ID - 1);
+    if (download.data.len > HUSH_MAX_IMAGE + NONCE + MAC) {
+        say("! that image is too big; not saved");
+        download.active = 0;
+        return;
+    }
+    if (status != BLOB_LAST)
+        return;
+    download.active = 0;
+
+    struct buf *d = &download.data;
+    uint8_t *img = d->len >= NONCE + MAC ? malloc(d->len) : NULL;
+    unsigned long long il;
+    if (!img || crypto_aead_xchacha20poly1305_ietf_decrypt(img, &il, NULL, d->data + NONCE, d->len - NONCE,
+                                                           NULL, 0, d->data, download.img.file_key) != 0) {
+        say("! the image failed to decrypt (tampered with?)");
+        free(img);
+        return;
+    }
+    char dir[4096], path[4200];
+    const char *home = getenv("HOME");
+    struct stat st;
+    snprintf(dir, sizeof dir, "%s/Downloads", home ? home : ".");
+    if (!home || stat(dir, &st) < 0 || !S_ISDIR(st.st_mode))
+        strcpy(dir, ".");
+    int fd = -1;
+    for (int i = 0; i < 100 && fd < 0; i++) {
+        if (i)
+            snprintf(path, sizeof path, "%s/hush-%llu-%d.%s", dir, (unsigned long long)download.img.msg_id, i,
+                     mime_ext(download.img.mime));
+        else
+            snprintf(path, sizeof path, "%s/hush-%llu.%s", dir, (unsigned long long)download.img.msg_id,
+                     mime_ext(download.img.mime));
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    }
+    if (fd < 0 || write(fd, img, (size_t)il) != (ssize_t)il || close(fd) < 0)
+        say("! cannot save %s: %s", path, strerror(errno));
+    else
+        say("saved %s", path);
+    free(img);
+}
+
+/* ---- incoming ---------------------------------------------------------------- */
+
 /* Handle every whole frame in rx. Also called right after the handshake,
- * which may have read the initial PEER frames along with WELCOME. */
+ * which may have read the first frames along with WELCOME. */
 static void process_frames(void)
 {
     uint8_t type;
@@ -583,12 +1013,20 @@ static void process_frames(void)
             on_peer(p, n);
         else if (type == T_LEAVE)
             on_leave(p, n);
-        else if (type == T_DELIVER)
-            on_deliver(p, n);
+        else if (type == T_MSG)
+            on_msg(p, n);
+        else if (type == T_HISTORY_END)
+            on_history_end(p, n);
+        else if (type == T_UPLOADED)
+            on_uploaded(p, n);
+        else if (type == T_BLOB)
+            on_blob(p, n);
         else if (type == T_ERROR) {
             char msg[HUSH_MAX_FRAME + 1];
             sanitize(p, n, msg);
             say("! server: %s", msg);
+            if (upload.active && strstr(msg, "image"))
+                upload.active = 0;
         }
         buf_consume(&rx, fs);
     }
@@ -600,7 +1038,7 @@ static void process_frames(void)
 
 static void on_net(void)
 {
-    buf_reserve(&rx, 16384);
+    buf_reserve(&rx, 65536);
     ssize_t r = recv(sock, rx.data + rx.len, rx.cap - rx.len, 0);
     if (r < 0 && errno == EINTR)
         return;
@@ -617,9 +1055,12 @@ static void on_net(void)
 
 static void cmd_help(void)
 {
-    say("Type a message and press Enter to send it to everyone online.\n"
-        "  /msg NAME TEXT   private message to one person\n"
-        "  /who             who's online, with fingerprints\n"
+    say("Type a message and press Enter to send it to everyone in the chat.\n"
+        "  /msg NAME TEXT   private message to one person (they get it even if offline)\n"
+        "  /img FILE [text] send an image (jpeg, png, gif or webp, up to 25 MB)\n"
+        "  /save N          save image N to ~/Downloads\n"
+        "  /more            show older messages\n"
+        "  /who             who's in the chat, with fingerprints\n"
         "  /fp [NAME]       show your fingerprint, or NAME's\n"
         "  /verify NAME     mark NAME's key as verified after comparing fingerprints\n"
         "  /trust NAME      accept NAME's new key after it changed (verify it first!)\n"
@@ -629,27 +1070,28 @@ static void cmd_help(void)
 
 static void cmd_who(void)
 {
-    int any = 0;
-    say("online:");
-    for (size_t i = 0; i < npeers; i++) {
-        struct peer *pe = &peers[i];
-        if (!pe->online)
-            continue;
-        char fp[HUSH_FP_LEN];
-        fingerprint(pe->pk, fp);
-        struct known *kn = known_find(pe->name);
-        const char *color, *label;
-        if (pe->trust != TRUST_OK)
-            color = "\033[1;31m", label = "KEY CHANGED";
-        else if (kn && kn->verified)
-            color = "\033[32m", label = "verified";
-        else
-            color = "\033[33m", label = "unverified";
-        say("  %-12s  %s  %s%s%s", pe->name, fp, col(color), label, col("\033[0m"));
-        any = 1;
+    say("in %s:", chat_label);
+    for (int pass = 1; pass >= 0; pass--) {
+        for (size_t i = 0; i < npeers; i++) {
+            struct peer *pe = &peers[i];
+            if (pe->online != pass)
+                continue;
+            char fp[HUSH_FP_LEN];
+            fingerprint(pe->pk, fp);
+            struct known *kn = known_find(pe->name);
+            const char *color, *label;
+            if (pe->trust != TRUST_OK)
+                color = "\033[1;31m", label = "KEY CHANGED";
+            else if (kn && kn->verified)
+                color = "\033[32m", label = "verified";
+            else
+                color = "\033[33m", label = "unverified";
+            say("  %-12s  %s  %s%s%s%s", pe->name, fp, col(color), label, col("\033[0m"),
+                pe->online ? "  online" : "");
+        }
     }
-    if (!any)
-        say("  (just you)");
+    if (!npeers)
+        say("  (just you so far)");
 }
 
 static void cmd_fp(const char *name)
@@ -703,7 +1145,6 @@ static void cmd_trust(const char *name)
     kn->verified = 0;
     known_save();
     pe->trust = peer_derive(pe) == 0 ? TRUST_OK : TRUST_BAD;
-    pe->last_ctr = 0;
     char fp[HUSH_FP_LEN];
     fingerprint(pe->pk, fp);
     say("accepted %s's new key %s (unverified)", name, fp);
@@ -720,20 +1161,19 @@ static void cmd_msg(char *arg)
     while (*text == ' ')
         text++;
     struct peer *pe = peer_find(arg);
-    if (!pe || !pe->online) {
-        say("! %s is not online", arg);
-        return;
-    }
-    if (*text && send_text(KIND_DM, pe, text) > 0) {
-        char tag[64];
-        snprintf(tag, sizeof tag, "%s[dm to %s]%s ", col("\033[35m"), pe->name, col("\033[0m"));
-        show_msg(my_name, tag, (const uint8_t *)text, strlen(text));
+    if (!pe) {
+        say("! there is no %s in this chat", arg);
+    } else if (pe->trust != TRUST_OK) {
+        say("%s! not sent to %s: their key changed, see /help%s", col("\033[1;31m"), pe->name,
+            col("\033[0m"));
+    } else if (*text) {
+        post(pe, KIND_TEXT, text, strlen(text));
     }
 }
 
 static void submit(void)
 {
-    char s[MAX_TEXT + 1];
+    char s[HUSH_MAX_TEXT + 1];
     while (line_len && line[line_len - 1] == ' ')
         line_len--;
     memcpy(s, line, line_len);
@@ -759,7 +1199,18 @@ static void submit(void)
             cmd_who();
         else if (!strcmp(cmd, "msg") || !strcmp(cmd, "m"))
             cmd_msg(arg);
-        else if (!strcmp(cmd, "fp"))
+        else if (!strcmp(cmd, "img"))
+            cmd_img(arg);
+        else if (!strcmp(cmd, "save"))
+            cmd_save(arg);
+        else if (!strcmp(cmd, "more")) {
+            if (more_history && oldest_id) {
+                say("%s--- older messages ---%s", col("\033[2m"), col("\033[0m"));
+                request_history(0, oldest_id, HISTORY_PAGE);
+            } else {
+                say("(that's everything)");
+            }
+        } else if (!strcmp(cmd, "fp"))
             cmd_fp(arg);
         else if (!strcmp(cmd, "verify"))
             cmd_verify(arg);
@@ -769,15 +1220,8 @@ static void submit(void)
             say("! unknown command; try /help");
         return;
     }
-
     const char *text = s[0] == '/' ? s + 1 : s;
-    int anyone = 0;
-    for (size_t i = 0; i < npeers; i++)
-        anyone |= peers[i].online;
-    if (send_text(KIND_ROOM, NULL, text) > 0)
-        show_msg(my_name, "", (const uint8_t *)text, strlen(text));
-    else if (running && !anyone)
-        say("(message not sent: nobody else is here)");
+    post(NULL, KIND_TEXT, text, strlen(text));
 }
 
 static void on_key(uint8_t c)
@@ -829,7 +1273,7 @@ static void on_key(uint8_t c)
     default:
         if (c == '\t')
             c = ' ';
-        if (c >= 0x20 && c != 0x7f && line_len < MAX_TEXT)
+        if (c >= 0x20 && c != 0x7f && line_len < HUSH_MAX_TEXT)
             line[line_len++] = (char)c;
     }
     redraw();
@@ -856,13 +1300,13 @@ static void prompt_key(void)
         off.c_lflag &= ~(tcflag_t)ECHO;
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &off);
     }
-    char *ok = fgets(chat_key, sizeof chat_key, stdin);
+    char *ok = fgets(chat_key_text, sizeof chat_key_text, stdin);
     if (hide)
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
     fputc('\n', stderr);
     if (!ok)
         die("no chat key given");
-    chat_key[strcspn(chat_key, "\r\n")] = '\0';
+    chat_key_text[strcspn(chat_key_text, "\r\n")] = '\0';
 }
 
 static void usage(void)
@@ -922,17 +1366,20 @@ int main(int argc, char **argv)
     if (!name || !name_valid(name, strlen(name)))
         die("pick a name with -n (1-24 of A-Z a-z 0-9 _ . -)");
     strcpy(my_name, name);
-    if (key && strlen(key) > HUSH_KEY_MAX)
-        die("that chat key is too long");
-    if (key && *key)
-        strcpy(chat_key, key);
-    else
-        prompt_key();
-    if (!*chat_key || strlen(chat_key) > HUSH_KEY_MAX)
-        die("that chat key is not valid");
 
     if (sodium_init() < 0)
         die("libsodium failed to initialise");
+    if (key && strlen(key) > HUSH_KEY_MAX)
+        die("that chat key is too long");
+    if (key && *key)
+        strcpy(chat_key_text, key);
+    else
+        prompt_key();
+    if (chat_key_derive(chat_key_text, strlen(chat_key_text), token, chat_key) != 0)
+        die("that isn't a chat key (it looks like xxxx-xxxx-xxxx-xxxx-xxxx-xxxx)");
+    sodium_memzero(chat_key_text, sizeof chat_key_text);
+    crypto_generichash(chat_id, sizeof chat_id, chat_key, sizeof chat_key, NULL, 0);
+
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa = { .sa_handler = on_signal };
     sigaction(SIGTERM, &sa, NULL);
@@ -964,6 +1411,7 @@ int main(int argc, char **argv)
     ui_ready = 1;
     redraw();
     process_frames();
+    request_history(0, 0, HISTORY_PAGE);
 
     struct pollfd pfd[2] = { { .fd = sock, .events = POLLIN }, { .fd = STDIN_FILENO, .events = POLLIN } };
     while (running) {

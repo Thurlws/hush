@@ -25,10 +25,11 @@ static struct asset {
 };
 
 /* Sent with every response. The page only loads its own scripts and styles,
- * only connects back to this server, and can't be framed by other sites. */
+ * shows images only from decrypted in-page data (blob: URLs), only connects
+ * back to this server, and can't be framed by other sites. */
 static const char security_headers[] =
     "Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; "
-    "style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+    "style-src 'self'; img-src blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
     "frame-ancestors 'none'\r\n"
     "X-Content-Type-Options: nosniff\r\n"
     "X-Frame-Options: DENY\r\n"

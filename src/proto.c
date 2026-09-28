@@ -1,5 +1,6 @@
 #include "proto.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,11 +100,42 @@ int name_get(const uint8_t *p, size_t n, char out[HUSH_NAME_MAX + 1])
     return 1 + p[0];
 }
 
+int name_get_opt(const uint8_t *p, size_t n, char out[HUSH_NAME_MAX + 1])
+{
+    if (n >= 1 && p[0] == 0) {
+        out[0] = '\0';
+        return 1;
+    }
+    return name_get(p, n, out);
+}
+
 void name_put(struct buf *b, const char *name)
 {
     uint8_t n = (uint8_t)strlen(name);
     buf_put(b, &n, 1);
     buf_put(b, name, n);
+}
+
+void put_u16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
+}
+
+void put_u32(uint8_t *p, uint32_t v)
+{
+    for (int i = 3; i >= 0; i--, v >>= 8)
+        p[i] = (uint8_t)v;
+}
+
+uint16_t get_u16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] << 8 | p[1]);
+}
+
+uint32_t get_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
 void put_u64(uint8_t *p, uint64_t v)
@@ -133,4 +165,37 @@ void fingerprint(const uint8_t pk[crypto_sign_PUBLICKEYBYTES], char out[HUSH_FP_
         *o++ = hex[i];
     }
     *o = '\0';
+}
+
+int chat_key_derive(const char *key, size_t n, uint8_t token[32], uint8_t chat_key[32])
+{
+    static const char alphabet[] = "0123456789abcdefghjkmnpqrstvwxyz";
+    char norm[HUSH_KEY_CHARS];
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = (char)tolower((unsigned char)key[i]);
+        if (ch == '-' || ch == ' ')
+            continue;
+        if (ch == 'o')
+            ch = '0';
+        else if (ch == 'i' || ch == 'l')
+            ch = '1';
+        if (!ch || !strchr(alphabet, ch) || k == HUSH_KEY_CHARS)
+            return -1;
+        norm[k++] = ch;
+    }
+    if (k != HUSH_KEY_CHARS)
+        return -1;
+    /* Different BLAKE2b keys make the two outputs unrelated. */
+    if (token)
+        crypto_generichash(token, 32, (const uint8_t *)norm, k, (const uint8_t *)"hush-chat-login-v3", 18);
+    if (chat_key)
+        crypto_generichash(chat_key, 32, (const uint8_t *)norm, k, (const uint8_t *)"hush-chat-crypt-v3", 18);
+    sodium_memzero(norm, sizeof norm);
+    return 0;
+}
+
+void chat_verifier(const uint8_t token[32], uint8_t out[32])
+{
+    crypto_generichash(out, 32, token, 32, (const uint8_t *)"hush-chat-verify-v3", 19);
 }

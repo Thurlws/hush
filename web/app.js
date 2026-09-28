@@ -1,6 +1,6 @@
-// The page: login form, chat log and input. The protocol is in hush.js.
+// The page: login form, chat log, input and images. The protocol is in hush.js.
 import sodium from "./sodium.mjs";
-import { Session, NAME_RE, KEY_MAX, fingerprint, publicKey } from "./hush.js";
+import { Session, NAME_RE, KEY_MAX, MAX_IMAGE, IMAGE_TYPES, fingerprint, publicKey, deriveChatKey } from "./hush.js";
 
 const $ = id => document.getElementById(id);
 
@@ -37,7 +37,9 @@ const known = {
   set(n, rec) { knownMap.set(n, rec); local.set("hush.known", JSON.stringify(Object.fromEntries(knownMap))); },
 };
 
-let chat = null, retries = 0, retryTimer = null;
+let chat = null, retries = 0, retryTimer = null, lastId = 0;
+const shown = new Set(); // message ids on the page
+const imageUrls = new Map(); // blob id -> object URL of the decrypted image
 const history = [];
 let hi = 0;
 
@@ -55,54 +57,184 @@ function hue(name) {
   return "n" + (h % 6);
 }
 
-function append(div) {
-  const log = $("log");
-  const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
-  log.append(div);
-  if (stick) log.scrollTop = log.scrollHeight;
+const nearBottom = () => { const l = $("log"); return l.scrollHeight - l.scrollTop - l.clientHeight < 80; };
+const toBottom = () => { $("log").scrollTop = $("log").scrollHeight; };
+
+function append(node) {
+  const stick = nearBottom();
+  $("msgs").append(node);
+  if (stick) toBottom();
 }
 
 // All text reaches the page through textContent, never as HTML.
 const line = (cls, text) => append(el("div", cls, text));
 
-function time() {
-  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+function stamp(ms) {
+  const d = new Date(ms), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  return d.toDateString() === now.toDateString() ? time
+    : d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + time;
 }
 
-function showMessage(ev) {
-  const div = el("div", "msg");
-  div.append(el("span", "ts", time() + " "));
-  if (ev.dm) div.append(el("span", "tag", ev.to ? `[dm to ${ev.to}] ` : "[dm] "));
-  div.append(el("span", "name " + hue(ev.from), ev.from), ": " + ev.text);
-  append(div);
+// ---- messages and images ----------------------------------------------------
+
+const lazy = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) { lazy.unobserve(e.target); e.target.load(); }
+}, { root: null, rootMargin: "400px" });
+
+function imageBox(msg) {
+  const { image } = msg, id = sodium.to_hex(image.blob);
+  const box = el("button", "img");
+  box.type = "button";
+  if (image.width && image.height) box.style.aspectRatio = `${image.width} / ${image.height}`;
+  const label = el("span", "img-label", `image · ${(image.size / 1048576).toFixed(1)} MB`);
+  box.append(label);
+  box.load = async () => {
+    try {
+      let url = imageUrls.get(id);
+      if (!url) {
+        if (!chat || !chat.ready) throw new Error("not connected");
+        label.textContent = "loading…";
+        const bytes = await chat.fetchImage(image);
+        url = URL.createObjectURL(new Blob([bytes], { type: image.mime }));
+        imageUrls.set(id, url);
+      }
+      const img = el("img");
+      img.alt = image.caption || `image from ${msg.from}`;
+      img.src = url;
+      box.replaceChildren(img);
+      box.onclick = () => openViewer(url, `hush-${msg.id}.${IMAGE_TYPES[image.mime]}`, img.alt);
+    } catch (e) {
+      label.textContent = `${e.message}; tap to retry`;
+      box.onclick = () => { box.onclick = null; box.load(); };
+    }
+  };
+  lazy.observe(box);
+  return box;
 }
+
+function messageNode(msg) {
+  const div = el("div", "msg");
+  div.append(el("span", "ts", stamp(msg.time) + " "));
+  if (msg.dm) div.append(el("span", "tag", msg.from === chat.name ? `[dm to ${msg.to}] ` : "[dm] "));
+  div.append(el("span", "name " + hue(msg.from), msg.from), ": ");
+  if (msg.image) {
+    if (msg.image.caption) div.append(msg.image.caption);
+    div.append(imageBox(msg));
+  } else {
+    div.append(msg.text);
+  }
+  return div;
+}
+
+function addMessages(messages, where) {
+  const fresh = messages.filter(m => !shown.has(m.id));
+  for (const m of fresh) { shown.add(m.id); lastId = Math.max(lastId, m.id); }
+  if (!fresh.length) return;
+  const nodes = fresh.map(messageNode);
+  if (where === "top") { // keep what's on screen in place
+    const log = $("log"), before = log.scrollHeight;
+    $("msgs").prepend(...nodes);
+    log.scrollTop += log.scrollHeight - before;
+  } else {
+    const stick = nearBottom();
+    $("msgs").append(...nodes);
+    if (stick) toBottom();
+  }
+}
+
+function openViewer(url, filename, alt) {
+  const img = $("viewer-img");
+  img.src = url;
+  img.alt = alt;
+  $("viewer-save").href = url;
+  $("viewer-save").download = filename;
+  $("viewer").hidden = false;
+  $("viewer-close").focus();
+}
+
+function closeViewer() {
+  $("viewer").hidden = true;
+  $("viewer-img").removeAttribute("src");
+  $("msg").focus();
+}
+
+// Photos are decoded and drawn again before sending, which leaves behind
+// everything but the pixels, such as the GPS position phones store in them.
+// GIFs are sent as they are to keep them animated; they carry no location.
+async function prepareImage(file) {
+  let bmp;
+  try { bmp = await createImageBitmap(file); } catch { throw new Error("can't read that image"); }
+  const w0 = bmp.width, h0 = bmp.height;
+  if (file.type === "image/gif") {
+    bmp.close();
+    if (file.size > MAX_IMAGE) throw new Error("image too big (25 MB at most)");
+    return { bytes: new Uint8Array(await file.arrayBuffer()), mime: "image/gif", width: w0, height: h0 };
+  }
+  const scale = Math.min(1, 4096 / Math.max(w0, h0));
+  const canvas = el("canvas");
+  canvas.width = Math.max(1, Math.round(w0 * scale));
+  canvas.height = Math.max(1, Math.round(h0 * scale));
+  canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  bmp.close();
+  const tries = file.type === "image/png" ? [["image/png"], ["image/jpeg", 0.9]] : [["image/jpeg", 0.9], ["image/jpeg", 0.75]];
+  for (const [type, q] of tries) {
+    const blob = await new Promise(r => canvas.toBlob(r, type, q));
+    if (blob && blob.size <= MAX_IMAGE)
+      return { bytes: new Uint8Array(await blob.arrayBuffer()), mime: type, width: canvas.width, height: canvas.height };
+  }
+  throw new Error("image too big (25 MB at most)");
+}
+
+async function sendImage(file) {
+  if (!chat || !chat.ready) return line("warn", "! not connected right now");
+  const caption = $("msg").value.trim();
+  const status = el("div", "info", "preparing image…");
+  append(status);
+  try {
+    const img = await prepareImage(file);
+    $("msg").value = caption ? "" : $("msg").value;
+    await chat.sendImage(img.bytes, { ...img, caption }, f => { status.textContent = `sending image… ${Math.round(f * 100)}%`; });
+    status.remove();
+  } catch (e) {
+    status.className = "warn";
+    status.textContent = `! image not sent: ${e.message}`;
+  }
+}
+
+// ---- people -------------------------------------------------------------------
 
 function showPeer(ev) {
-  const what = ev.joined ? "joined" : "is here";
   if (ev.trust === "bad") line("warn", `! ${ev.name} presented an invalid key; ignoring them`);
   else if (ev.trust === "changed")
     line("warn", `!!! WARNING: ${ev.name}'s key has CHANGED !!!\n` +
       "Either they reset their identity (new browser or device), or someone (the server?) is\n" +
-      "trying to read your messages. Nothing will be sent to or accepted from them.\n" +
+      "trying to pose as them. Nothing will be sent to or accepted from them.\n" +
       `  pinned: ${ev.oldFp}\n  now:    ${ev.fp}\n` +
       `Call them, compare the new fingerprint, then type /trust ${ev.name}`);
   else if (ev.first)
-    line("sys", `* ${ev.name} ${what}. First time seeing them: fingerprint ${ev.fp}\n` +
+    line("sys", `* ${ev.name} ${ev.joined ? "joined the chat" : ev.online ? "is online" : "is in this chat"}. ` +
+      `First time seeing them: fingerprint ${ev.fp}\n` +
       `  Compare it with them on another channel (e.g. a call), then type /verify ${ev.name}`);
-  else line("sys", `* ${ev.name} ${what}${ev.verified ? "" : " (unverified)"}`);
+  else if (ev.joined) line("sys", `* ${ev.name} joined the chat`);
+  else if (ev.online && !ev.wasOnline) line("sys", `* ${ev.name} is online${ev.verified ? "" : " (unverified)"}`);
 }
 
 function showOnline() {
   const names = chat ? chat.online() : [];
-  $("online").textContent = names.length ? `${names.length + 1} here` : "just you";
+  $("online").textContent = names.length ? `${names.length + 1} online` : "just you online";
   $("online").title = [chat ? chat.name : "", ...names].join(", ");
 }
 
-function setStatus(s) { $("dot").className = s; }
+const setStatus = s => { $("dot").className = s; };
+
+// ---- connecting -----------------------------------------------------------------
 
 function showLogin(err) {
   clearTimeout(retryTimer);
   chat = null;
+  lastId = 0;
+  shown.clear();
   $("chat").hidden = true;
   $("login").hidden = false;
   $("join").disabled = false;
@@ -118,7 +250,7 @@ function connect(name, key) {
   $("join").textContent = "Connecting…";
   $("login-error").textContent = "";
   const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
-  const s = new Session({ sodium, url, name, key, secretKey: sk, known }, ev => {
+  const s = new Session({ sodium, url, name, key, secretKey: sk, known, sinceId: lastId }, ev => {
     if (s === chat) onEvent(ev, name, key); // ignore a connection we already gave up on
   });
   chat = s;
@@ -139,15 +271,27 @@ function onEvent(ev, name, key) {
     else {
       $("login").hidden = true;
       $("chat").hidden = false;
-      $("log").replaceChildren();
+      $("msgs").replaceChildren();
+      $("older").hidden = true;
       line("info", `connected as ${name} to the chat "${ev.label}"\nyour fingerprint: ${myFp}\ntype /help for commands`);
       $("msg").focus();
     }
     showOnline();
     break;
+  case "history":
+    if (ev.dir === 0) {
+      const first = !$("msgs").querySelector(".msg");
+      addMessages(ev.messages, first ? "bottom" : "top");
+      $("older").hidden = !ev.more;
+      $("older").disabled = false;
+      if (first) toBottom();
+    } else {
+      addMessages(ev.messages, "bottom");
+    }
+    break;
+  case "message": addMessages([ev.msg], "bottom"); break;
   case "peer": showPeer(ev); showOnline(); break;
-  case "leave": line("sys", `* ${ev.name} left`); showOnline(); break;
-  case "message": showMessage(ev); break;
+  case "leave": line("sys", `* ${ev.name} went offline`); showOnline(); break;
   case "notice": line(ev.level, ev.text); break;
   case "error": if (inChat && chat && chat.ready) line("warn", `! server: ${ev.text}`); break;
   case "closed":
@@ -156,11 +300,10 @@ function onEvent(ev, name, key) {
       showLogin(ev.error ? capitalize(ev.error) + "." : "");
     } else if (!inChat) {
       showLogin("Couldn't reach the server. Try again in a moment.");
-    } else { // dropped: try again with backoff
+    } else { // dropped: try again with backoff, then fetch what was missed
       setStatus("off");
       const wait = Math.min(30, 2 ** retries++);
       line("warn", `! disconnected; trying again in ${wait}s`);
-      showOnline();
       retryTimer = setTimeout(() => connect(name, key), wait * 1000);
     }
     break;
@@ -169,11 +312,14 @@ function onEvent(ev, name, key) {
 
 const capitalize = s => s.charAt(0).toUpperCase() + s.slice(1);
 
+// ---- controls ---------------------------------------------------------------------
+
 $("login-form").addEventListener("submit", e => {
   e.preventDefault();
   const key = $("key").value.trim(), name = $("name").value.trim();
   if (!NAME_RE.test(name)) return showLogin("Your name can be 1-24 letters, digits, _ . or -");
-  if (!key || key.length > KEY_MAX) return showLogin("Enter the key you were given.");
+  if (!key || key.length > KEY_MAX || !deriveChatKey(sodium, key))
+    return showLogin("That isn't a key. It looks like xxxx-xxxx-xxxx-xxxx-xxxx-xxxx.");
   connect(name, key);
 });
 
@@ -195,6 +341,30 @@ $("msg").addEventListener("keydown", e => {
   e.preventDefault();
 });
 
+$("msg").addEventListener("paste", e => {
+  const file = [...(e.clipboardData?.files || [])].find(f => f.type.startsWith("image/"));
+  if (!file) return;
+  e.preventDefault();
+  sendImage(file);
+});
+
+$("attach").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", () => {
+  const file = $("file").files[0];
+  $("file").value = "";
+  if (file) sendImage(file);
+});
+
+$("older").addEventListener("click", () => {
+  if (!chat || !chat.ready) return;
+  $("older").disabled = true;
+  chat.loadOlder();
+});
+
+$("viewer").addEventListener("click", e => { if (e.target === $("viewer")) closeViewer(); });
+$("viewer-close").addEventListener("click", closeViewer);
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("viewer").hidden) closeViewer(); });
+
 $("leave").addEventListener("click", () => {
   if (chat && chat.ws.readyState < 2) return chat.close();
   tab.del("hush.key");
@@ -204,5 +374,5 @@ $("leave").addEventListener("click", () => {
 $("myfp").textContent = myFp;
 $("name").value = local.get("hush.name") || "";
 const saved = tab.get("hush.key");
-if (saved && NAME_RE.test($("name").value)) connect($("name").value, saved);
+if (saved && NAME_RE.test($("name").value) && deriveChatKey(sodium, saved)) connect($("name").value, saved);
 else showLogin($("login-error").textContent);

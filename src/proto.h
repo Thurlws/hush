@@ -1,22 +1,37 @@
-/* Shared wire format for hush (client) and hushd (relay server).
+/* Shared wire format for hush (client) and hushd (server).
  *
  * Every frame is: u32 big-endian length | u8 type | payload
- * where length covers type + payload.
+ * where length covers type + payload. Browsers send the same frames
+ * without the length, one per binary WebSocket message.
  *
- * Browsers send the same frames without the length, one per binary
- * WebSocket message.
+ * Chat keys. The admin creates one per chat with `hushd newkey`. Clients
+ * derive two unrelated values from it: a login token, which is all the
+ * server ever sees (and it stores only a hash of that), and the chat's
+ * encryption key, which never leaves the clients.
  *
  * Handshake (client -> server -> client):
- *   HELLO     name, ed25519 public key, chat key
+ *   HELLO     name, ed25519 public key, login token
  *   CHALLENGE 32 random bytes
  *   AUTH      ed25519 signature over HUSH_AUTH_CONTEXT || challenge
- *   WELCOME   chat label, followed by one PEER per user already in that chat
+ *   WELCOME   chat label, then one PEER for every member of the chat
  *
- * The chat key only gets you into a chat: the server admin creates it with
- * `hushd newkey` and the server keeps just its hash. After the handshake
- * the server only relays SEND -> DELIVER between people in the same chat.
- * The blob inside is nonce || crypto_box ciphertext, which the server
- * cannot read.
+ * After that, clients POST messages; the server stores them and sends a
+ * MSG to everyone concerned who is online. HISTORY asks for stored ones.
+ * Images are uploaded (UPLOAD) and downloaded (FETCH) as encrypted blobs.
+ *
+ * Message body (the blob in POST/MSG), which the server cannot read:
+ *   chat message: nonce[24] | XChaCha20-Poly1305(chat key, plaintext)
+ *   DM:           nonce[24] | crypto_box(sender <-> recipient, plaintext)
+ * plaintext:
+ *   u8 version (3) | u8 kind | u64 time (ms) | id[16] random |
+ *   from (name) | to (name, empty for the chat) | content |
+ *   ed25519 signature by the sender over
+ *     HUSH_MSG_CONTEXT || chat id[32] || everything before the signature
+ *   where chat id = BLAKE2b(chat key).
+ * content, KIND_TEXT:  utf-8 text
+ *          KIND_IMAGE: file key[32] | blob id[16] | u32 size | u16 width |
+ *                      u16 height | u8 len + mime type | utf-8 caption
+ * An image blob is nonce[24] | XChaCha20-Poly1305(file key, image bytes).
  */
 #pragma once
 
@@ -29,23 +44,42 @@
 #define HUSH_MAX_FRAME     (64 * 1024)
 #define HUSH_NAME_MAX      24
 #define HUSH_CHALLENGE_LEN 32
-#define HUSH_AUTH_CONTEXT  "hush-auth-v2"
-#define HUSH_KEY_MAX       64 /* chat key as typed, dashes and spaces allowed */
+#define HUSH_AUTH_CONTEXT  "hush-auth-v3"
+#define HUSH_MSG_CONTEXT   "hush-msg-v3"
+#define HUSH_KEY_CHARS     24 /* chat key: Crockford base32, 120 random bits */
+#define HUSH_KEY_MAX       64 /* as typed, dashes and spaces allowed */
 #define HUSH_FP_LEN        40 /* 32 hex digits in groups of 4, plus NUL */
+#define HUSH_MAX_TEXT      4000
+#define HUSH_MAX_IMAGE     (25u << 20)
+#define HUSH_CHUNK         (48 * 1024) /* upload/download piece */
+#define HUSH_BLOB_ID       16
+#define HUSH_HISTORY_MAX   200 /* messages per HISTORY request */
 
 enum {
     /* client -> server */
-    T_HELLO = 1,     /* name, pk[32], u8 len + chat key */
-    T_AUTH = 2,      /* sig[64] */
-    T_SEND = 3,      /* to-name, blob */
+    T_HELLO = 1,   /* name, pk[32], token[32] */
+    T_AUTH = 2,    /* sig[64] */
+    T_POST = 3,    /* to (name, empty for the chat), body */
+    T_HISTORY = 4, /* u8 dir, u64 anchor id, u16 limit: dir 0 = older than anchor (0: newest), 1 = newer */
+    T_UPLOAD = 5,  /* u8 flags (UP_FIRST, UP_LAST), data */
+    T_FETCH = 6,   /* blob id[16] */
     /* server -> client */
-    T_CHALLENGE = 10, /* challenge[32] */
-    T_WELCOME = 11,   /* chat label (same rules as a name) */
-    T_PEER = 12,      /* name, pk[32], u8 just_joined */
-    T_LEAVE = 13,     /* name */
-    T_DELIVER = 14,   /* from-name, blob */
-    T_ERROR = 15,     /* utf-8 text */
+    T_CHALLENGE = 10,   /* challenge[32] */
+    T_WELCOME = 11,     /* chat label (same rules as a name) */
+    T_PEER = 12,        /* name, pk[32], u8 flags (PEER_ONLINE, PEER_NEW) */
+    T_LEAVE = 13,       /* name: went offline */
+    T_MSG = 14,         /* u64 id, u64 server time (ms), u8 live, from, to, body */
+    T_ERROR = 15,       /* utf-8 text */
+    T_HISTORY_END = 16, /* u8 dir, u8 more */
+    T_UPLOADED = 17,    /* blob id[16] */
+    T_BLOB = 18,        /* blob id[16], u8 status (BLOB_*), data */
 };
+
+enum { PEER_ONLINE = 1, PEER_NEW = 2 };
+enum { UP_FIRST = 1, UP_LAST = 2 };
+enum { BLOB_PART = 0, BLOB_LAST = 1, BLOB_MISSING = 2 };
+enum { KIND_TEXT = 0, KIND_IMAGE = 1 };
+#define HUSH_MSG_VERSION 3
 
 struct buf {
     uint8_t *data;
@@ -63,14 +97,28 @@ void frame_put(struct buf *out, uint8_t type, const void *payload, size_t n);
 int frame_peek(const struct buf *b, uint8_t *type, const uint8_t **payload,
                size_t *len, size_t *frame_size);
 
-/* Names (and chat labels) are 1..HUSH_NAME_MAX of [A-Za-z0-9_.-] and go on the wire as u8 len + bytes. */
+/* Names (and chat labels) are 1..HUSH_NAME_MAX of [A-Za-z0-9_.-] and go on
+ * the wire as u8 len + bytes. name_get returns the bytes used, or -1;
+ * with empty_ok, a zero-length name (meaning "the whole chat") is allowed. */
 int name_valid(const char *s, size_t n);
 int name_get(const uint8_t *p, size_t n, char out[HUSH_NAME_MAX + 1]);
+int name_get_opt(const uint8_t *p, size_t n, char out[HUSH_NAME_MAX + 1]);
 void name_put(struct buf *b, const char *name);
 
+void put_u16(uint8_t *p, uint16_t v);
+void put_u32(uint8_t *p, uint32_t v);
 void put_u64(uint8_t *p, uint64_t v);
+uint16_t get_u16(const uint8_t *p);
+uint32_t get_u32(const uint8_t *p);
 uint64_t get_u64(const uint8_t *p);
 
 void fingerprint(const uint8_t pk[crypto_sign_PUBLICKEYBYTES], char out[HUSH_FP_LEN]);
+
+/* Read a chat key as typed (case, dashes and spaces don't matter; o, i
+ * and l count as 0, 1 and 1) and derive its login token and the chat's
+ * encryption key. Either output may be NULL. Returns -1 if it can't be a key. */
+int chat_key_derive(const char *key, size_t n, uint8_t token[32], uint8_t chat_key[32]);
+/* What the server stores for a login token. */
+void chat_verifier(const uint8_t token[32], uint8_t out[32]);
 
 __attribute__((noreturn, format(printf, 1, 2))) void die(const char *fmt, ...);

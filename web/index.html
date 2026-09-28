@@ -31,10 +31,23 @@
     <span id="dot"></span><b id="label">hush</b><span id="online"></span>
     <button id="leave" type="button">Leave</button>
   </header>
-  <div id="log" aria-live="polite"></div>
+  <div id="log">
+    <button id="older" type="button" hidden>Load older messages</button>
+    <div id="msgs" aria-live="polite"></div>
+  </div>
   <form id="send-form" autocomplete="off">
+    <button id="attach" type="button" title="Send an image" aria-label="Send an image">+</button>
+    <input id="file" type="file" accept="image/*" hidden>
     <input id="msg" maxlength="4000" placeholder="message, or /help" aria-label="message">
   </form>
+</div>
+
+<div id="viewer" hidden role="dialog" aria-label="Image">
+  <img id="viewer-img" alt="">
+  <div id="viewer-bar">
+    <a id="viewer-save" href="#">Save</a>
+    <button id="viewer-close" type="button">Close</button>
+  </div>
 </div>
 </body>
 </html>

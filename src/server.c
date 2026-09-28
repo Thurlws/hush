@@ -1,24 +1,26 @@
-/* hushd: relay server. It authenticates users by their signing key, lets
- * them into a chat only with a key the admin created, and forwards
- * encrypted blobs between people in the same chat. It never holds a key
- * that can decrypt messages. It also serves the web client, which speaks
+/* hushd: the hush server. It lets people into a chat only with a key the
+ * admin created, authenticates them by their signing key, stores their
+ * encrypted messages and images, and passes them on. It never holds a key
+ * that can decrypt anything. It also serves the web client, which speaks
  * the same protocol over a WebSocket. */
 #include "proto.h"
 #include "web.h"
 
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sqlite3.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,21 +29,21 @@
 #define AUTH_TIMEOUT 15 /* seconds a connection may spend in the handshake */
 #define HTTP_TIMEOUT 10 /* ... sending its HTTP request */
 #define SEND_TIMEOUT 60 /* ... downloading a response */
+#define MIN_FREE_DISK (1ull << 30) /* refuse uploads below this */
+#define MAX_FETCHES  16 /* queued image downloads per connection */
 
 /* Per-address limits. IPv6 addresses count per /64, since one machine
  * usually has a whole /64 to pick from. */
-#define IP_CONNS   16         /* open connections */
-#define CONN_BURST 30.0       /* new connections and HTTP requests ... */
-#define CONN_RATE  0.5        /* ... refilled per second */
-#define AUTH_BURST 5.0        /* wrong chat keys ... */
-#define AUTH_RATE  (1.0 / 60) /* ... refilled per second */
-/* Per connection. Each copy of a message counts, one per recipient. */
-#define MSG_BURST 300.0
-#define MSG_RATE  50.0
-
-/* Chat keys: 24 characters of Crockford base32, 120 random bits. */
-#define KEY_CHARS 24
-static const char key_alphabet[] = "0123456789abcdefghjkmnpqrstvwxyz";
+#define IP_CONNS    16                 /* open connections */
+#define CONN_BURST  30.0               /* new connections and HTTP requests ... */
+#define CONN_RATE   0.5                /* ... refilled per second */
+#define AUTH_BURST  5.0                /* wrong chat keys ... */
+#define AUTH_RATE   (1.0 / 60)         /* ... refilled per second */
+#define UP_BURST    (100.0 * (1 << 20)) /* uploaded bytes ... */
+#define UP_RATE     (1.0 * (1 << 20))  /* ... refilled per second */
+/* Per connection: messages, history requests and downloads. */
+#define REQ_BURST 60.0
+#define REQ_RATE  5.0
 
 enum cstate { ST_HTTP, ST_HELLO, ST_AUTH, ST_READY };
 
@@ -59,9 +61,19 @@ struct client {
     char name[HUSH_NAME_MAX + 1];
     uint8_t pk[crypto_sign_PUBLICKEYBYTES];
     uint8_t challenge[HUSH_CHALLENGE_LEN];
-    uint8_t room[crypto_generichash_BYTES];
-    double msg_tokens, msg_t;
+    uint8_t room[32];
+    double req_tokens, req_t;
     struct buf in, out;
+    /* image upload in progress */
+    int up_fd;
+    size_t up_len;
+    char up_path[64];
+    /* image downloads: the one being sent, then the queue */
+    int dl_fd;
+    uint8_t dl_id[HUSH_BLOB_ID];
+    off_t dl_off, dl_size;
+    uint8_t fetch_q[MAX_FETCHES][HUSH_BLOB_ID];
+    int fetch_n;
 };
 
 /* Names are pinned to the first key that claims them, so nobody can take
@@ -71,16 +83,17 @@ struct user {
     uint8_t pk[crypto_sign_PUBLICKEYBYTES];
 };
 
-/* A chat, known only by the hash of its key. */
+/* A chat, known only by the hash of its login token. */
 struct room {
-    uint8_t hash[crypto_generichash_BYTES];
+    uint8_t hash[32];
     char label[HUSH_NAME_MAX + 1];
+    int old; /* from before chat keys changed; can't be used, only revoked */
 };
 
 struct limit {
     uint8_t ip[16];
     int used, conns;
-    double conn, auth, t;
+    double conn, auth, up, t;
 };
 
 static struct client *clients[MAX_CLIENTS];
@@ -89,6 +102,7 @@ static size_t nusers;
 static struct room *rooms;
 static size_t nrooms;
 static const char *users_path = "hushd-users.txt", *keys_path = "hushd-keys.txt";
+static const char *db_path = "hushd.db", *blob_dir = "blobs";
 static struct stat users_st, keys_st;
 static int trust_proxy;
 
@@ -114,6 +128,13 @@ static double now_mono(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 static double refill(double tokens, double burst, double rate, double dt)
@@ -188,9 +209,11 @@ static struct limit *limit_get(const uint8_t ip[16])
         l->used = 1;
         l->conn = CONN_BURST;
         l->auth = AUTH_BURST;
+        l->up = UP_BURST;
     } else {
         l->conn = refill(l->conn, CONN_BURST, CONN_RATE, now - l->t);
         l->auth = refill(l->auth, AUTH_BURST, AUTH_RATE, now - l->t);
+        l->up = refill(l->up, UP_BURST, UP_RATE, now - l->t);
     }
     l->t = now;
     return l;
@@ -257,7 +280,7 @@ static void user_pin(const char *name, const uint8_t *pk)
 static struct room *room_find(const uint8_t *hash)
 {
     for (size_t i = 0; i < nrooms; i++)
-        if (!sodium_memcmp(rooms[i].hash, hash, sizeof rooms[i].hash))
+        if (!rooms[i].old && !sodium_memcmp(rooms[i].hash, hash, sizeof rooms[i].hash))
             return &rooms[i];
     return NULL;
 }
@@ -279,6 +302,8 @@ static void room_add(const struct room *r)
     rooms[nrooms++] = *r;
 }
 
+/* Lines are "3 HASH LABEL". Two-field lines are keys from before chat
+ * keys changed: kept so they can be listed and revoked, but unusable. */
 static void keys_load(void)
 {
     nrooms = 0;
@@ -288,10 +313,18 @@ static void keys_load(void)
             note("cannot read %s: %s", keys_path, strerror(errno));
         return;
     }
-    char hex[128], label[64];
-    while (fscanf(f, "%127s %63s", hex, label) == 2) {
+    char line[256], a[128], b[128], c[128];
+    while (fgets(line, sizeof line, f)) {
         struct room r = { 0 };
         size_t bl;
+        const char *hex, *label;
+        int n = sscanf(line, "%127s %127s %127s", a, b, c);
+        if (n == 3 && !strcmp(a, "3"))
+            hex = b, label = c;
+        else if (n == 2)
+            hex = a, label = b, r.old = 1;
+        else
+            continue;
         if (!name_valid(label, strlen(label)) ||
             sodium_hex2bin(r.hash, sizeof r.hash, hex, strlen(hex), NULL, &bl, NULL) != 0 ||
             bl != sizeof r.hash) {
@@ -322,7 +355,10 @@ static void keys_write(FILE *f)
     for (size_t i = 0; i < nrooms; i++) {
         char hex[sizeof rooms[i].hash * 2 + 1];
         sodium_bin2hex(hex, sizeof hex, rooms[i].hash, sizeof rooms[i].hash);
-        fprintf(f, "%s %s\n", hex, rooms[i].label);
+        if (rooms[i].old)
+            fprintf(f, "%s %s\n", hex, rooms[i].label);
+        else
+            fprintf(f, "3 %s %s\n", hex, rooms[i].label);
     }
 }
 
@@ -335,33 +371,6 @@ static void users_write(FILE *f)
     }
 }
 
-/* Hash a chat key as typed: case, dashes and spaces don't matter, and
- * o/i/l are read as 0/1/1. Returns -1 if it can't be a key. */
-static int key_hash(const uint8_t *s, size_t n, uint8_t out[crypto_generichash_BYTES])
-{
-    char norm[KEY_CHARS];
-    size_t k = 0;
-    for (size_t i = 0; i < n; i++) {
-        char ch = (char)tolower(s[i]);
-        if (ch == '-' || ch == ' ')
-            continue;
-        if (ch == 'o')
-            ch = '0';
-        else if (ch == 'i' || ch == 'l')
-            ch = '1';
-        if (!ch || !strchr(key_alphabet, ch) || k == KEY_CHARS)
-            return -1;
-        norm[k++] = ch;
-    }
-    if (k != KEY_CHARS)
-        return -1;
-    static const char context[] = "hush-chat-key-v1";
-    crypto_generichash(out, crypto_generichash_BYTES, (const uint8_t *)norm, k,
-                       (const uint8_t *)context, sizeof context - 1);
-    sodium_memzero(norm, sizeof norm);
-    return 0;
-}
-
 static int file_changed(const char *path, struct stat *last)
 {
     struct stat st;
@@ -372,6 +381,91 @@ static int file_changed(const char *path, struct stat *last)
                   st.st_mtim.tv_nsec != last->st_mtim.tv_nsec;
     *last = st;
     return changed;
+}
+
+/* ---- storage ------------------------------------------------------------------
+ * Messages and chat membership live in SQLite; images are files in blob_dir.
+ * Every query is a prepared statement with bound parameters. */
+
+static sqlite3 *db;
+enum {
+    Q_INSERT_MSG, Q_OLDER, Q_NEWER, Q_ADD_MEMBER, Q_MEMBERS, Q_IS_MEMBER,
+    Q_ADD_BLOB, Q_BLOB_ROOM, NQUERIES
+};
+static const char *const query_sql[NQUERIES] = {
+    [Q_INSERT_MSG] = "INSERT INTO messages (room, sender, recipient, time, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+    [Q_OLDER] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id < ?2 "
+                "AND (recipient IS NULL OR recipient = ?3 OR sender = ?3) ORDER BY id DESC LIMIT ?4",
+    [Q_NEWER] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id > ?2 "
+                "AND (recipient IS NULL OR recipient = ?3 OR sender = ?3) ORDER BY id ASC LIMIT ?4",
+    [Q_ADD_MEMBER] = "INSERT OR IGNORE INTO members (room, name) VALUES (?1, ?2)",
+    [Q_MEMBERS] = "SELECT name FROM members WHERE room = ?1 ORDER BY name",
+    [Q_IS_MEMBER] = "SELECT 1 FROM members WHERE room = ?1 AND name = ?2",
+    [Q_ADD_BLOB] = "INSERT INTO blobs (id, room, size, time) VALUES (?1, ?2, ?3, ?4)",
+    [Q_BLOB_ROOM] = "SELECT room FROM blobs WHERE id = ?1",
+};
+static sqlite3_stmt *queries[NQUERIES];
+
+static void db_exec(const char *sql)
+{
+    char *err = NULL;
+    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK)
+        die("database %s: %s", db_path, err ? err : "error");
+}
+
+static void db_open(void)
+{
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK)
+        die("cannot open %s: %s", db_path, sqlite3_errmsg(db));
+    sqlite3_busy_timeout(db, 5000);
+    db_exec("PRAGMA journal_mode = WAL;"
+            "PRAGMA foreign_keys = ON;"
+            "CREATE TABLE IF NOT EXISTS messages ("
+            "  id INTEGER PRIMARY KEY, room BLOB NOT NULL, sender TEXT NOT NULL,"
+            "  recipient TEXT, time INTEGER NOT NULL, body BLOB NOT NULL);"
+            "CREATE INDEX IF NOT EXISTS messages_room ON messages (room, id);"
+            "CREATE TABLE IF NOT EXISTS members ("
+            "  room BLOB NOT NULL, name TEXT NOT NULL, PRIMARY KEY (room, name));"
+            "CREATE TABLE IF NOT EXISTS blobs ("
+            "  id BLOB PRIMARY KEY, room BLOB NOT NULL, size INTEGER NOT NULL, time INTEGER NOT NULL);"
+            "CREATE INDEX IF NOT EXISTS blobs_room ON blobs (room);");
+    for (int i = 0; i < NQUERIES; i++)
+        if (sqlite3_prepare_v3(db, query_sql[i], -1, SQLITE_PREPARE_PERSISTENT, &queries[i], NULL) !=
+            SQLITE_OK)
+            die("database %s: %s", db_path, sqlite3_errmsg(db));
+    if (mkdir(blob_dir, 0700) < 0 && errno != EEXIST)
+        die("cannot create %s: %s", blob_dir, strerror(errno));
+}
+
+static sqlite3_stmt *q(int which)
+{
+    sqlite3_stmt *s = queries[which];
+    sqlite3_reset(s);
+    sqlite3_clear_bindings(s);
+    return s;
+}
+
+static int is_member(const uint8_t *room, const char *name)
+{
+    sqlite3_stmt *s = q(Q_IS_MEMBER);
+    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    int yes = sqlite3_step(s) == SQLITE_ROW;
+    sqlite3_reset(s); /* an unfinished statement would pin an old snapshot of the database */
+    return yes;
+}
+
+static void blob_path(const uint8_t id[HUSH_BLOB_ID], char *out, size_t n)
+{
+    char hex[HUSH_BLOB_ID * 2 + 1];
+    sodium_bin2hex(hex, sizeof hex, id, HUSH_BLOB_ID);
+    snprintf(out, n, "%s/%s", blob_dir, hex);
+}
+
+static int disk_low(void)
+{
+    struct statvfs sv;
+    return statvfs(blob_dir, &sv) == 0 && (unsigned long long)sv.f_bavail * sv.f_frsize < MIN_FREE_DISK;
 }
 
 /* ---- clients ------------------------------------------------------------------ */
@@ -411,22 +505,35 @@ static void send_error(struct client *c, const char *msg, int fatal)
         c->dead = c->refused = 1;
 }
 
-static void send_peer(struct client *to, const struct client *who, uint8_t joined)
+static void send_peer(struct client *to, const char *name, const uint8_t *pk, uint8_t flags)
 {
     struct buf b = { 0 };
-    name_put(&b, who->name);
-    buf_put(&b, who->pk, sizeof who->pk);
-    buf_put(&b, &joined, 1);
+    name_put(&b, name);
+    buf_put(&b, pk, crypto_sign_PUBLICKEYBYTES);
+    buf_put(&b, &flags, 1);
     send_to(to, T_PEER, b.data, b.len);
     buf_free(&b);
+}
+
+/* Messages, history requests and downloads share one allowance per connection. */
+static int take_request(struct client *c)
+{
+    double now = now_mono();
+    c->req_tokens = refill(c->req_tokens, REQ_BURST, REQ_RATE, now - c->req_t);
+    c->req_t = now;
+    if (c->req_tokens < 1) {
+        note("%s: %s is sending too fast, dropping", c->addr, c->name);
+        send_error(c, "you are sending too fast", 1);
+        return 0;
+    }
+    c->req_tokens -= 1;
+    return 1;
 }
 
 static void on_hello(struct client *c, const uint8_t *p, size_t n)
 {
     int k = name_get(p, n, c->name);
-    size_t kl;
-    if (k < 0 || n - k < crypto_sign_PUBLICKEYBYTES + 1 ||
-        (kl = p[k + crypto_sign_PUBLICKEYBYTES]) != n - k - crypto_sign_PUBLICKEYBYTES - 1) {
+    if (k < 0 || n - k != crypto_sign_PUBLICKEYBYTES + 32) {
         send_error(c, "bad hello (names are 1-24 of A-Z a-z 0-9 _ . -)", 1);
         return;
     }
@@ -437,7 +544,8 @@ static void on_hello(struct client *c, const uint8_t *p, size_t n)
         send_error(c, "too many wrong keys from your address; wait a few minutes", 1);
         return;
     }
-    if (key_hash(p + k + crypto_sign_PUBLICKEYBYTES + 1, kl, c->room) != 0 || !room_find(c->room)) {
+    chat_verifier(p + k + crypto_sign_PUBLICKEYBYTES, c->room);
+    if (!room_find(c->room)) {
         l->auth -= 1;
         note("%s: wrong key", c->addr);
         send_error(c, "wrong key", 1);
@@ -476,55 +584,306 @@ static void on_auth(struct client *c, const uint8_t *p, size_t n)
         user_pin(c->name, c->pk);
         note("%s: registered new user %s", c->addr, c->name);
     }
+    sqlite3_stmt *s = q(Q_ADD_MEMBER);
+    sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, c->name, -1, SQLITE_STATIC);
+    int is_new = sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(db) > 0;
     c->st = ST_READY;
     c->deadline = 0;
-    c->msg_tokens = MSG_BURST;
-    c->msg_t = now_mono();
+    c->req_tokens = REQ_BURST;
+    c->req_t = now_mono();
     note("%s: %s joined %s", c->addr, c->name, r->label);
 
     struct buf b = { 0 };
     name_put(&b, r->label);
     send_to(c, T_WELCOME, b.data, b.len);
     buf_free(&b);
+
+    /* Everyone in the chat, online or not, so DMs can be encrypted for them. */
+    s = q(Q_MEMBERS);
+    sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(s, 0);
+        const struct user *u = name ? user_find(name) : NULL;
+        struct client *o = u ? client_find(name) : NULL;
+        if (!u || o == c)
+            continue;
+        send_peer(c, u->name, u->pk, o && same_room(o, c) ? PEER_ONLINE : 0);
+    }
+    sqlite3_reset(s);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         struct client *o = clients[i];
-        if (!o || o == c || o->dead || o->st != ST_READY || !same_room(o, c))
-            continue;
-        send_peer(c, o, 0);
-        send_peer(o, c, 1);
+        if (o && o != c && !o->dead && o->st == ST_READY && same_room(o, c))
+            send_peer(o, c->name, c->pk, PEER_ONLINE | (is_new ? PEER_NEW : 0));
     }
 }
 
-static void on_send(struct client *c, const uint8_t *p, size_t n)
+static void msg_frame(struct buf *b, int64_t id, int64_t time, uint8_t live, const char *from,
+                      const char *to, const void *body, size_t n)
 {
-    double now = now_mono();
-    c->msg_tokens = refill(c->msg_tokens, MSG_BURST, MSG_RATE, now - c->msg_t);
-    c->msg_t = now;
-    if (c->msg_tokens < 1) {
-        note("%s: %s is sending too fast, dropping", c->addr, c->name);
-        send_error(c, "you are sending too fast", 1);
-        return;
-    }
-    c->msg_tokens -= 1;
+    uint8_t h[17];
+    put_u64(h, (uint64_t)id);
+    put_u64(h + 8, (uint64_t)time);
+    h[16] = live;
+    b->len = 0;
+    buf_put(b, h, sizeof h);
+    name_put(b, from);
+    name_put(b, to);
+    buf_put(b, body, n);
+}
 
+static void on_post(struct client *c, const uint8_t *p, size_t n)
+{
+    if (!take_request(c))
+        return;
     char to[HUSH_NAME_MAX + 1];
-    int k = name_get(p, n, to);
-    if (k < 0 || n - k < crypto_box_NONCEBYTES + crypto_box_MACBYTES) {
+    int k = name_get_opt(p, n, to);
+    size_t bl = k < 0 ? 0 : n - (size_t)k;
+    if (k < 0 || bl < 24 + 16 + 64) {
         send_error(c, "malformed message", 1);
         return;
     }
-    struct client *dst = client_find(to);
-    if (!dst || !same_room(dst, c)) {
+    if (*to && (!strcmp(to, c->name) || !is_member(c->room, to))) {
         char msg[64 + HUSH_NAME_MAX];
-        snprintf(msg, sizeof msg, "%s is not online", to);
+        snprintf(msg, sizeof msg, "there is no %s in this chat", to);
         send_error(c, msg, 0);
         return;
     }
+    int64_t time = (int64_t)now_ms();
+    sqlite3_stmt *s = q(Q_INSERT_MSG);
+    sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, c->name, -1, SQLITE_STATIC);
+    if (*to)
+        sqlite3_bind_text(s, 3, to, -1, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(s, 3);
+    sqlite3_bind_int64(s, 4, time);
+    sqlite3_bind_blob(s, 5, p + k, (int)bl, SQLITE_STATIC);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        note("storing a message failed: %s", sqlite3_errmsg(db));
+        send_error(c, "the server could not store your message", 0);
+        return;
+    }
+    int64_t id = sqlite3_last_insert_rowid(db);
+
     struct buf b = { 0 };
-    name_put(&b, c->name);
-    buf_put(&b, p + k, n - k);
-    send_to(dst, T_DELIVER, b.data, b.len);
+    msg_frame(&b, id, time, 1, c->name, to, p + k, bl);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (!o || o->dead || o->st != ST_READY || !same_room(o, c))
+            continue;
+        if (!*to || o == c || !strcmp(o->name, to))
+            send_to(o, T_MSG, b.data, b.len);
+    }
     buf_free(&b);
+}
+
+static void on_history(struct client *c, const uint8_t *p, size_t n)
+{
+    if (n != 11 || p[0] > 1) {
+        send_error(c, "malformed history request", 1);
+        return;
+    }
+    if (!take_request(c))
+        return;
+    int dir = p[0];
+    uint64_t anchor = get_u64(p + 1);
+    int limit = get_u16(p + 9);
+    if (limit < 1 || limit > HUSH_HISTORY_MAX)
+        limit = HUSH_HISTORY_MAX;
+    if (dir == 0 && (anchor == 0 || anchor > INT64_MAX))
+        anchor = INT64_MAX;
+    if (anchor > INT64_MAX)
+        anchor = INT64_MAX;
+
+    sqlite3_stmt *s = q(dir == 0 ? Q_OLDER : Q_NEWER);
+    sqlite3_bind_blob(s, 1, c->room, 32, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 2, (int64_t)anchor);
+    sqlite3_bind_text(s, 3, c->name, -1, SQLITE_STATIC);
+    sqlite3_bind_int(s, 4, limit + 1); /* one extra says whether there's more */
+
+    /* Older pages come newest first; collect them to send oldest first. */
+    struct buf frames[HUSH_HISTORY_MAX];
+    int rows = 0, more = 0;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        if (rows == limit) {
+            more = 1;
+            break;
+        }
+        const char *from = (const char *)sqlite3_column_text(s, 2);
+        const char *to = (const char *)sqlite3_column_text(s, 3);
+        const void *body = sqlite3_column_blob(s, 4);
+        int bl = sqlite3_column_bytes(s, 4);
+        if (!from || !body)
+            continue;
+        frames[rows] = (struct buf){ 0 };
+        msg_frame(&frames[rows], sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), 0, from,
+                  to ? to : "", body, (size_t)bl);
+        rows++;
+    }
+    sqlite3_reset(s);
+    for (int i = 0; i < rows; i++) {
+        struct buf *f = &frames[dir == 0 ? rows - 1 - i : i];
+        send_to(c, T_MSG, f->data, f->len);
+    }
+    for (int i = 0; i < rows; i++)
+        buf_free(&frames[i]);
+    uint8_t end[2] = { (uint8_t)dir, (uint8_t)more };
+    send_to(c, T_HISTORY_END, end, sizeof end);
+}
+
+static void upload_abort(struct client *c)
+{
+    if (c->up_fd < 0)
+        return;
+    close(c->up_fd);
+    unlink(c->up_path);
+    c->up_fd = -1;
+    c->up_len = 0;
+}
+
+static void on_upload(struct client *c, const uint8_t *p, size_t n)
+{
+    if (n < 1 || p[0] > (UP_FIRST | UP_LAST)) {
+        send_error(c, "malformed upload", 1);
+        return;
+    }
+    int first = p[0] & UP_FIRST, last = p[0] & UP_LAST;
+    p++, n--;
+    if (first)
+        upload_abort(c);
+    else if (c->up_fd < 0)
+        return; /* the rest of an upload we already refused */
+    if (c->up_fd < 0) {
+        if (disk_low()) {
+            note("refusing an upload: less than 1 GB free in %s", blob_dir);
+            send_error(c, "the server is low on disk space; image not sent", 0);
+            return;
+        }
+        uint8_t rnd[8];
+        char hex[sizeof rnd * 2 + 1];
+        randombytes_buf(rnd, sizeof rnd);
+        sodium_bin2hex(hex, sizeof hex, rnd, sizeof rnd);
+        snprintf(c->up_path, sizeof c->up_path, "%s/.up-%s", blob_dir, hex);
+        c->up_fd = open(c->up_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (c->up_fd < 0) {
+            note("cannot create %s: %s", c->up_path, strerror(errno));
+            send_error(c, "the server could not store your image", 0);
+            return;
+        }
+    }
+    struct limit *l = limit_get(c->ip);
+    if (c->up_len + n > HUSH_MAX_IMAGE + 24 + 16 || l->up < (double)n) {
+        upload_abort(c);
+        send_error(c, c->up_len + n > HUSH_MAX_IMAGE + 40 ? "image too big (25 MB at most)"
+                                                          : "sending images too fast; try again in a minute",
+                   0);
+        return;
+    }
+    l->up -= (double)n;
+    if (write(c->up_fd, p, n) != (ssize_t)n) {
+        note("writing %s failed: %s", c->up_path, strerror(errno));
+        upload_abort(c);
+        send_error(c, "the server could not store your image", 0);
+        return;
+    }
+    c->up_len += n;
+    if (!last)
+        return;
+
+    uint8_t id[HUSH_BLOB_ID];
+    char path[128];
+    randombytes_buf(id, sizeof id);
+    blob_path(id, path, sizeof path);
+    int ok = fsync(c->up_fd) == 0;
+    close(c->up_fd);
+    c->up_fd = -1;
+    if (!ok || rename(c->up_path, path) != 0) {
+        unlink(c->up_path);
+        c->up_len = 0;
+        send_error(c, "the server could not store your image", 0);
+        return;
+    }
+    sqlite3_stmt *s = q(Q_ADD_BLOB);
+    sqlite3_bind_blob(s, 1, id, sizeof id, SQLITE_STATIC);
+    sqlite3_bind_blob(s, 2, c->room, 32, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 3, (int64_t)c->up_len);
+    sqlite3_bind_int64(s, 4, (int64_t)now_ms());
+    c->up_len = 0;
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        unlink(path);
+        send_error(c, "the server could not store your image", 0);
+        return;
+    }
+    send_to(c, T_UPLOADED, id, sizeof id);
+}
+
+static void blob_reply(struct client *c, const uint8_t *id, uint8_t status, const void *data, size_t n)
+{
+    struct buf b = { 0 };
+    buf_put(&b, id, HUSH_BLOB_ID);
+    buf_put(&b, &status, 1);
+    buf_put(&b, data, n);
+    send_to(c, T_BLOB, b.data, b.len);
+    buf_free(&b);
+}
+
+/* Queue up more of the current download while the connection keeps up. */
+static void pump_downloads(struct client *c)
+{
+    static uint8_t chunk[HUSH_CHUNK];
+    while (!c->dead && !c->closing && c->out.len < 4 * HUSH_CHUNK) {
+        if (c->dl_fd < 0) {
+            if (!c->fetch_n)
+                return;
+            memcpy(c->dl_id, c->fetch_q[0], HUSH_BLOB_ID);
+            memmove(c->fetch_q, c->fetch_q + 1, (size_t)--c->fetch_n * HUSH_BLOB_ID);
+            sqlite3_stmt *s = q(Q_BLOB_ROOM);
+            sqlite3_bind_blob(s, 1, c->dl_id, HUSH_BLOB_ID, SQLITE_STATIC);
+            int mine = sqlite3_step(s) == SQLITE_ROW && sqlite3_column_bytes(s, 0) == 32 &&
+                       !memcmp(sqlite3_column_blob(s, 0), c->room, 32);
+            sqlite3_reset(s);
+            char path[128];
+            struct stat st;
+            blob_path(c->dl_id, path, sizeof path);
+            if (!mine || (c->dl_fd = open(path, O_RDONLY | O_CLOEXEC)) < 0 ||
+                fstat(c->dl_fd, &st) < 0) {
+                if (c->dl_fd >= 0)
+                    close(c->dl_fd);
+                c->dl_fd = -1;
+                blob_reply(c, c->dl_id, BLOB_MISSING, NULL, 0);
+                continue;
+            }
+            c->dl_off = 0;
+            c->dl_size = st.st_size;
+        }
+        ssize_t r = pread(c->dl_fd, chunk, sizeof chunk, c->dl_off);
+        if (r < 0)
+            r = 0;
+        c->dl_off += r;
+        int last = r == 0 || c->dl_off >= c->dl_size;
+        blob_reply(c, c->dl_id, last ? BLOB_LAST : BLOB_PART, chunk, (size_t)r);
+        if (last) {
+            close(c->dl_fd);
+            c->dl_fd = -1;
+        }
+    }
+}
+
+static void on_fetch(struct client *c, const uint8_t *p, size_t n)
+{
+    if (n != HUSH_BLOB_ID) {
+        send_error(c, "malformed download request", 1);
+        return;
+    }
+    if (!take_request(c))
+        return;
+    if (c->fetch_n == MAX_FETCHES) {
+        blob_reply(c, p, BLOB_MISSING, NULL, 0);
+        return;
+    }
+    memcpy(c->fetch_q[c->fetch_n++], p, HUSH_BLOB_ID);
+    pump_downloads(c);
 }
 
 static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_t n)
@@ -533,8 +892,14 @@ static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_
         on_hello(c, p, n);
     else if (c->st == ST_AUTH && type == T_AUTH)
         on_auth(c, p, n);
-    else if (c->st == ST_READY && type == T_SEND)
-        on_send(c, p, n);
+    else if (c->st == ST_READY && type == T_POST)
+        on_post(c, p, n);
+    else if (c->st == ST_READY && type == T_HISTORY)
+        on_history(c, p, n);
+    else if (c->st == ST_READY && type == T_UPLOAD)
+        on_upload(c, p, n);
+    else if (c->st == ST_READY && type == T_FETCH)
+        on_fetch(c, p, n);
     else
         send_error(c, "protocol violation", 1);
 }
@@ -675,6 +1040,9 @@ static void client_close(int i)
     if (c->out.len) /* best effort, so a final error message gets through */
         send(c->fd, c->out.data, c->out.len, MSG_NOSIGNAL | MSG_DONTWAIT);
     close(c->fd);
+    upload_abort(c);
+    if (c->dl_fd >= 0)
+        close(c->dl_fd);
     if (c->counted) {
         struct limit *l = limit_get(c->ip);
         if (l->conns > 0)
@@ -747,6 +1115,7 @@ static void accept_client(int lfd, int web)
             c->counted = 1;
         }
         c->fd = fd;
+        c->up_fd = c->dl_fd = -1;
         c->st = web ? ST_HTTP : ST_HELLO;
         c->deadline = time(NULL) + (web ? HTTP_TIMEOUT : AUTH_TIMEOUT);
         clients[slot] = c;
@@ -812,24 +1181,59 @@ static void cmd_newkey(const char *label)
     keys_load();
     if (room_by_label(label))
         die("there is already a key called %s (hushd revoke %s to replace it)", label, label);
-    char key[KEY_CHARS + KEY_CHARS / 4], *o = key;
-    for (int i = 0; i < KEY_CHARS; i++) {
+    static const char alphabet[] = "0123456789abcdefghjkmnpqrstvwxyz";
+    char key[HUSH_KEY_CHARS + HUSH_KEY_CHARS / 4], *o = key;
+    for (int i = 0; i < HUSH_KEY_CHARS; i++) {
         if (i && i % 4 == 0)
             *o++ = '-';
-        *o++ = key_alphabet[randombytes_uniform(sizeof key_alphabet - 1)];
+        *o++ = alphabet[randombytes_uniform(sizeof alphabet - 1)];
     }
     *o = '\0';
+    uint8_t token[32];
     struct room r = { 0 };
-    key_hash((const uint8_t *)key, strlen(key), r.hash);
+    chat_key_derive(key, strlen(key), token, NULL);
+    chat_verifier(token, r.hash);
     strcpy(r.label, label);
     room_add(&r);
     file_replace(keys_path, keys_write);
     printf("New key for the chat \"%s\":\n\n    %s\n\n"
-           "Give it to the people you want in this chat. Anyone who has it can join.\n"
-           "It is not stored anywhere (only a hash of it is, in %s), so this is\n"
-           "the only time it's shown. A running hushd picks it up by itself.\n",
-           label, key, keys_path);
+           "Give it to the people you want in this chat. Anyone who has it can join\n"
+           "and read the chat's history. It is not stored anywhere (the server keeps\n"
+           "only a hash), so this is the only time it's shown. A running hushd picks\n"
+           "it up by itself.\n",
+           label, key);
     sodium_memzero(key, sizeof key);
+    sodium_memzero(token, sizeof token);
+}
+
+/* Delete a chat's messages and images (and, with members, its member list). */
+static void delete_history(const uint8_t *room, int members)
+{
+    sqlite3_stmt *s;
+    db_exec("BEGIN IMMEDIATE");
+    if (sqlite3_prepare_v2(db, "SELECT id FROM blobs WHERE room = ?1", -1, &s, NULL) != SQLITE_OK)
+        die("database: %s", sqlite3_errmsg(db));
+    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        char path[128];
+        if (sqlite3_column_bytes(s, 0) != HUSH_BLOB_ID)
+            continue;
+        blob_path(sqlite3_column_blob(s, 0), path, sizeof path);
+        unlink(path);
+    }
+    sqlite3_finalize(s);
+    static const char *const del[] = { "DELETE FROM blobs WHERE room = ?1",
+                                       "DELETE FROM messages WHERE room = ?1",
+                                       "DELETE FROM members WHERE room = ?1" };
+    for (int i = 0; i < (members ? 3 : 2); i++) {
+        if (sqlite3_prepare_v2(db, del[i], -1, &s, NULL) != SQLITE_OK)
+            die("database: %s", sqlite3_errmsg(db));
+        sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+        if (sqlite3_step(s) != SQLITE_DONE)
+            die("database: %s", sqlite3_errmsg(db));
+        sqlite3_finalize(s);
+    }
+    db_exec("COMMIT");
 }
 
 static void cmd_keys(void)
@@ -837,8 +1241,27 @@ static void cmd_keys(void)
     keys_load();
     if (!nrooms)
         printf("no keys yet; create one with: hushd newkey NAME\n");
-    for (size_t i = 0; i < nrooms; i++)
-        printf("%s\n", rooms[i].label);
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT (SELECT count(*) FROM messages WHERE room = ?1),"
+                           " (SELECT count(*) FROM blobs WHERE room = ?1),"
+                           " (SELECT coalesce(sum(size), 0) FROM blobs WHERE room = ?1)",
+                           -1, &s, NULL) != SQLITE_OK)
+        die("database: %s", sqlite3_errmsg(db));
+    for (size_t i = 0; i < nrooms; i++) {
+        if (rooms[i].old) {
+            printf("%-24s  old key from before this version: hushd revoke %s, then newkey\n",
+                   rooms[i].label, rooms[i].label);
+            continue;
+        }
+        sqlite3_reset(s);
+        sqlite3_bind_blob(s, 1, rooms[i].hash, 32, SQLITE_STATIC);
+        if (sqlite3_step(s) == SQLITE_ROW)
+            printf("%-24s  %lld messages, %lld images (%.1f MB)\n", rooms[i].label,
+                   sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1),
+                   sqlite3_column_int64(s, 2) / 1048576.0);
+    }
+    sqlite3_finalize(s);
 }
 
 static void cmd_revoke(const char *label)
@@ -847,9 +1270,22 @@ static void cmd_revoke(const char *label)
     struct room *r = label ? room_by_label(label) : NULL;
     if (!r)
         die("no key called %s (see hushd keys)", label ? label : "?");
+    uint8_t hash[32];
+    memcpy(hash, r->hash, sizeof hash);
     *r = rooms[--nrooms];
     file_replace(keys_path, keys_write);
-    printf("revoked %s; a running hushd disconnects everyone in that chat\n", label);
+    delete_history(hash, 1);
+    printf("revoked %s and deleted its history; a running hushd disconnects everyone in it\n", label);
+}
+
+static void cmd_clear(const char *label)
+{
+    keys_load();
+    struct room *r = label ? room_by_label(label) : NULL;
+    if (!r)
+        die("no key called %s (see hushd keys)", label ? label : "?");
+    delete_history(r->hash, 0);
+    printf("deleted every message and image in %s; the key still works\n", label);
 }
 
 static void cmd_forget(const char *name)
@@ -860,6 +1296,12 @@ static void cmd_forget(const char *name)
         die("no user called %s", name ? name : "?");
     *u = users[--nusers];
     file_replace(users_path, users_write);
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db, "DELETE FROM members WHERE name = ?1", -1, &s, NULL) != SQLITE_OK)
+        die("database: %s", sqlite3_errmsg(db));
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
     printf("forgot %s; the next person to log in with that name gets it\n", name);
 }
 
@@ -868,17 +1310,18 @@ static void usage(void)
     fprintf(stderr,
             "usage: hushd [options]              run the server\n"
             "       hushd [options] newkey NAME  create a key for a new chat called NAME\n"
-            "       hushd [options] keys         list chats\n"
-            "       hushd [options] revoke NAME  delete a chat's key, disconnecting everyone in it\n"
+            "       hushd [options] keys         list chats and how much they store\n"
+            "       hushd [options] clear NAME   delete a chat's messages and images, keep the key\n"
+            "       hushd [options] revoke NAME  delete a chat: its key, messages and images\n"
             "       hushd [options] forget USER  free up a name (e.g. a friend lost their key)\n"
             "options:\n"
+            "  -C dir        work in dir: keys, users, database and images live there\n"
             "  -p port       port for terminal clients (default " HUSH_DEFAULT_PORT ")\n"
             "  -w port       port for the web client, 0 for none (default " HUSH_DEFAULT_WEB ")\n"
             "  -d dir        web client files (default ./web, else ../share/hush/web from hushd)\n"
-            "  -k keys-file  chat key hashes (default %s)\n"
-            "  -u users-file name->key registrations (default %s)\n"
-            "  -x            trust X-Forwarded-For from a reverse proxy on this machine\n",
-            keys_path, users_path);
+            "  -x            trust X-Forwarded-For from a reverse proxy on this machine\n"
+            "files, relative to -C: %s (chat key hashes), %s, %s, %s/\n",
+            keys_path, users_path, db_path, blob_dir);
     exit(2);
 }
 
@@ -886,17 +1329,16 @@ int main(int argc, char **argv)
 {
     const char *port = HUSH_DEFAULT_PORT, *web_port = HUSH_DEFAULT_WEB, *web_dir = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "p:w:d:k:u:xh")) != -1) {
-        if (opt == 'p')
+    while ((opt = getopt(argc, argv, "C:p:w:d:xh")) != -1) {
+        if (opt == 'C') {
+            if (chdir(optarg) < 0)
+                die("cannot use %s: %s", optarg, strerror(errno));
+        } else if (opt == 'p')
             port = optarg;
         else if (opt == 'w')
             web_port = optarg;
         else if (opt == 'd')
             web_dir = optarg;
-        else if (opt == 'k')
-            keys_path = optarg;
-        else if (opt == 'u')
-            users_path = optarg;
         else if (opt == 'x')
             trust_proxy = 1;
         else
@@ -910,12 +1352,17 @@ int main(int argc, char **argv)
         const char *cmd = argv[optind], *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
         if (argc - optind > 2)
             usage();
-        if (!strcmp(cmd, "newkey"))
+        if (!strcmp(cmd, "newkey")) {
             cmd_newkey(arg);
-        else if (!strcmp(cmd, "keys") && !arg)
+            return 0;
+        }
+        db_open();
+        if (!strcmp(cmd, "keys") && !arg)
             cmd_keys();
         else if (!strcmp(cmd, "revoke"))
             cmd_revoke(arg);
+        else if (!strcmp(cmd, "clear"))
+            cmd_clear(arg);
         else if (!strcmp(cmd, "forget"))
             cmd_forget(arg);
         else
@@ -924,6 +1371,7 @@ int main(int argc, char **argv)
     }
 
     signal(SIGPIPE, SIG_IGN);
+    db_open();
     users_load();
     keys_load();
     file_changed(users_path, &users_st);
@@ -944,6 +1392,10 @@ int main(int argc, char **argv)
              trust_proxy ? ", trusting X-Forwarded-For from localhost" : "");
     note("hushd: %zu chats in %s, %zu registered users in %s", nrooms, keys_path, nusers,
          users_path);
+    for (size_t i = 0; i < nrooms; i++)
+        if (rooms[i].old)
+            note("hushd: the key for %s is from an older version and no longer works; "
+                 "run: hushd revoke %s && hushd newkey %s", rooms[i].label, rooms[i].label, rooms[i].label);
     if (!nrooms)
         note("hushd: no chats yet; create one with: hushd newkey NAME");
 
@@ -982,6 +1434,8 @@ int main(int argc, char **argv)
                 c->dead = 1;
             if (!c->dead && (pfds[k].revents & POLLOUT))
                 client_write(c);
+            if (!c->dead && (c->dl_fd >= 0 || c->fetch_n))
+                pump_downloads(c);
         }
 
         /* Pick up `hushd newkey/revoke/forget` run while we're up. */

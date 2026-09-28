@@ -1,6 +1,8 @@
 // Drives the web client's protocol code (web/hush.js) from the command line,
 // the way test.sh drives hush: stdin lines are typed, events are printed.
 //   node test-web.mjs NAME KEY URL ORIGIN [IDENTITY-FILE]
+// Besides the chat commands: "/img FILE [caption]" sends an image as is,
+// and "/save FILE" saves the newest image seen.
 import { readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import sodium from "./web/sodium.mjs";
@@ -23,21 +25,52 @@ class WS extends WebSocket {
   constructor(u) { super(u, { headers: origin ? { Origin: origin } : {} }); }
 }
 
+let lastImage = null;
+function show(m) {
+  const tag = m.dm ? (m.from === name ? `[dm to ${m.to}] ` : "[dm] ") : "";
+  if (m.image) {
+    lastImage = m.image;
+    console.log(`${tag}${m.from}: [image ${m.image.width}x${m.image.height} ${m.image.mime}] ${m.image.caption}`);
+  } else {
+    console.log(`${tag}${m.from}: ${m.text}`);
+  }
+}
+
 const queue = [];
 const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket: WS }, ev => {
   switch (ev.type) {
-  case "ready": console.log(`connected as ${name}, chat: ${ev.label}`); queue.splice(0).forEach(l => s.input(l)); break;
+  case "ready": console.log(`connected as ${name}, chat: ${ev.label}`); queue.splice(0).forEach(run); break;
   case "peer":
     if (ev.trust === "changed") console.log(`!!! WARNING: ${ev.name}'s key has CHANGED !!!`);
-    else console.log(`* ${ev.name} ${ev.joined ? "joined" : "is here"}${ev.first ? ". First time seeing them" : ""}`);
+    else if (ev.first || ev.joined || (ev.online && !ev.wasOnline)) console.log(`* ${ev.name} ${ev.online ? "is online" : "is in this chat"}`);
     break;
-  case "leave": console.log(`* ${ev.name} left`); break;
-  case "message": console.log(`${ev.dm ? (ev.to ? `[dm to ${ev.to}] ` : "[dm] ") : ""}${ev.from}: ${ev.text}`); break;
+  case "leave": console.log(`* ${ev.name} went offline`); break;
+  case "message": show(ev.msg); break;
+  case "history": ev.messages.forEach(show); if (ev.more) console.log("(more history)"); break;
   case "notice": console.log(ev.text); break;
   case "error": console.log(`! server: ${ev.text}`); break;
   case "closed": console.log(`closed${ev.error ? `: ${ev.error}` : ""}`); process.exit(0);
   }
 });
+
+async function run(l) {
+  const img = /^\/img (\S+) ?(.*)$/.exec(l), save = /^\/save (\S+)$/.exec(l);
+  try {
+    if (img) {
+      const mime = { jpg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp" }[img[1].split(".").pop()];
+      await s.sendImage(new Uint8Array(readFileSync(img[1])), { mime, width: 1, height: 1, caption: img[2] });
+      console.log("image sent");
+    } else if (save) {
+      writeFileSync(save[1], await s.fetchImage(lastImage));
+      console.log(`saved ${save[1]}`);
+    } else {
+      s.input(l);
+    }
+  } catch (e) {
+    console.log(`! ${e.message}`);
+  }
+}
+
 const rl = createInterface({ input: process.stdin });
-rl.on("line", l => (s.ready ? s.input(l) : queue.push(l)));
+rl.on("line", l => (s.ready ? run(l) : queue.push(l)));
 rl.on("close", () => setTimeout(() => s.close(), 300));

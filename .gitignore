@@ -2,6 +2,7 @@
 hush
 hushd
 src/*.o
+tests/unit
 
 # server state: chat key hashes, name->key registrations, admins, messages, images
 hushd-keys.txt

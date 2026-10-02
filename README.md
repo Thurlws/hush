@@ -57,12 +57,14 @@ hushd uses `accept4` and `/proc/self/exe`.
 ## Testing
 
 ```sh
-make test          # build, then run test.sh
+make test          # build, run the unit tests, then test.sh
 make asan test     # the same under AddressSanitizer and UBSan
 make debug         # -O0 -g3 build for gdb
 ```
 
-`test.sh` runs everything on localhost against a real hushd: scripted terminal clients, the web
+`tests/unit.c` checks the parts that need no network: framing, names, chat key derivation (against
+vectors from the browser code, so both clients stay in step), message encryption and signatures
+with every kind of tampering, and the HTTP and WebSocket parsers. `test.sh` runs everything on localhost against a real hushd: scripted terminal clients, the web
 client's protocol code under Node, and the HTTP side with curl. It covers wrong and old keys, the
 waitlist, history and offline DMs, images and metadata stripping, data exports, name takeover,
 changed keys, `clear` and `revoke`, rate limits and the reverse-proxy mode. It needs `python3` and

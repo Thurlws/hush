@@ -20,6 +20,9 @@ hushd: src/server.o src/web.o src/msg.o src/proto.o
 src/%.o: src/%.c src/proto.h src/web.h src/msg.h
 	$(CC) $(HUSH_CFLAGS) $(CFLAGS) -c -o $@ $<
 
+tests/unit: tests/unit.c src/msg.o src/proto.o src/web.o src/proto.h src/web.h src/msg.h
+	$(CC) $(HUSH_CFLAGS) -Isrc $(CFLAGS) $(LDFLAGS) -o $@ $(filter-out %.h,$^) $(LDLIBS) $(HUSH_LIBS)
+
 # Objects don't remember their flags, so these rebuild from scratch.
 debug:
 	$(MAKE) clean
@@ -30,7 +33,8 @@ asan:
 	$(MAKE) CFLAGS="-O1 -g $(SAN)" LDFLAGS="$(SAN)"
 
 # Runs against whatever was built last, so `make asan test` tests the sanitizer build.
-test: all
+test: all tests/unit
+	./tests/unit
 	./test.sh
 
 install: all
@@ -38,6 +42,6 @@ install: all
 	install -Dm644 $(WEB_FILES) -t $(PREFIX)/share/hush/web
 
 clean:
-	rm -f hush hushd src/*.o
+	rm -f hush hushd src/*.o tests/unit
 
 .PHONY: all debug asan test install clean

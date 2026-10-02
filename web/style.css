@@ -29,11 +29,9 @@ button {
   border: 1px solid var(--line); border-radius: 6px; background: none; padding: .35em .8em; cursor: pointer;
 }
 
-/* login and waiting */
 #login, #waiting { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
 #login .card, #login-form, #waiting .card { width: 100%; max-width: 380px; display: flex; flex-direction: column; }
 
-/* saved chats */
 .section { margin: 0 0 .5em; font-weight: 600; }
 #sessions { list-style: none; margin: 0 0 .8em; padding: 0; display: flex; flex-direction: column; gap: .5em; }
 #sessions li { display: flex; gap: .4em; }
@@ -62,7 +60,6 @@ label { margin: .9em 0 .35em; font-weight: 600; }
 .fine { margin: 1.2em 0 0; color: var(--dim); font-size: .85em; }
 noscript { color: var(--warn); }
 
-/* chat */
 #chat { height: 100%; display: flex; flex-direction: column; }
 header {
   display: flex; align-items: center; gap: .6em; padding: .6em 16px;
@@ -74,7 +71,6 @@ header b { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-sp
 #dot.on { background: var(--n1); }
 #dot.off { background: var(--warn); }
 
-/* admins: the waitlist button and its panel */
 #waitlist-count {
   display: inline-block; min-width: 1.5em; margin-left: .3em; padding: 0 .4em; border-radius: 1em;
   background: var(--warn); color: #fff; font-size: .8em; text-align: center;

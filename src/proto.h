@@ -4,13 +4,12 @@
  * where length covers type + payload. Browsers send the same frames
  * without the length, one per binary WebSocket message.
  *
- * Chat keys. An admin creates one per chat (`hushd newkey`, or NEWCHAT
- * from the web page). Clients derive two unrelated values from it: a login
- * token, which is all the server ever sees (and it stores only a hash of
- * that), and the chat's encryption key, which never leaves the clients.
- * Keys are 8 characters (40 bits) and go through Argon2id first, so each
- * guess against stolen server files is slow; older 24-character keys
- * (120 bits) are used as they are.
+ * Chat keys. An admin makes one per chat (`hushd newkey`, or NEWCHAT from a
+ * client). Clients derive two unrelated values from it: a login token, which
+ * is all the server sees (it stores only a hash of it), and the chat's
+ * encryption key, which never leaves the clients. 8-character keys (40 bits)
+ * go through Argon2id first, so each guess against stolen server files is
+ * slow. Older 24-character keys (120 bits) are used as they are.
  *
  * Handshake (client -> server -> client):
  *   HELLO     name, ed25519 public key, login token
@@ -19,12 +18,12 @@
  *   WELCOME   chat label, then one PEER for every member of the chat
  * Someone new to a chat gets WAITING instead and waits, seeing nothing,
  * until an admin approves them (then WELCOME follows) or denies them.
- * Admins are identity keys the server operator listed by fingerprint;
- * they get PENDING for each person waiting and answer with DECIDE.
+ * Admins are identity keys the operator listed by fingerprint. They get
+ * PENDING for each person waiting and answer with DECIDE.
  * A HELLO with an all-zero token asks for no chat at all: only admins get
  * through (ADMIN instead of WELCOME), and can then only send NEWCHAT.
  *
- * After that, clients POST messages; the server stores them and sends a
+ * After that, clients POST messages. The server stores them and sends a
  * MSG to everyone concerned who is online. HISTORY asks for stored ones.
  * Images are uploaded (UPLOAD) and downloaded (FETCH) as encrypted blobs.
  *
@@ -70,8 +69,8 @@ enum {
     T_HELLO = 1,   /* name, pk[32], token[32] */
     T_AUTH = 2,    /* sig[64] */
     T_POST = 3,    /* to (name, empty for the chat), body */
-    T_HISTORY = 4, /* u8 dir, u64 anchor id, u16 limit: dir 0 = older than anchor (0: newest), 1 = newer,
-                      2 = newer, only messages you sent or that were sent to you */
+    T_HISTORY = 4, /* u8 dir, u64 anchor id, u16 limit. dir 0: older than anchor (anchor 0 = newest),
+                      1: newer, 2: newer, only messages you sent or that were sent to you */
     T_UPLOAD = 5,  /* u8 flags (UP_FIRST, UP_LAST), data */
     T_FETCH = 6,   /* blob id[16] */
     T_DECIDE = 7,  /* admins: u8 approve, name */
@@ -116,9 +115,9 @@ void frame_put(struct buf *out, uint8_t type, const void *payload, size_t n);
 int frame_peek(const struct buf *b, uint8_t *type, const uint8_t **payload,
                size_t *len, size_t *frame_size);
 
-/* Names (and chat labels) are 1..HUSH_NAME_MAX of [A-Za-z0-9_.-] and go on
- * the wire as u8 len + bytes. name_get returns the bytes used, or -1;
- * with empty_ok, a zero-length name (meaning "the whole chat") is allowed. */
+/* Names (and chat labels) are 1..HUSH_NAME_MAX of [A-Za-z0-9_.-], sent as
+ * u8 len + bytes. name_get returns the bytes used, or -1. name_get_opt also
+ * takes an empty name, meaning "the whole chat". */
 int name_valid(const char *s, size_t n);
 int name_get(const uint8_t *p, size_t n, char out[HUSH_NAME_MAX + 1]);
 int name_get_opt(const uint8_t *p, size_t n, char out[HUSH_NAME_MAX + 1]);
@@ -133,10 +132,10 @@ uint64_t get_u64(const uint8_t *p);
 
 void fingerprint(const uint8_t pk[crypto_sign_PUBLICKEYBYTES], char out[HUSH_FP_LEN]);
 
-/* Read a chat key as typed (case, dashes and spaces don't matter; o, i
- * and l count as 0, 1 and 1) and derive its login token and the chat's
- * encryption key. Either output may be NULL. Returns -1 if it can't be a
- * key, -2 if there wasn't enough memory for Argon2id. */
+/* Read a chat key as typed (case, dashes and spaces don't matter, o/i/l
+ * read as 0/1/1) and derive its login token and encryption key. Either
+ * output may be NULL. Returns -1 if it isn't a key, -2 if Argon2id ran out
+ * of memory. */
 int chat_key_derive(const char *key, size_t n, uint8_t token[32], uint8_t chat_key[32]);
 /* What the server stores for a login token. */
 void chat_verifier(const uint8_t token[32], uint8_t out[32]);

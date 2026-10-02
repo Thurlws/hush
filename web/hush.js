@@ -1,7 +1,6 @@
-// The hush protocol for the browser: the same keys, encryption and trust
-// rules as src/client.c (see src/proto.h), so browser and terminal users
-// share a chat. No DOM in here; app.js draws the page, and tests can run
-// this in Node.
+// The hush protocol for the browser. Same keys, encryption and trust rules
+// as src/client.c (see src/proto.h), so browser and terminal users share a
+// chat. No DOM here: app.js draws the page and tests run this in Node.
 
 const T = {
   HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6, DECIDE: 7, NEWCHAT: 8,
@@ -31,9 +30,8 @@ export function fingerprint(sodium, pk) {
 
 const KEY_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
 
-// A chat key as typed, normalised: case, dashes and spaces don't matter, and
-// o, i and l count as 0, 1 and 1. null if it can't be a key. Keys are 8
-// characters; ones made before keys got shorter have 24.
+// Normalize a typed chat key: case, dashes and spaces don't matter, o/i/l
+// count as 0/1/1. null if it can't be a key. Keys are 8 chars, old ones 24.
 export function normalizeKey(typed) {
   let norm = "";
   for (let ch of typed.toLowerCase()) {
@@ -103,7 +101,7 @@ function readName(p, off = 0, emptyOk = false) {
 
 // Admins: create a chat without being in one (the home page's "Create your
 // own"). Logs in with no chat key, which the server allows only for admins.
-// The key is made here; only its login token is sent. Resolves to {label, key}.
+// The key is made here and only its login token is sent. Resolves to {label, key}.
 export function createChat({ sodium, url, name, secretKey, WebSocket: WS = globalThis.WebSocket }, label) {
   if (!NAME_RE.test(label)) return Promise.reject(new Error("a chat name is 1-24 letters, digits, _ . or -"));
   const key = newChatKey(sodium), { token } = deriveChatKey(sodium, key);
@@ -177,7 +175,7 @@ export class Session {
     this.ws.binaryType = "arraybuffer";
     this.ws.onopen = () => this.send(T.HELLO, nameBytes(this.name), this.pk, this.token);
     this.ws.onmessage = e => this.onFrame(new Uint8Array(e.data));
-    // The server closes with code 4000 when it refuses us; anything else is a dropped connection.
+    // Close code 4000 means the server refused us, anything else is a dropped connection.
     this.ws.onclose = e => {
       const err = new Error("disconnected");
       if (this.upload) this.upload.reject(err);
@@ -209,7 +207,7 @@ export class Session {
     this.send(T.HISTORY, p);
   }
 
-  // Messages older than the ones seen so far; answered with a "history" event.
+  // Ask for older messages. They arrive as a "history" event.
   loadOlder() { if (this.oldestId && !this.exporting) this.history(HIST_OLDER, this.oldestId); }
 
   onFrame(f) {
@@ -402,7 +400,7 @@ export class Session {
     return msg;
   }
 
-  // Sign, encrypt and post a message; it comes back as a "message" event once stored.
+  // Sign, encrypt and post. It comes back as a "message" event once stored.
   post(to, kind, content) {
     const s = this.s, time = new Uint8Array(8);
     view(time).setBigUint64(0, BigInt(Date.now()));

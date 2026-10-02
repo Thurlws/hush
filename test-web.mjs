@@ -22,7 +22,7 @@ if (!sk || sk.length !== 64) {
 const knownMap = new Map();
 const known = { get: n => knownMap.get(n) || null, set: (n, r) => knownMap.set(n, r) };
 
-// Browsers always send Origin on a WebSocket handshake; Node doesn't unless asked.
+// Browsers always send Origin on the WebSocket handshake, Node only when asked.
 class WS extends WebSocket {
   constructor(u) { super(u, { headers: origin ? { Origin: origin } : {} }); }
 }

@@ -116,7 +116,7 @@ check  "$T/carol.out"  "there is no alice in this chat" "no DMs across chats"
 sleep 1 | client alice a "$KOLD" >"$T/alice-old.out" 2>&1
 check "$T/alice-old.out" "chat: oldstyle" "24-character keys from before still work"
 
-# An admin creates a chat from the terminal; its key works right away.
+# An admin creates a chat from the terminal and its key works right away.
 (sleep 0.5; echo "/newchat club"; sleep 1) | client alice a >"$T/alice-new.out" 2>&1
 KC=$(grep -ao 'Its key: [0-9a-z-]*' "$T/alice-new.out" | cut -d' ' -f3)
 check "$T/alice-new.out" "Created the chat \"club\"" "/newchat creates a chat"
@@ -309,7 +309,7 @@ else
     echo "skip - web client tests (need node)"
 fi
 
-# `hushd clear` empties a chat; `hushd revoke` deletes it and disconnects everyone.
+# `hushd clear` empties a chat, `hushd revoke` deletes it and kicks everyone.
 admin keys >"$T/keys.out"
 check "$T/keys.out" "main" "hushd keys lists chats"
 admin clear main >/dev/null

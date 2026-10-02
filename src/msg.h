@@ -13,7 +13,7 @@
 
 struct hush_msg {
     int kind;
-    uint64_t time; /* ms, as the sender's clock said */
+    uint64_t time; /* ms, from the sender's clock */
     const uint8_t *uid;
     char from[HUSH_NAME_MAX + 1], to[HUSH_NAME_MAX + 1];
     const uint8_t *content;

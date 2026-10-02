@@ -25,9 +25,9 @@ static struct asset {
     { "/zip.js", "zip.js", "text/javascript; charset=utf-8", NULL, 0 },
 };
 
-/* Sent with every response. The page only loads its own scripts and styles,
- * shows images only from decrypted in-page data (blob: URLs), only connects
- * back to this server, and can't be framed by other sites. */
+/* Sent with every response: only the page's own scripts and styles, images only
+ * from decrypted in-page data (blob: URLs), connections only back to this server,
+ * and no framing by other sites. */
 static const char security_headers[] =
     "Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; "
     "style-src 'self'; img-src blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
@@ -78,8 +78,6 @@ int web_load(const char *dir)
     }
     return 0;
 }
-
-/* ---- request parsing ------------------------------------------------------ */
 
 static int copy_value(char *dst, size_t cap, const char *v)
 {
@@ -178,8 +176,6 @@ int http_parse(const uint8_t *buf, size_t len, struct http_req *req)
     return (int)(hl + 4);
 }
 
-/* ---- responses ------------------------------------------------------------- */
-
 static const char *status_text(int code)
 {
     switch (code) {
@@ -229,8 +225,6 @@ void http_serve(struct buf *out, const struct http_req *req)
     if (!req->head)
         buf_put(out, a->data, a->len);
 }
-
-/* ---- WebSocket ------------------------------------------------------------- */
 
 static uint32_t rol(uint32_t x, int n)
 {

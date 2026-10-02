@@ -5,7 +5,7 @@ import { zip } from "./zip.js";
 
 const $ = id => document.getElementById(id);
 
-// Browser storage can be blocked (private windows, strict settings); cope without it.
+// Storage can be blocked (private windows, strict settings), so work without it.
 function storage(area) {
   return {
     get(k) { try { return area().getItem(k); } catch { return null; } },
@@ -76,8 +76,6 @@ function stamp(ms) {
   return d.toDateString() === now.toDateString() ? time
     : d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + time;
 }
-
-// ---- messages and images ----------------------------------------------------
 
 const lazy = new IntersectionObserver(entries => {
   for (const e of entries) if (e.isIntersecting) { lazy.unobserve(e.target); e.target.load(); }
@@ -160,9 +158,8 @@ function closeViewer() {
   $("msg").focus();
 }
 
-// Photos are decoded and drawn again before sending, which leaves behind
-// everything but the pixels, such as the GPS position phones store in them.
-// GIFs are sent as they are to keep them animated; they carry no location.
+// Redraw photos before sending so only the pixels survive (no GPS or other
+// metadata). GIFs go as is so they stay animated. They carry no location.
 async function prepareImage(file) {
   let bmp;
   try { bmp = await createImageBitmap(file); } catch { throw new Error("can't read that image"); }
@@ -202,8 +199,6 @@ async function sendImage(file) {
     status.textContent = `! image not sent: ${e.message}`;
   }
 }
-
-// ---- my data ------------------------------------------------------------------
 
 // Everything you sent here and the DMs sent to you, decrypted in this
 // browser and saved as a zip: messages.json plus the images.
@@ -256,8 +251,6 @@ async function saveMyData() {
   }
 }
 
-// ---- the waitlist ---------------------------------------------------------------
-
 // Admins only: a Waitlist button with a count, which opens the list.
 function showWaitlist() {
   const admin = !!(chat && chat.admin), n = admin ? chat.pending.size : 0;
@@ -297,8 +290,6 @@ function showWaiting(label) {
   document.title = "hush · waiting";
 }
 
-// ---- people -------------------------------------------------------------------
-
 function showPeer(ev) {
   if (ev.trust === "bad") line("warn", `! ${ev.name} presented an invalid key; ignoring them`);
   else if (ev.trust === "changed")
@@ -322,8 +313,6 @@ function showOnline() {
 }
 
 const setStatus = s => { $("dot").className = s; };
-
-// ---- connecting -----------------------------------------------------------------
 
 function showLogin(err) {
   clearTimeout(retryTimer);
@@ -364,7 +353,7 @@ function create(name, label) {
   $("join").disabled = true;
   $("join").textContent = "Creating…";
   $("login-error").textContent = "";
-  setTimeout(async () => { // making the key takes a moment (Argon2id); show "Creating…" first
+  setTimeout(async () => { // Argon2id takes a moment, show "Creating…" first
     try {
       const { key } = await createChat({ sodium, url: wsUrl(), name, secretKey: sk }, label);
       local.set("hush.name", name);
@@ -383,7 +372,6 @@ function create(name, label) {
   }, 30);
 }
 
-// ---- saved chats ----------------------------------------------------------------
 // Chats you've joined from this browser, so you can rejoin with a click. They
 // stay in this browser's storage, next to your identity key.
 
@@ -522,8 +510,6 @@ function onEvent(ev, name, key) {
 }
 
 const capitalize = s => s.charAt(0).toUpperCase() + s.slice(1);
-
-// ---- controls ---------------------------------------------------------------------
 
 $("login-form").addEventListener("submit", e => {
   e.preventDefault();

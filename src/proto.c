@@ -192,8 +192,8 @@ int chat_key_derive(const char *key, size_t n, uint8_t token[32], uint8_t chat_k
         if (chat_key)
             crypto_generichash(chat_key, 32, (const uint8_t *)norm, k, (const uint8_t *)"hush-chat-crypt-v3", 18);
     } else if (k == HUSH_KEY_CHARS) {
-        /* 40 bits is little, so every guess has to pay for Argon2id. The salt
-         * is fixed so that every client gets the same keys. */
+        /* Only 40 bits, so every guess has to pay for Argon2id. The salt is
+         * fixed so every client derives the same keys. */
         uint8_t master[64];
         if (crypto_pwhash(master, sizeof master, norm, k, (const uint8_t *)"hush-chat-key-v4", 3, 128u << 20,
                           crypto_pwhash_ALG_ARGON2ID13) != 0)

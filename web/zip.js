@@ -1,5 +1,5 @@
 // A minimal zip writer (files stored as is, no compression) for "My data".
-// files: [{name, data: Uint8Array}]; returns a Blob.
+// files: [{name, data: Uint8Array}], returns a Blob.
 
 const CRC = (() => {
   const t = new Uint32Array(256);

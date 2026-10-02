@@ -1,16 +1,16 @@
 /* hush: end-to-end encrypted chat client for the terminal.
  *
  * Identity: one ed25519 keypair per user (~/.local/share/hush/identity.key).
- * It signs the server's login challenge and every message you send, and,
- * converted to X25519, encrypts DMs with crypto_box.
+ * It signs the login challenge and every message you send, and, converted to
+ * X25519, encrypts DMs with crypto_box.
  *
- * Chat messages are encrypted with a key derived from the chat key, which
- * the server never sees (see proto.h), so everyone in the chat, including
- * people who join later, can read the history the server stores.
+ * Chat messages use a key derived from the chat key (see proto.h) that the
+ * server never sees. Everyone in the chat, including people who join later,
+ * can read the stored history.
  *
- * Trust: the first key seen for a name is pinned in known_peers. A later
- * different key is refused until the user runs /trust. Comparing
- * fingerprints out of band (/fp, /verify) rules out a lying server. */
+ * Trust: the first key seen for a name is pinned in known_peers. A different
+ * key later is refused until the user runs /trust. Comparing fingerprints
+ * out of band (/fp, /verify) rules out a lying server. */
 #include "msg.h"
 #include "proto.h"
 
@@ -97,7 +97,7 @@ static struct {
     int active, for_mydata;
     struct image img;
     struct buf data;
-    char path[4300]; /* where to save it; empty: ~/Downloads */
+    char path[4300]; /* save path, empty means ~/Downloads */
 } download;
 /* /mydata: everything you sent, and DMs sent to you, saved to a folder. */
 static struct {
@@ -119,8 +119,6 @@ static int raw_on;
 static char line[HUSH_MAX_TEXT + 1];
 static size_t line_len;
 static int esc_state;
-
-/* ---- terminal ---------------------------------------------------------- */
 
 static const char *col(const char *seq)
 {
@@ -187,9 +185,8 @@ static void term_raw(void)
     atexit(term_restore);
 }
 
-/* Copy untrusted text for display, dropping anything a terminal could
- * interpret: C0/C1 control codes (escape sequences) and invalid UTF-8.
- * dst must hold n + 1 bytes. */
+/* Copy untrusted text for display, dropping C0/C1 control codes (escape
+ * sequences) and invalid UTF-8. dst must hold n + 1 bytes. */
 static void sanitize(const uint8_t *s, size_t n, char *dst)
 {
     size_t o = 0;
@@ -255,8 +252,6 @@ static void show_line(uint64_t ms, const char *from, const char *to, const char 
     say("%s%s%s %s%s%s%s: %s", col("\033[2m"), ts, col("\033[0m"), tag, col(color), from,
         col("\033[0m"), text);
 }
-
-/* ---- identity and pinned keys ------------------------------------------ */
 
 static void mkdir_p(char *path)
 {
@@ -349,8 +344,6 @@ static void known_save(void)
     if (fclose(f) != 0 || rename(tmp, known_path) != 0)
         say("! cannot save %s: %s", known_path, strerror(errno));
 }
-
-/* ---- network ------------------------------------------------------------ */
 
 static int dial(const char *host, const char *port)
 {
@@ -453,7 +446,7 @@ static void handshake(void)
     net_send(T_AUTH, &b);
     buf_free(&b);
 
-    /* In, or first on the waitlist until an admin decides. */
+    /* WAITING until an admin lets us in, then WELCOME */
     for (;;) {
         uint8_t type;
         read_frame(&type, &p, &n, &fs);
@@ -489,8 +482,6 @@ static void request_history(int dir, uint64_t anchor, uint16_t limit)
     put_u16(p + 9, limit);
     net_send_raw(T_HISTORY, p, sizeof p);
 }
-
-/* ---- peers --------------------------------------------------------------- */
 
 static struct peer *peer_find(const char *name)
 {
@@ -572,8 +563,6 @@ static void on_leave(const uint8_t *p, size_t n)
     say("%s* %s went offline%s", col("\033[33m"), name, col("\033[0m"));
 }
 
-/* ---- messages ------------------------------------------------------------ */
-
 static void sign_data(struct buf *d, const uint8_t *plain, size_t n)
 {
     d->len = 0;
@@ -582,7 +571,7 @@ static void sign_data(struct buf *d, const uint8_t *plain, size_t n)
     buf_put(d, plain, n);
 }
 
-/* Build, sign, encrypt and post a message. to is "" for the chat. */
+/* Build, sign, encrypt and post a message. to is NULL for the chat. */
 static void post(const struct peer *to, int kind, const void *content, size_t cn)
 {
     struct buf plain = { 0 }, sd = { 0 }, out = { 0 };
@@ -862,8 +851,6 @@ static void on_history_end(const uint8_t *p, size_t n)
     }
 }
 
-/* ---- the waitlist (admins) ----------------------------------------------- */
-
 static void on_pending(const uint8_t *p, size_t n)
 {
     char name[HUSH_NAME_MAX + 1], fp[HUSH_FP_LEN];
@@ -917,7 +904,7 @@ static void cmd_newchat(const char *label)
         say("usage: /newchat NAME   (1-24 of A-Z a-z 0-9 _ . -)");
         return;
     }
-    /* The key is made here; the server only ever gets its login token. */
+    /* Key is made here. The server only gets its login token. */
     uint8_t tok[32];
     chat_key_new(new_key);
     if (chat_key_derive(new_key, strlen(new_key), tok, NULL) != 0) {
@@ -955,8 +942,6 @@ static void cmd_waiting(void)
     for (size_t i = 0; i < nwaiting; i++)
         say("  %s is waiting: /approve %s or /deny %s", waiting[i], waiting[i], waiting[i]);
 }
-
-/* ---- images ---------------------------------------------------------------- */
 
 /* Drop metadata (EXIF with the GPS position, XMP, comments) before an image
  * leaves this machine. Each returns the new length. */
@@ -1176,7 +1161,6 @@ static void cmd_save(const char *arg)
     start_download(im, NULL, 0);
 }
 
-/* Write a finished download where it was meant to go. */
 static void save_image(const uint8_t *img, size_t n)
 {
     char dir[4096], path[4300];
@@ -1243,10 +1227,8 @@ static void on_blob(const uint8_t *p, size_t n)
     download_done();
 }
 
-/* ---- incoming ---------------------------------------------------------------- */
-
-/* Handle every whole frame in rx. Also called right after the handshake,
- * which may have read the first frames along with WELCOME. */
+/* Handle every whole frame in rx. Also runs after the handshake, which may
+ * have read frames past WELCOME. */
 static void process_frames(void)
 {
     uint8_t type;
@@ -1299,8 +1281,6 @@ static void on_net(void)
     rx.len += (size_t)r;
     process_frames();
 }
-
-/* ---- commands ------------------------------------------------------------ */
 
 static void cmd_help(void)
 {
@@ -1546,8 +1526,6 @@ static void on_key(uint8_t c)
     }
     redraw();
 }
-
-/* ---- main ---------------------------------------------------------------- */
 
 static void on_signal(int sig)
 {

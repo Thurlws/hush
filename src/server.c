@@ -59,10 +59,10 @@ struct client {
     int proxied;  /* came through a trusted local reverse proxy */
     int counted;  /* holds one of its address's connection slots */
     int dead, closing;
-    int refused;     /* dropped with an error; web clients shouldn't reconnect */
+    int refused;     /* dropped with an error, web clients shouldn't reconnect */
     int admin;       /* its identity key is on the admin list */
     int no_chat;     /* logged in with a zero token, to create chats */
-    time_t deadline; /* drop the connection after this; 0 for never */
+    time_t deadline; /* drop the connection after this, 0 for never */
     uint8_t ip[16];  /* rate-limit key */
     char addr[INET6_ADDRSTRLEN];
     char name[HUSH_NAME_MAX + 1];
@@ -94,7 +94,7 @@ struct user {
 struct room {
     uint8_t hash[32];
     char label[HUSH_NAME_MAX + 1];
-    int old; /* from before chat keys changed; can't be used, only revoked */
+    int old; /* old-format key, can only be revoked */
 };
 
 struct limit {
@@ -153,8 +153,6 @@ static double refill(double tokens, double burst, double rate, double dt)
     return tokens > burst ? burst : tokens;
 }
 
-/* ---- addresses and rate limits ---------------------------------------------- */
-
 static void sa_to_in6(const struct sockaddr_storage *ss, struct in6_addr *a)
 {
     memset(a, 0, sizeof *a);
@@ -194,8 +192,8 @@ static int ip_loopback(const struct in6_addr *a)
     return IN6_IS_ADDR_LOOPBACK(a) || (IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127);
 }
 
-/* The (refilled) limits for an address. The table has a fixed size; when a
- * spot is needed, the entry idle the longest gives way. */
+/* Limits for an address, refilled. With no free slot, the one with the fewest
+ * open connections (then the longest idle) gets reused. */
 static struct limit *limit_get(const uint8_t ip[16])
 {
     uint32_t h = 2166136261u;
@@ -228,8 +226,6 @@ static struct limit *limit_get(const uint8_t ip[16])
     l->t = now;
     return l;
 }
-
-/* ---- users and chat keys ---------------------------------------------------- */
 
 static struct user *user_find(const char *name)
 {
@@ -391,8 +387,8 @@ static void users_write(FILE *f)
     }
 }
 
-/* A fingerprint as shown to users ("6937 b1d5 ...", any case, spaces
- * optional) to its 16 bytes. */
+/* Parse a fingerprint as shown to users ("6937 b1d5 ...", any case, spaces
+ * optional) into 16 bytes. Returns -1 if it isn't one. */
 static int fingerprint_parse(const char *s, uint8_t out[16])
 {
     char hex[33];
@@ -461,9 +457,8 @@ static int file_changed(const char *path, struct stat *last)
     return changed;
 }
 
-/* ---- storage ------------------------------------------------------------------
- * Messages and chat membership live in SQLite; images are files in blob_dir.
- * Every query is a prepared statement with bound parameters. */
+/* Messages and members are in SQLite, images are files in blob_dir.
+ * All queries are prepared statements with bound parameters. */
 
 static sqlite3 *db;
 enum {
@@ -581,8 +576,6 @@ static int disk_low(void)
     return statvfs(blob_dir, &sv) == 0 && (unsigned long long)sv.f_bavail * sv.f_frsize < MIN_FREE_DISK;
 }
 
-/* ---- clients ------------------------------------------------------------------ */
-
 static struct client *client_find(const char *name)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
@@ -677,7 +670,7 @@ static void on_hello(struct client *c, const uint8_t *p, size_t n)
     c->st = ST_AUTH;
 }
 
-/* Tell the admins in c's chat that name is waiting (1) or was decided (0). */
+/* Tell the admins in room that name is waiting (1) or was decided (0). */
 static void notify_admins(const uint8_t *room, uint8_t waiting, const char *name, const uint8_t *pk)
 {
     struct buf b = { 0 };
@@ -804,7 +797,7 @@ static void on_auth(struct client *c, const uint8_t *p, size_t n)
         admit(c, 0);
         return;
     }
-    if (c->admin) { /* admins don't wait */
+    if (c->admin) {
         set_member_state(c->room, c->name, MEMBER_IN);
         admit(c, 1);
         return;
@@ -834,8 +827,8 @@ static void on_auth(struct client *c, const uint8_t *p, size_t n)
     buf_free(&b);
 }
 
-/* Someone waiting may have been approved or denied (here, by `hushd
- * approve`, or by becoming an admin): act on it. */
+/* A waiting client may have been approved or denied (by an admin in the chat,
+ * with `hushd approve`, or by becoming an admin). Act on it. */
 static void recheck_waiting(struct client *c)
 {
     c->admin = is_admin(c->pk);
@@ -971,7 +964,7 @@ static void on_history(struct client *c, const uint8_t *p, size_t n)
     sqlite3_bind_text(s, 3, c->name, -1, SQLITE_STATIC);
     sqlite3_bind_int(s, 4, limit + 1); /* one extra says whether there's more */
 
-    /* Older pages come newest first; collect them to send oldest first. */
+    /* Older pages come newest first, so collect them and send reversed. */
     struct buf frames[HUSH_HISTORY_MAX];
     int rows = 0, more = 0;
     while (sqlite3_step(s) == SQLITE_ROW) {
@@ -1465,8 +1458,8 @@ static int listen_on(const char *port)
     die("cannot create a socket: %s", strerror(errno));
 }
 
-/* The web client's files: ./web when run from the source tree, else where
- * `make install` put them, next to this binary's bin directory. */
+/* The web client's files: ./web in the source tree, else ../share/hush/web
+ * relative to this binary, where `make install` puts them. */
 static const char *find_web_dir(void)
 {
     static char dir[4200];
@@ -1483,8 +1476,6 @@ static const char *find_web_dir(void)
     snprintf(dir, sizeof dir, "%s/../share/hush/web", exe);
     return dir;
 }
-
-/* ---- admin commands ----------------------------------------------------------- */
 
 static void cmd_newkey(const char *label)
 {

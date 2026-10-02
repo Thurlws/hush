@@ -5,6 +5,9 @@
 // "/save FILE" saves the newest image seen, and "/mydata FILE" writes what
 // "My data" would put in messages.json. "/newchat NAME" creates a chat the
 // way the home page's "Create your own" does (admins).
+// For server tests: "/raw TYPE HEX" sends any frame, even while waiting,
+// "/garbage N" sends N random frames, "/lastblob" prints the newest image's
+// blob id, and every BLOB reply is printed with its status.
 import { readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import sodium from "./web/sodium.mjs";
@@ -39,6 +42,7 @@ function show(m) {
 }
 
 const queue = [];
+const hex = b => Buffer.from(b).toString("hex");
 const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket: WS }, ev => {
   switch (ev.type) {
   case "waiting": console.log(`waiting for approval to join ${ev.label}`); break;
@@ -60,6 +64,20 @@ const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket:
   }
 });
 
+const onFrame = s.onFrame.bind(s);
+s.onFrame = f => {
+  if (f[0] === 18 && f.length >= 18) console.log(`blob ${hex(f.subarray(1, 17))} status ${f[17]}`);
+  onFrame(f);
+};
+
+function raw(l) {
+  const r = /^\/raw (\d+) ?([0-9a-f]*)$/.exec(l), g = /^\/garbage (\d+)$/.exec(l);
+  if (r) s.send(Number(r[1]), Buffer.from(r[2], "hex"));
+  for (let i = 0; g && i < Number(g[1]); i++)
+    s.send(sodium.randombytes_uniform(32), sodium.randombytes_buf(sodium.randombytes_uniform(300)));
+  return !!(r || g);
+}
+
 async function run(l) {
   const img = /^\/img (\S+) ?(.*)$/.exec(l), save = /^\/save (\S+)$/.exec(l), mine = /^\/mydata (\S+)$/.exec(l);
   try {
@@ -74,6 +92,8 @@ async function run(l) {
       const items = await s.exportMine();
       writeFileSync(mine[1], JSON.stringify(items.map(m => ({ from: m.from, to: m.to, text: m.text, image: !!m.image })), null, 1));
       console.log(`my data: ${items.length} messages`);
+    } else if (l === "/lastblob") {
+      console.log(`lastblob ${lastImage ? hex(lastImage.blob) : "none"}`);
     } else if (save) {
       writeFileSync(save[1], await s.fetchImage(lastImage));
       console.log(`saved ${save[1]}`);
@@ -86,5 +106,5 @@ async function run(l) {
 }
 
 const rl = createInterface({ input: process.stdin });
-rl.on("line", l => (s.ready ? run(l) : queue.push(l)));
+rl.on("line", l => raw(l) || (s.ready ? run(l) : queue.push(l)));
 rl.on("close", () => setTimeout(() => s.close(), 300));

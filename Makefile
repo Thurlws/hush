@@ -26,11 +26,11 @@ tests/unit: tests/unit.c src/msg.o src/proto.o src/web.o src/proto.h src/web.h s
 # Objects don't remember their flags, so these rebuild from scratch.
 debug:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O0 -g3"
+	$(MAKE) CFLAGS="-O0 -g3" all tests/unit
 
 asan:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O1 -g $(SAN)" LDFLAGS="$(SAN)"
+	$(MAKE) CFLAGS="-O1 -g $(SAN)" LDFLAGS="$(SAN)" all tests/unit
 
 # Runs against whatever was built last, so `make asan test` tests the sanitizer build.
 test: all tests/unit

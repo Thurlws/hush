@@ -9,6 +9,10 @@ PORT=${PORT:-17777}
 WPORT=$((PORT + 1))
 fail=0
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
+# Sanitizer builds (make asan test) report here, checked at the end before $T goes away
+mkdir -p "$T/san"
+export ASAN_OPTIONS="log_path=$T/san/asan:${ASAN_OPTIONS:-}"
+export UBSAN_OPTIONS="log_path=$T/san/ubsan:print_stacktrace=1:${UBSAN_OPTIONS:-}"
 
 check() { # file pattern description
     if grep -qaF -- "$2" "$1"; then echo "ok   - $3"; else echo "FAIL - $3"; echo "---- $1:"; cat "$1"; fail=1; fi
@@ -343,6 +347,20 @@ if command -v node >/dev/null; then
         { echo "FAIL - web image round trip"; fail=1; }
     echo | web eve zzzz-zzzz-zzzz-zzzz-zzzz-zzzz >"$T/eve.out" 2>&1
     check  "$T/eve.out"    "closed: wrong key"             "web client is refused a wrong key"
+
+    # The server checks permissions itself, whatever a modified client sends.
+    (sleep 1; echo "/raw 7 01037a6564"; echo "/raw 8 046e6f7065$(printf '%064d' 0)"; sleep 1) |
+        web wendy >"$T/wendy-raw.out" 2>&1
+    check "$T/wendy-raw.out" "server: only an admin can do that"     "a DECIDE from someone who isn't an admin is refused"
+    check "$T/wendy-raw.out" "server: only an admin can create chats" "...and so is a NEWCHAT"
+    (sleep 1; echo "/raw 3 00$(printf '%0200d' 0)"; sleep 1) | web wilma >"$T/wilma.out" 2>&1
+    check "$T/wilma.out" "closed: protocol violation" "someone on the waitlist can't post"
+    (sleep 1; echo "/lastblob"; sleep 0.5) | web wally >"$T/wally-blob.out" 2>&1
+    BLOB=$(sed -n 's/^lastblob //p' "$T/wally-blob.out")
+    (sleep 1; echo "/raw 6 $BLOB"; sleep 1) | web wally >"$T/fetch-own.out" 2>&1
+    (sleep 1; echo "/raw 6 $BLOB"; sleep 1) | web wally "$KW" >"$T/fetch-other.out" 2>&1
+    check "$T/fetch-own.out"   "blob $BLOB status 1" "an image can be fetched in its own chat"
+    check "$T/fetch-other.out" "blob $BLOB status 2" "...but not from another chat"
 else
     echo "skip - web client tests (need node)"
 fi
@@ -425,5 +443,117 @@ for i in $(seq 40); do code -H "X-Forwarded-For: 203.0.113.9" "$B/style.css"; ec
 code -H "X-Forwarded-For: 203.0.113.9, 198.51.100.7" "$B/style.css" >"$T/proxy2.out"
 check "$T/proxy1.out" "429" "limits apply to the forwarded address"
 check "$T/proxy2.out" "200" "other forwarded addresses are unaffected"
+
+# Hostile input and a crash, on a fresh server so the rate limits above don't get in the way.
+kill $srv
+wait $srv 2>/dev/null
+S="$T/s5"
+mkdir -p "$S"
+cp "$T/s1/hushd-keys.txt" "$T/s1/hushd-admins.txt" "$S/"
+server "$S"
+python3 - "$PORT" "$WPORT" >"$T/malformed.out" <<'EOF'
+import socket, struct, sys, time
+tcp, web = int(sys.argv[1]), int(sys.argv[2])
+def conn(port):
+    return socket.create_connection(("127.0.0.1", port), timeout=3)
+def read(s, n):
+    d = b""
+    while len(d) < n:
+        c = s.recv(n - len(d))
+        if not c:
+            return None
+        d += c
+    return d
+def closed(s):
+    try:
+        while True:
+            if not s.recv(4096):
+                return "closed"
+    except socket.timeout:
+        return "still open"
+    except ConnectionResetError:
+        return "closed"
+hello = bytes([5]) + b"probe" + bytes(64) + b"\x01"
+frame = struct.pack(">IB", len(hello) + 1, 1) + hello
+s = conn(tcp)
+for b in frame:
+    s.send(bytes([b]))
+    time.sleep(0.003)
+h = read(s, 5)
+print("tcp trickled hello:", "CHALLENGE" if h and h[4] == 10 else h)
+s = conn(tcp); s.send(b"\x00\x00\x00\x00\x01"); print("tcp zero length:", closed(s))
+s = conn(tcp); s.send(b"\x00\x01\x00\x01\x01"); print("tcp oversized:", closed(s))
+s = conn(tcp); s.send(b"\x00\x00\x00\x02\x03\x00"); h = read(s, 5)
+print("tcp post before hello:", read(s, struct.unpack(">I", h[:4])[0] - 1).decode() if h else None, closed(s))
+def ws():
+    s = conn(web)
+    s.send((f"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{web}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Origin: http://127.0.0.1:{web}\r\n\r\n").encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += s.recv(1)
+    return s, head.split(b" ")[1].decode()
+def masked(op, payload, fin=True, mask=b"abcd"):
+    assert len(payload) < 126
+    return bytes([(0x80 if fin else 0) | op, 0x80 | len(payload)]) + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
+s, code = ws(); s.send(masked(2, bytes([1]) + hello)); h = read(s, 3)
+print("ws hello:", code, "CHALLENGE" if h and h[2] == 10 else h)
+s, _ = ws(); s.send(bytes([0x82, len(hello) + 1]) + bytes([1]) + hello); print("ws unmasked:", closed(s))
+s, _ = ws(); s.send(masked(2, bytes([1]) + hello, fin=False)); print("ws fragment:", closed(s))
+s, _ = ws(); s.send(bytes([0x82, 0xff]) + (2**40).to_bytes(8, "big") + b"abcd"); print("ws huge length:", closed(s))
+EOF
+check "$T/malformed.out" "tcp trickled hello: CHALLENGE"  "a HELLO that arrives a byte at a time still works"
+check "$T/malformed.out" "tcp zero length: closed"        "a zero-length frame drops the connection"
+check "$T/malformed.out" "tcp oversized: closed"          "an oversized frame drops the connection"
+check "$T/malformed.out" "protocol violation closed"      "frames out of order are refused"
+check "$T/malformed.out" "ws hello: 101 CHALLENGE"        "the same HELLO works over a WebSocket"
+check "$T/malformed.out" "ws unmasked: closed"            "unmasked WebSocket frames are refused"
+check "$T/malformed.out" "ws fragment: closed"            "fragmented WebSocket frames are refused"
+check "$T/malformed.out" "ws huge length: closed"         "a WebSocket frame claiming 1 TB is refused"
+
+if command -v node >/dev/null; then
+    admin admin "$(fingerprint "$T/web-wally.id")" >/dev/null
+    for i in $(seq 8); do (sleep 1; echo "/garbage 50"; sleep 0.5) | web wally >>"$T/garbage.out" 2>&1; done
+    (sleep 0.5; echo "still here?"; sleep 1) | client alice a >"$T/alice-garbage.out" 2>&1
+    check "$T/garbage.out" "connected as wally" "random frames after login..."
+    check "$T/garbage.out" "closed: "           "...get the sender dropped..."
+    check "$T/alice-garbage.out" "chat: main" "...don't take the server down"
+
+    # kill -9 in the middle of an upload
+    head -c 20000000 /dev/urandom >"$T/big.jpg"
+    (sleep 1; echo "/img $T/big.jpg"; sleep 20) | web wally >"$T/wally-big.out" 2>&1 &
+    w=$!
+    for i in $(seq 200); do ls "$S"/blobs/.up-* >/dev/null 2>&1 && break; sleep 0.05; done
+    ls "$S"/blobs/.up-* >/dev/null 2>&1 && echo "ok   - an upload is under way" ||
+        { echo "FAIL - no upload under way to interrupt"; fail=1; }
+    kill -9 $srv
+    wait $srv 2>/dev/null
+    kill $w 2>/dev/null
+    wait $w 2>/dev/null
+    server "$S"
+    check "$T/server.log" "removed 1 unfinished uploads" "after a crash, the half-uploaded image is removed..."
+    ls "$S"/blobs/.up-* >/dev/null 2>&1 && { echo "FAIL - partial upload left"; fail=1; } ||
+        echo "ok   - ...and nothing partial is left"
+    python3 -c "import sqlite3, sys; print('integrity', sqlite3.connect(sys.argv[1]).execute('PRAGMA integrity_check').fetchone()[0])" \
+        "$S/hushd.db" >"$T/integrity.out"
+    check "$T/integrity.out" "integrity ok" "...the database is intact"
+    sleep 2 | client alice a >"$T/alice-crash.out" 2>&1
+    check "$T/alice-crash.out" "alice: still here?" "...and messages from before the crash are still there"
+else
+    echo "skip - random frames and crash tests (need node)"
+fi
+
+kill $srv
+wait $srv 2>/dev/null
+if grep -qa __asan_init hushd; then
+    if ls "$T"/san/* >/dev/null 2>&1; then
+        echo "FAIL - sanitizer reports:"
+        cat "$T"/san/*
+        fail=1
+    else
+        echo "ok   - no sanitizer reports from any client or server"
+    fi
+fi
 
 [ $fail = 0 ] && echo "all tests passed" || { echo "some tests failed"; exit 1; }

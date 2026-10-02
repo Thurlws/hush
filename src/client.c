@@ -176,8 +176,8 @@ static void term_raw(void)
     if (tcgetattr(STDIN_FILENO, &orig_tio) < 0)
         die("tcgetattr: %s", strerror(errno));
     struct termios t = orig_tio;
-    t.c_iflag &= ~(ICRNL | IXON | BRKINT | ISTRIP | INPCK);
-    t.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
+    t.c_iflag &= ~(tcflag_t)(ICRNL | IXON | BRKINT | ISTRIP | INPCK);
+    t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | ISIG | IEXTEN);
     t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
@@ -227,7 +227,7 @@ static int name_color(const char *name)
     unsigned h = 5381;
     while (*name)
         h = h * 33 + (unsigned char)*name++;
-    return 31 + h % 6;
+    return 31 + (int)(h % 6);
 }
 
 /* "14:05" today, else "Mar 3 14:05". */
@@ -451,9 +451,9 @@ static void handshake(void)
         uint8_t type;
         read_frame(&type, &p, &n, &fs);
         if (type == T_ERROR) {
-            char msg[HUSH_MAX_FRAME + 1];
-            sanitize(p, n, msg);
-            die("server refused login: %s", msg);
+            char err[HUSH_MAX_FRAME + 1];
+            sanitize(p, n, err);
+            die("server refused login: %s", err);
         }
         int k = name_get(p, n, chat_label);
         if (k < 0 || (type != T_WAITING && type != T_WELCOME))
@@ -504,10 +504,10 @@ static void on_peer(const uint8_t *p, size_t n)
 {
     char name[HUSH_NAME_MAX + 1], fp[HUSH_FP_LEN], oldfp[HUSH_FP_LEN];
     int k = name_get(p, n, name);
-    if (k < 0 || n - k != crypto_sign_PUBLICKEYBYTES + 1 || !strcmp(name, my_name))
+    if (k < 0 || n - (size_t)k != crypto_sign_PUBLICKEYBYTES + 1 || !strcmp(name, my_name))
         return;
     const uint8_t *pk = p + k;
-    int flags = p[k + crypto_sign_PUBLICKEYBYTES];
+    int flags = p[(size_t)k + crypto_sign_PUBLICKEYBYTES];
 
     struct peer *pe = peer_find(name);
     if (!pe) {
@@ -640,7 +640,7 @@ static int open_msg(const uint8_t *p, size_t n, struct opened *o)
     o->id = get_u64(p);
     o->live = p[16];
     int k1 = name_get(p + 17, n - 17, o->from), k2;
-    if (k1 < 0 || (k2 = name_get_opt(p + 17 + k1, n - 17 - k1, o->to)) < 0)
+    if (k1 < 0 || (k2 = name_get_opt(p + 17 + k1, n - 17 - (size_t)k1, o->to)) < 0)
         return -1;
     const uint8_t *body = p + 17 + k1 + k2;
     size_t bl = n - 17 - (size_t)k1 - (size_t)k2;
@@ -1109,7 +1109,7 @@ static void cmd_img(char *arg)
     enc.len = NONCE + (size_t)cl;
     buf_free(&img);
     upload.active = 1;
-    say("sending %s (%.1f MB)...", arg, enc.len / 1048576.0);
+    say("sending %s (%.1f MB)...", arg, (double)enc.len / 1048576.0);
     uint8_t piece[1 + HUSH_CHUNK];
     for (size_t off = 0; off < enc.len && running;) {
         size_t n = enc.len - off < HUSH_CHUNK ? enc.len - off : HUSH_CHUNK;

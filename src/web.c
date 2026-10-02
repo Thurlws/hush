@@ -240,7 +240,7 @@ static void sha1(const uint8_t *msg, size_t len, uint8_t out[20])
     memcpy(m, msg, len);
     m[len] = 0x80;
     uint64_t bits = (uint64_t)len * 8;
-    for (int i = 0; i < 8; i++)
+    for (size_t i = 0; i < 8; i++)
         m[blocks * 64 - 1 - i] = (uint8_t)(bits >> (8 * i));
 
     uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };

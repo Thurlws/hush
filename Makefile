@@ -2,10 +2,12 @@ CC      ?= cc
 CFLAGS  ?= -O2 -g
 PREFIX  ?= $(HOME)/.local
 # Required flags live apart from CFLAGS so `make CFLAGS=...` can't drop them.
-HUSH_CFLAGS = -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic $(shell pkg-config --cflags libsodium sqlite3)
+HUSH_CFLAGS = -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wundef \
+              $(shell pkg-config --cflags libsodium sqlite3)
 HUSH_LIBS   = $(shell pkg-config --libs libsodium)
 HUSHD_LIBS  = $(shell pkg-config --libs sqlite3)
 WEB_FILES   = web/index.html web/style.css web/app.js web/hush.js web/sodium.mjs web/libsodium.mjs web/zip.js
+SAN         = -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 
 all: hush hushd
 
@@ -18,6 +20,19 @@ hushd: src/server.o src/web.o src/msg.o src/proto.o
 src/%.o: src/%.c src/proto.h src/web.h src/msg.h
 	$(CC) $(HUSH_CFLAGS) $(CFLAGS) -c -o $@ $<
 
+# Objects don't remember their flags, so these rebuild from scratch.
+debug:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="-O0 -g3"
+
+asan:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="-O1 -g $(SAN)" LDFLAGS="$(SAN)"
+
+# Runs against whatever was built last, so `make asan test` tests the sanitizer build.
+test: all
+	./test.sh
+
 install: all
 	install -Dm755 hush hushd -t $(PREFIX)/bin
 	install -Dm644 $(WEB_FILES) -t $(PREFIX)/share/hush/web
@@ -25,4 +40,4 @@ install: all
 clean:
 	rm -f hush hushd src/*.o
 
-.PHONY: all install clean
+.PHONY: all debug asan test install clean

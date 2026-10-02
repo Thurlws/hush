@@ -137,7 +137,7 @@ static double now_mono(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 static uint64_t now_ms(void)
@@ -202,7 +202,7 @@ static struct limit *limit_get(const uint8_t ip[16])
     double now = now_mono();
     struct limit *l = NULL, *spare = NULL;
     for (int i = 0; i < LIMIT_PROBE && !l; i++) {
-        struct limit *e = &limits[(h + i) % LIMIT_SLOTS];
+        struct limit *e = &limits[(h + (uint32_t)i) % LIMIT_SLOTS];
         if (e->used && !memcmp(e->ip, ip, 16))
             l = e;
         else if (!spare || !e->used ||
@@ -639,7 +639,7 @@ static int take_request(struct client *c)
 static void on_hello(struct client *c, const uint8_t *p, size_t n)
 {
     int k = name_get(p, n, c->name);
-    if (k < 0 || n - k != crypto_sign_PUBLICKEYBYTES + 32) {
+    if (k < 0 || n - (size_t)k != crypto_sign_PUBLICKEYBYTES + 32) {
         send_error(c, "bad hello (names are 1-24 of A-Z a-z 0-9 _ . -)", 1);
         return;
     }
@@ -1557,7 +1557,7 @@ static void cmd_keys(void)
         if (sqlite3_step(s) == SQLITE_ROW)
             printf("%-24s  %lld messages, %lld images (%.1f MB)\n", rooms[i].label,
                    sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1),
-                   sqlite3_column_int64(s, 2) / 1048576.0);
+                   (double)sqlite3_column_int64(s, 2) / 1048576.0);
     }
     sqlite3_finalize(s);
 }
@@ -2034,7 +2034,7 @@ int main(int argc, char **argv)
             pfds[n] = (struct pollfd){ .fd = c->fd, .events = ev };
             slot_of[n++] = i;
         }
-        if (poll(pfds, n, 1000) < 0) {
+        if (poll(pfds, (nfds_t)n, 1000) < 0) {
             if (errno == EINTR)
                 continue;
             die("poll: %s", strerror(errno));

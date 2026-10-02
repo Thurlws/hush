@@ -55,7 +55,7 @@ void buf_free(struct buf *b)
 void frame_put(struct buf *out, uint8_t type, const void *payload, size_t n)
 {
     uint32_t len = (uint32_t)n + 1;
-    uint8_t hdr[5] = { len >> 24, len >> 16, len >> 8, len, type };
+    uint8_t hdr[5] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len, type };
     buf_put(out, hdr, sizeof hdr);
     buf_put(out, payload, n);
 }

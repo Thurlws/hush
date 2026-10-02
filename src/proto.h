@@ -47,6 +47,7 @@
 #include <stdint.h>
 #include <sodium.h>
 
+#define HUSH_VERSION       "0.1.0"
 #define HUSH_DEFAULT_PORT  "7777"
 #define HUSH_DEFAULT_WEB   "8080"
 #define HUSH_MAX_FRAME     ((size_t)64 * 1024)

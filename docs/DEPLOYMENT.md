@@ -48,6 +48,9 @@ This is the setup for a small cloud server, e.g. an Oracle Cloud free VM. You ge
 
 Logs: `journalctl -u hushd -f`. Everything the server keeps is in `/var/lib/hush`, so back that up.
 
+For uptime monitoring, poll `https://chat.example.com/health`. It answers `ok` as long as hushd's
+event loop is running. `hushd -V` prints the version.
+
 To update: `git pull && make && sudo make install PREFIX=/usr/local && sudo systemctl restart hushd`.
 
 ## Upgrading from the version without history

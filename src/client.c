@@ -1573,6 +1573,7 @@ static void usage(void)
     fprintf(stderr, "usage: hush [-n name] [-k key] host[:port]   e.g.  hush -n alice 203.0.113.7\n"
                     "       hush [-n name] [-k key] host port\n"
                     "  -n name  your chat name (default: $USER)\n"
+                    "  -V       print the version\n"
                     "  -k key   the chat key you were given (or set HUSH_KEY; asked for if missing)\n"
                     "  host     IP address or hostname of the machine running hushd\n"
                     "  port     defaults to " HUSH_DEFAULT_PORT "\n");
@@ -1583,12 +1584,15 @@ int main(int argc, char **argv)
 {
     const char *name = getenv("USER"), *key = getenv("HUSH_KEY");
     int opt;
-    while ((opt = getopt(argc, argv, "n:k:h")) != -1) {
+    while ((opt = getopt(argc, argv, "n:k:hV")) != -1) {
         if (opt == 'n')
             name = optarg;
         else if (opt == 'k')
             key = optarg;
-        else
+        else if (opt == 'V') {
+            printf("hush %s\n", HUSH_VERSION);
+            return 0;
+        } else
             usage();
     }
     if (optind >= argc || argc - optind > 2)

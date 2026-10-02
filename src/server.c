@@ -2050,6 +2050,7 @@ static void usage(void)
             "  -w port       port for the web client, 0 for none (default " HUSH_DEFAULT_WEB ")\n"
             "  -d dir        web client files (default ./web, else ../share/hush/web from hushd)\n"
             "  -x            trust X-Forwarded-For from a reverse proxy on this machine\n"
+            "  -V            print the version\n"
             "files, relative to -C: %s (chat key hashes), %s, %s, %s, %s/\n",
             keys_path, users_path, admins_path, db_path, blob_dir);
     exit(2);
@@ -2059,7 +2060,7 @@ int main(int argc, char **argv)
 {
     const char *port = HUSH_DEFAULT_PORT, *web_port = HUSH_DEFAULT_WEB, *web_dir = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "C:p:w:d:xh")) != -1) {
+    while ((opt = getopt(argc, argv, "C:p:w:d:xhV")) != -1) {
         if (opt == 'C') {
             if (chdir(optarg) < 0)
                 die("cannot use %s: %s", optarg, strerror(errno));
@@ -2071,7 +2072,10 @@ int main(int argc, char **argv)
             web_dir = optarg;
         else if (opt == 'x')
             trust_proxy = 1;
-        else
+        else if (opt == 'V') {
+            printf("hushd %s\n", HUSH_VERSION);
+            return 0;
+        } else
             usage();
     }
     if (sodium_init() < 0)
@@ -2140,7 +2144,7 @@ int main(int argc, char **argv)
                 web_dir, strerror(errno));
     }
     int lfd = listen_on(port), wfd = web ? listen_on(web_port) : -1;
-    note("hushd: terminal clients on port %s", port);
+    note("hushd %s: terminal clients on port %s", HUSH_VERSION, port);
     if (web)
         note("hushd: web client on port %s (files from %s)%s", web_port, web_dir,
              trust_proxy ? ", trusting X-Forwarded-For from localhost" : "");

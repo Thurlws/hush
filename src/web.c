@@ -210,6 +210,14 @@ void http_serve(struct buf *out, const struct http_req *req)
         http_error(out, 405);
         return;
     }
+    /* for uptime checks. Answering at all means the event loop is alive */
+    if (!strcmp(req->path, "/health")) {
+        buf_printf(out,
+                   "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\n"
+                   "Cache-Control: no-store\r\n%sConnection: close\r\n\r\n%s",
+                   security_headers, req->head ? "" : "ok\n");
+        return;
+    }
     const struct asset *a = NULL;
     for (size_t i = 0; i < sizeof assets / sizeof *assets && !a; i++)
         if (assets[i].data && !strcmp(req->path, assets[i].path))

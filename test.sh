@@ -71,6 +71,9 @@ S="$T/s1"
 mkdir -p "$S"
 K1=$(newkey main)
 K2=$(newkey other)
+./hush -V >"$T/version.out"; ./hushd -V >>"$T/version.out"
+check "$T/version.out" "hush 0.1.0" "hush -V prints the version"
+check "$T/version.out" "hushd 0.1.0" "hushd -V too"
 [ -n "$K1" ] && [ -n "$K2" ] && echo "ok   - hushd newkey prints a key" || { echo "FAIL - hushd newkey"; fail=1; }
 [[ $K1 =~ ^[0-9a-z]{4}-[0-9a-z]{4}$ ]] && echo "ok   - keys look like xxxx-xxxx" || { echo "FAIL - key format: $K1"; fail=1; }
 # A key made before keys got shorter (24 characters, no Argon2id) must keep working.
@@ -304,12 +307,14 @@ check "$T/headers"    "frame-ancestors 'none'"          "can't be framed"
     echo "origin $(code -H 'Upgrade: websocket' -H 'Connection: Upgrade' -H 'Sec-WebSocket-Version: 13' \
         -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Origin: https://evil.example' "$B/ws")"
     echo "garbage $(code -H $'X-Bad: a\x01b' "$B/")"
+    echo "health $(code "$B/health") $(curl -s "$B/health")"
 } >"$T/http.out"
 check "$T/http.out" "traversal 404 404" "no files outside the web client are served"
 check "$T/http.out" "unknown 404 404 404 404" "unknown paths, images and server files are 404"
 check "$T/http.out" "post 405"          "only GET and HEAD"
 check "$T/http.out" "origin 403"        "WebSockets from other sites are refused"
 check "$T/http.out" "garbage 400"       "control characters in headers are refused"
+check "$T/http.out" "health 200 ok"     "/health answers for uptime checks"
 
 if command -v node >/dev/null; then
     # A web admin lets a web newcomer in.

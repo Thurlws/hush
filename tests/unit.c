@@ -313,6 +313,16 @@ static void test_http(void)
     memset(req, 'a', HTTP_MAX_HEADER);
     CHECK(http_parse((const uint8_t *)req, HTTP_MAX_HEADER, &r) == -1);
     CHECK(http_parse((const uint8_t *)req, HTTP_MAX_HEADER - 1, &r) == 0);
+
+    struct buf out = { 0 };
+    CHECK(parse("GET /health HTTP/1.1\r\n\r\n", &r) > 0);
+    http_serve(&out, &r);
+    CHECK(out.len > 3 && !strncmp((char *)out.data, "HTTP/1.1 200 OK\r\n", 17) && !memcmp(out.data + out.len - 3, "ok\n", 3));
+    out.len = 0;
+    CHECK(parse("HEAD /health HTTP/1.1\r\n\r\n", &r) > 0);
+    http_serve(&out, &r);
+    CHECK(out.len > 4 && !memcmp(out.data + out.len - 4, "\r\n\r\n", 4));
+    buf_free(&out);
 }
 
 /* Parse a WebSocket upgrade with extra headers and run ws_upgrade on it */

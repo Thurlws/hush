@@ -114,6 +114,7 @@ hushd keys            # list chats, with how many messages and images each one s
 hushd clear NAME      # delete a chat's messages and images; the key keeps working
 hushd revoke NAME     # delete a chat: its key, messages and images; everyone in it is disconnected
 hushd forget USER     # free up a name, e.g. when a friend lost their browser data
+hushd backup DIR      # copy everything into a new DIR, safe while hushd runs
 ```
 
 A running server picks up these changes by itself. Add `-C DIR` to work on the files in DIR.

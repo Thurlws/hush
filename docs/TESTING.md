@@ -15,7 +15,7 @@ Ryzen 7 7800X3D with gcc 16 and clang 22.
 
 `tests/unit.c` covers the code that needs no network or database: framing, names,
 chat key derivation, message encryption, parsing and signatures, image metadata,
-JSON output, the HTTP parser and WebSocket frames. 138 checks, well under a second.
+JSON output, the HTTP parser and WebSocket frames. 142 checks, well under a second.
 
 Chat key derivation is checked against values computed by `web/hush.js` (for the
 Argon2id keys) and by Python's `hashlib` (for the old 24-character keys and
@@ -32,7 +32,7 @@ person's key. Each has to fail.
 
 `test.sh` builds nothing. It starts real hushd processes on localhost and drives
 terminal clients, the web client's protocol code under Node (`test-web.mjs`) and
-the HTTP side with curl. 139 checks, about two minutes. Without Node the web parts
+the HTTP side with curl. 145 checks, about two minutes. Without Node the web parts
 are skipped and say so.
 
 What it covers, roughly in order:
@@ -47,7 +47,8 @@ What it covers, roughly in order:
 - Key changes: when the server hands out a new key for someone, clients hide their
   messages and refuse to encrypt DMs to them.
 - The web server: headers, path traversal, methods, Origin checks.
-- Admin commands: `clear`, `revoke`, `forget`, old key formats, database migrations.
+- Admin commands: `clear`, `revoke`, `forget`, old key formats, database migrations, and a
+  backup of the running server, opened and exported again to compare with the original.
 - Permissions the server checks itself, using raw frames a normal client wouldn't
   send: DECIDE and NEWCHAT from non-admins, posting from the waitlist, fetching an
   image from another chat, a message bigger than any client builds.

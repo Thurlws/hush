@@ -53,6 +53,41 @@ event loop is running. `hushd -V` prints the version.
 
 To update: `git pull && make && sudo make install PREFIX=/usr/local && sudo systemctl restart hushd`.
 
+## Backups
+
+```sh
+sudo install -d -o hush -g hush -m 700 /var/backups/hush
+sudo -u hush hushd -C /var/lib/hush backup /var/backups/hush/$(date +%F)
+```
+
+This is safe while hushd runs: the database is copied as one consistent snapshot, then
+the images. The folder has to be new, and a relative path counts from the `-C`
+directory, so give a full one. For a daily backup, put this in `/etc/cron.d/hush`:
+
+```
+0 4 * * * hush /usr/local/bin/hushd -C /var/lib/hush backup /var/backups/hush/$(date +\%F)
+```
+
+Copy the backups off the machine too. They hold what the server holds: ciphertext, and
+a hash per chat key that someone could use to guess keys offline (see
+[THREAT_MODEL.md](THREAT_MODEL.md)). Keep them as private as the server.
+
+To check a backup without touching the server, open it with hushd. `hushd -C
+/var/backups/hush/2026-10-03 keys` lists every chat with its message and image counts,
+and `hushd -C /var/backups/hush/2026-10-03 export CHAT DIR` decrypts one chat from it
+with its key. `test.sh` does both after backing up a running server and compares them
+with the live one.
+
+To restore:
+
+```sh
+sudo systemctl stop hushd
+sudo mv /var/lib/hush /var/lib/hush.old
+sudo cp -a /var/backups/hush/2026-10-03 /var/lib/hush
+sudo chown -R hush:hush /var/lib/hush
+sudo systemctl start hushd
+```
+
 ## Upgrading from the version without history
 
 Chat keys work differently now, so old keys stop working. After updating (install `libsqlite3-dev`

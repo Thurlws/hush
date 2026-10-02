@@ -233,6 +233,20 @@ check  "$T/export/messages.json"    "\"signature\": \"valid\""  "...and signatur
 cmp -s "$T/export/images/$id.jpg" "$T/home/Downloads/hush-$id.jpg" &&
     echo "ok   - ...and images decrypted" || { echo "FAIL - export images"; fail=1; }
 
+# A backup of the running server brings everything back: same chats and counts, and the
+# same transcript and images when exported from the backup.
+admin backup "$T/backup" >"$T/backup.out" 2>&1
+check "$T/backup.out" "backed up" "hushd backup copies a running server"
+admin keys >"$T/keys-live.out"
+./hushd -C "$T/backup" keys >"$T/keys-backup.out"
+cmp -s "$T/keys-live.out" "$T/keys-backup.out" && echo "ok   - ...with every chat and its message and image counts" ||
+    { echo "FAIL - backup counts differ"; diff "$T/keys-live.out" "$T/keys-backup.out"; fail=1; }
+HUSH_KEY="$K1" ./hushd -C "$T/backup" export main "$T/export-backup" >/dev/null 2>&1
+cmp -s <(tail -n +3 "$T/export/messages.txt") <(tail -n +3 "$T/export-backup/messages.txt") &&
+    cmp -s "$T/export/images/$id.jpg" "$T/export-backup/images/$id.jpg" &&
+    echo "ok   - ...and exporting from the backup gives the same messages and images" ||
+    { echo "FAIL - export from backup differs"; fail=1; }
+
 # Nothing readable is stored.
 cat "$S"/hushd.db* "$S"/blobs/* >"$T/stored"
 for text in "hello from alice" "just for you" "while you were out" "the view" "image/jpeg"; do

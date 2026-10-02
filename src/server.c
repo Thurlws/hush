@@ -1880,6 +1880,80 @@ static void txt_write(FILE *f, const uint8_t *s, size_t n)
         fputc(s[i] < 0x20 || s[i] == 0x7f ? ' ' : s[i], f);
 }
 
+/* Copy src to a new file dst. 0 when done, 1 if src doesn't exist, -1 with errno set. */
+static int copy_file(const char *src, const char *dst)
+{
+    int in = open(src, O_RDONLY | O_CLOEXEC);
+    if (in < 0)
+        return errno == ENOENT ? 1 : -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int err = out < 0 ? errno : 0;
+    char b[65536];
+    ssize_t r;
+    while (!err && (r = read(in, b, sizeof b)) != 0) {
+        ssize_t w = r > 0 ? write(out, b, (size_t)r) : -1;
+        if (w != r)
+            err = w < 0 ? errno : EIO;
+    }
+    if (out >= 0 && fsync(out) != 0 && !err)
+        err = errno;
+    if (out >= 0 && close(out) != 0 && !err)
+        err = errno;
+    close(in);
+    errno = err;
+    return err ? -1 : 0;
+}
+
+/* Everything hushd keeps, copied into a new dir. Safe while the server runs: the database
+ * is a VACUUM INTO snapshot, taken before the images, and images are only stored before
+ * the rows that point at them. */
+static void cmd_backup(const char *dir)
+{
+    if (!dir)
+        die("give a new directory to back up into: hushd backup DIR");
+    if (mkdir(dir, 0700) < 0)
+        die("cannot create %s: %s (give a new directory)", dir, strerror(errno));
+    char path[4200];
+    sqlite3_stmt *s;
+    snprintf(path, sizeof path, "%s/%s", dir, db_path);
+    if (sqlite3_prepare_v2(db, "VACUUM INTO ?1", -1, &s, NULL) != SQLITE_OK)
+        die("database: %s", sqlite3_errmsg(db));
+    sqlite3_bind_text(s, 1, path, -1, SQLITE_STATIC);
+    if (sqlite3_step(s) != SQLITE_DONE)
+        die("cannot snapshot %s: %s", db_path, sqlite3_errmsg(db));
+    sqlite3_finalize(s);
+
+    const char *files[] = { keys_path, users_path, admins_path };
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+        snprintf(path, sizeof path, "%s/%s", dir, files[i]);
+        if (copy_file(files[i], path) < 0)
+            die("cannot copy %s: %s", files[i], strerror(errno));
+    }
+
+    snprintf(path, sizeof path, "%s/%s", dir, blob_dir);
+    if (mkdir(path, 0700) < 0)
+        die("cannot create %s: %s", path, strerror(errno));
+    DIR *d = opendir(blob_dir);
+    if (!d)
+        die("cannot read %s: %s", blob_dir, strerror(errno));
+    long images = 0;
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.') /* includes uploads still in progress */
+            continue;
+        char src[4200];
+        snprintf(src, sizeof src, "%s/%s", blob_dir, e->d_name);
+        snprintf(path, sizeof path, "%s/%s/%s", dir, blob_dir, e->d_name);
+        int k = copy_file(src, path);
+        if (k < 0)
+            die("cannot copy %s: %s", src, strerror(errno));
+        images += k == 0; /* 1: deleted since the listing */
+    }
+    closedir(d);
+    printf("backed up the database, keys, users, admins and %ld images to %s\n"
+           "To restore, stop hushd and run it with -C pointing at a copy of that folder.\n",
+           images, dir);
+}
+
 /* Decrypt a chat's messages and images with its key, into dir. DMs can't
  * be read with the chat key, so they're listed without their contents. */
 static void cmd_export(const char *label, const char *dir)
@@ -2044,6 +2118,7 @@ static void usage(void)
             "       hushd [options] pending      who's waiting to join which chat\n"
             "       hushd [options] approve CHAT USER, deny CHAT USER\n"
             "       hushd [options] export CHAT DIR   decrypt a chat into DIR (asks for its key)\n"
+            "       hushd [options] backup DIR   copy everything hushd keeps into DIR, safe while it runs\n"
             "options:\n"
             "  -C dir        work in dir: keys, users, database and images live there\n"
             "  -p port       port for terminal clients (default " HUSH_DEFAULT_PORT ")\n"
@@ -2117,6 +2192,8 @@ int main(int argc, char **argv)
             cmd_clear(arg);
         else if (!strcmp(cmd, "forget"))
             cmd_forget(arg);
+        else if (!strcmp(cmd, "backup"))
+            cmd_backup(arg);
         else
             usage();
         return 0;

@@ -337,7 +337,8 @@ if command -v node >/dev/null; then
     (sleep 2.5; echo "/approve wendy"; sleep 4) | web wally >"$T/wally.out" 2>&1 &
     w1=$!
     sleep 1
-    (sleep 3; echo "hello from a browser"; sleep 0.5; echo "/img $T/photo.jpg from the web"; sleep 1;
+    (sleep 3; echo "hello from a browser"; printf '\033[2Jwipe \342\200\256reversed\n'; sleep 0.5;
+     echo "/img $T/photo.jpg from the web"; sleep 1;
      echo "/msg alice web dm"; sleep 0.5; echo "/mydata $T/wendy-my.json"; sleep 1) | web wendy >"$T/wendy.out" 2>&1 &
     w2=$!
     (sleep 4; echo "hello from a terminal"; sleep 3) | client alice a >"$T/alice3.out" 2>&1 &
@@ -347,6 +348,8 @@ if command -v node >/dev/null; then
     check  "$T/wendy.out"  "waiting for approval"          "a web newcomer waits"
     check  "$T/wendy.out"  "connected as wendy"            "...and is let in by the web admin"
     check  "$T/alice3.out" "wendy: hello from a browser"   "terminal receives a web client's message"
+    check  "$T/alice3.out" "?[2Jwipe ?reversed"            "escape codes and bidi overrides are defused"
+    absent "$T/alice3.out" $'\033'                         "...so nothing reaches the terminal raw"
     check  "$T/alice3.out" "[dm] wendy: web dm"            "terminal receives a web client's DM"
     check  "$T/alice3.out" "from the web"                  "terminal receives a web client's image"
     check  "$T/wendy.out"  "alice: hello from a terminal"  "web client receives a terminal message"

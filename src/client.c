@@ -186,7 +186,8 @@ static void term_raw(void)
 }
 
 /* Copy untrusted text for display, dropping C0/C1 control codes (escape
- * sequences) and invalid UTF-8. dst must hold n + 1 bytes. */
+ * sequences), bidi overrides and invalid UTF-8, like clean() in hush.js.
+ * dst must hold n + 1 bytes. */
 static void sanitize(const uint8_t *s, size_t n, char *dst)
 {
     size_t o = 0;
@@ -213,6 +214,13 @@ static void sanitize(const uint8_t *s, size_t n, char *dst)
         if (!ok) {
             dst[o++] = '?';
             i++;
+            continue;
+        }
+        /* U+202A-202E and U+2066-2069 can make text read backwards */
+        if (len == 3 && c == 0xE2 && ((s[i + 1] == 0x80 && s[i + 2] >= 0xAA && s[i + 2] <= 0xAE) ||
+                                      (s[i + 1] == 0x81 && s[i + 2] >= 0xA6 && s[i + 2] <= 0xA9))) {
+            dst[o++] = '?';
+            i += 3;
             continue;
         }
         memcpy(dst + o, s + i, len);

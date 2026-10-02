@@ -416,7 +416,9 @@ static void admins_load(void)
         return;
     char line[256];
     while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "#\r\n")] = '\0'; /* NOLINT(clang-analyzer-security.ArrayBound) */
+        size_t end = strcspn(line, "#\r\n");
+        if (end < sizeof line)
+            line[end] = '\0';
         uint8_t fp[16];
         if (fingerprint_parse(line, fp) != 0)
             continue;
@@ -1855,7 +1857,9 @@ static void read_chat_key(char *out, size_t n)
     fputc('\n', stderr);
     if (!ok)
         die("no chat key given");
-    out[strcspn(out, "\r\n")] = '\0';
+    size_t end = strcspn(out, "\r\n");
+    if (end < n)
+        out[end] = '\0';
 }
 
 static void iso_time(uint64_t ms, char *out, size_t n, int local)

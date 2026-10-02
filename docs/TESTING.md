@@ -88,7 +88,7 @@ and connection state. The random-frames test in `test.sh` stands in for that.
 
 `make analyze` runs clang-tidy with the bugprone, CERT and clang-analyzer checks, and
 gcc's `-fanalyzer`, and fails on any finding. `.clang-tidy` lists the checks that are
-off and why. Five lines carry a `NOLINT` for a false positive, each naming the check
+off and why. Three lines carry a `NOLINT` for a false positive, each naming the check
 and the reason.
 
 Everything builds without warnings under `-Wall -Wextra -Wpedantic -Wconversion

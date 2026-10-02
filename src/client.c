@@ -1563,7 +1563,9 @@ static void prompt_key(void)
     fputc('\n', stderr);
     if (!ok)
         die("no chat key given");
-    chat_key_text[strcspn(chat_key_text, "\r\n")] = '\0'; /* NOLINT(clang-analyzer-security.ArrayBound) */
+    size_t end = strcspn(chat_key_text, "\r\n");
+    if (end < sizeof chat_key_text)
+        chat_key_text[end] = '\0';
 }
 
 static void usage(void)

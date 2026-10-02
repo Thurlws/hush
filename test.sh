@@ -355,6 +355,8 @@ if command -v node >/dev/null; then
     check "$T/wendy-raw.out" "server: only an admin can create chats" "...and so is a NEWCHAT"
     (sleep 1; echo "/raw 3 00$(printf '%0200d' 0)"; sleep 1) | web wilma >"$T/wilma.out" 2>&1
     check "$T/wilma.out" "closed: protocol violation" "someone on the waitlist can't post"
+    (sleep 1; echo "/raw 3 00$(printf '%010000d' 0)"; sleep 1) | web wendy >"$T/wendy-big.out" 2>&1
+    check "$T/wendy-big.out" "closed: malformed message" "a message bigger than any client sends is refused"
     (sleep 1; echo "/lastblob"; sleep 0.5) | web wally >"$T/wally-blob.out" 2>&1
     BLOB=$(sed -n 's/^lastblob //p' "$T/wally-blob.out")
     (sleep 1; echo "/raw 6 $BLOB"; sleep 1) | web wally >"$T/fetch-own.out" 2>&1

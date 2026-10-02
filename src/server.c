@@ -949,8 +949,14 @@ static void on_post(struct client *c, const uint8_t *p, size_t n)
     char to[HUSH_NAME_MAX + 1];
     int k = name_get_opt(p, n, to);
     size_t bl = k < 0 ? 0 : n - (size_t)k;
-    if (k < 0 || bl < 24 + 16 + 64) {
+    /* nothing bigger than a real client sends, or junk could make history too big to load */
+    if (k < 0 || bl < MSG_NONCE + MSG_MAC + 64 || bl > MSG_NONCE + MSG_PLAIN_MAX + MSG_MAC) {
         send_error(c, "malformed message", 1);
+        return;
+    }
+    if (disk_low()) {
+        note("refusing a message: less than 1 GB free in %s", blob_dir);
+        send_error(c, "the server is low on disk space, message not sent", 0);
         return;
     }
     if (*to && (!strcmp(to, c->name) || !is_member(c->room, to))) {

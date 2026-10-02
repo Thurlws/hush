@@ -1,0 +1,4 @@
+GET /app.js?v=1 HTTP/1.1
+Host: chat.example.com
+X-Forwarded-For: 203.0.113.9
+

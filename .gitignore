@@ -3,6 +3,15 @@ hush
 hushd
 src/*.o
 tests/unit
+fuzz/http
+fuzz/ws
+fuzz/frame
+fuzz/msg
+fuzz/corpus/
+fuzz/crash-*
+fuzz/leak-*
+fuzz/timeout-*
+fuzz/oom-*
 
 # server state: chat key hashes, name->key registrations, admins, messages, images
 hushd-keys.txt

@@ -49,7 +49,7 @@
 
 #define HUSH_DEFAULT_PORT  "7777"
 #define HUSH_DEFAULT_WEB   "8080"
-#define HUSH_MAX_FRAME     (64 * 1024)
+#define HUSH_MAX_FRAME     ((size_t)64 * 1024)
 #define HUSH_NAME_MAX      24
 #define HUSH_CHALLENGE_LEN 32
 #define HUSH_AUTH_CONTEXT  "hush-auth-v3"
@@ -60,7 +60,7 @@
 #define HUSH_FP_LEN        40 /* 32 hex digits in groups of 4, plus NUL */
 #define HUSH_MAX_TEXT      4000
 #define HUSH_MAX_IMAGE     (25u << 20)
-#define HUSH_CHUNK         (48 * 1024) /* upload/download piece */
+#define HUSH_CHUNK         ((size_t)48 * 1024) /* upload/download piece */
 #define HUSH_BLOB_ID       16
 #define HUSH_HISTORY_MAX   200 /* messages per HISTORY request */
 /* Protocol version, the last byte of HELLO. A HELLO without it is version 0,

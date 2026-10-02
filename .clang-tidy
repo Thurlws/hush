@@ -1,0 +1,15 @@
+# Used by make analyze. Off: the Annex K _s functions glibc doesn't have, printf-style
+# return values nobody checks, strcpy of names already checked to fit, and three
+# checks that only flag the house style (!strcmp, assignments in if, parameter order).
+Checks: >-
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -cert-err33-c,
+  -clang-analyzer-security.insecureAPI.strcpy,
+  -bugprone-suspicious-string-compare,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-easily-swappable-parameters
+WarningsAsErrors: '*'

@@ -193,7 +193,7 @@ static void sanitize(const uint8_t *s, size_t n, char *dst)
     for (size_t i = 0; i < n;) {
         uint8_t c = s[i];
         if (c < 0x80) {
-            dst[o++] = c >= 0x20 && c != 0x7f ? (char)c : (c == '\t' || c == '\n') ? ' ' : '?';
+            dst[o++] = (char)(c >= 0x20 && c != 0x7f ? c : (c == '\t' || c == '\n') ? ' ' : '?');
             i++;
             continue;
         }
@@ -371,6 +371,7 @@ static void net_send_raw(uint8_t type, const void *p, size_t n)
     tx.len = 0;
     frame_put(&tx, type, p, n);
     for (size_t off = 0; off < tx.len;) {
+        /* NOLINTNEXTLINE(clang-analyzer-unix.StdCLibraryFunctions): sock is open by now */
         ssize_t r = send(sock, tx.data + off, tx.len - off, MSG_NOSIGNAL);
         if (r < 0 && errno == EINTR)
             continue;
@@ -398,6 +399,7 @@ static void read_frame(uint8_t *type, const uint8_t **p, size_t *n, size_t *fs)
         if (k < 0)
             die("server sent a malformed frame");
         buf_reserve(&rx, 16384);
+        /* NOLINTNEXTLINE(clang-analyzer-unix.StdCLibraryFunctions): sock is open by now */
         ssize_t r = recv(sock, rx.data + rx.len, rx.cap - rx.len, 0);
         if (r < 0 && errno == EINTR)
             continue;
@@ -1083,8 +1085,14 @@ static void cmd_img(char *arg)
         buf_reserve(&img, 1 << 20);
         r = fread(img.data + img.len, 1, img.cap - img.len, f);
         img.len += r;
-    } while (r > 0 && img.len <= HUSH_MAX_IMAGE);
+    } while (r > 0 && !feof(f) && !ferror(f) && img.len <= HUSH_MAX_IMAGE);
+    int bad = ferror(f);
     fclose(f);
+    if (bad) {
+        say("! cannot read %s", arg);
+        buf_free(&img);
+        return;
+    }
     if (img.len > HUSH_MAX_IMAGE) {
         say("! %s is too big (25 MB at most)", arg);
         buf_free(&img);
@@ -1272,6 +1280,7 @@ static void process_frames(void)
 static void on_net(void)
 {
     buf_reserve(&rx, 65536);
+    /* NOLINTNEXTLINE(clang-analyzer-unix.StdCLibraryFunctions): sock is open by now */
     ssize_t r = recv(sock, rx.data + rx.len, rx.cap - rx.len, 0);
     if (r < 0 && errno == EINTR)
         return;
@@ -1554,7 +1563,7 @@ static void prompt_key(void)
     fputc('\n', stderr);
     if (!ok)
         die("no chat key given");
-    chat_key_text[strcspn(chat_key_text, "\r\n")] = '\0';
+    chat_key_text[strcspn(chat_key_text, "\r\n")] = '\0'; /* NOLINT(clang-analyzer-security.ArrayBound) */
 }
 
 static void usage(void)

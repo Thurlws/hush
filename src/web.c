@@ -64,7 +64,7 @@ int web_load(const char *dir)
             buf_reserve(&b, 65536);
             r = fread(b.data + b.len, 1, b.cap - b.len, f);
             b.len += r;
-        } while (r > 0 && b.len < (8u << 20));
+        } while (r > 0 && !feof(f) && !ferror(f) && b.len < (8u << 20));
         int err = ferror(f);
         fclose(f);
         if (err || b.len >= (8u << 20)) {
@@ -246,7 +246,7 @@ static void sha1(const uint8_t *msg, size_t len, uint8_t out[20])
     uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
     for (size_t blk = 0; blk < blocks; blk++) {
         uint32_t w[80];
-        for (int i = 0; i < 16; i++) {
+        for (size_t i = 0; i < 16; i++) {
             const uint8_t *p = m + blk * 64 + i * 4;
             w[i] = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
         }

@@ -322,9 +322,7 @@ static int upgrade(const char *extra, struct buf *out)
     struct http_req r;
     snprintf(req, sizeof req, "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n%s\r\n", extra);
     out->len = 0;
-    if (parse(req, &r) <= 0)
-        return -1;
-    int k = ws_upgrade(out, &r);
+    int k = parse(req, &r) > 0 ? ws_upgrade(out, &r) : -1;
     buf_put(out, "", 1);
     return k;
 }

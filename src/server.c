@@ -416,7 +416,7 @@ static void admins_load(void)
         return;
     char line[256];
     while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "#\r\n")] = '\0';
+        line[strcspn(line, "#\r\n")] = '\0'; /* NOLINT(clang-analyzer-security.ArrayBound) */
         uint8_t fp[16];
         if (fingerprint_parse(line, fp) != 0)
             continue;
@@ -524,6 +524,8 @@ static void db_migrate(void)
 {
     int n = (int)(sizeof migrations / sizeof *migrations);
     int v = db_int("PRAGMA user_version");
+    if (v < 0)
+        die("cannot read the schema version of %s: %s", db_path, sqlite3_errmsg(db));
     /* Databases from before migrations have version 0, so tell them apart by their tables */
     if (v == 0 && db_int("SELECT count(*) FROM sqlite_master WHERE name = 'messages'") > 0)
         v = db_int("SELECT count(*) FROM pragma_table_info('members') WHERE name = 'state'") > 0 ? 2 : 1;
@@ -1464,7 +1466,7 @@ static void refuse(int fd, int web)
 static void accept_client(int lfd, int web)
 {
     for (int round = 0; round < 64; round++) {
-        struct sockaddr_storage ss;
+        struct sockaddr_storage ss = { 0 };
         socklen_t sl = sizeof ss;
         int fd = accept4(lfd, (struct sockaddr *)&ss, &sl, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0)
@@ -1968,23 +1970,27 @@ static void cmd_export(const char *label, const char *dir)
                     buf_reserve(&enc, 1 << 20);
                     got = fread(enc.data + enc.len, 1, enc.cap - enc.len, bf);
                     enc.len += got;
-                } while (got > 0 && enc.len <= HUSH_MAX_IMAGE + MSG_NONCE + MSG_MAC);
+                } while (got > 0 && !feof(bf) && !ferror(bf) && enc.len <= HUSH_MAX_IMAGE + MSG_NONCE + MSG_MAC);
                 fclose(bf);
             }
-            uint8_t *img = enc.len >= MSG_NONCE + MSG_MAC ? malloc(enc.len) : NULL;
+            int fits = enc.len >= MSG_NONCE + MSG_MAC && enc.len <= HUSH_MAX_IMAGE + MSG_NONCE + MSG_MAC;
+            uint8_t *img = fits ? malloc(enc.len) : NULL;
             unsigned long long il;
             snprintf(path, sizeof path, "%s/%s", dir, file);
-            FILE *out = NULL;
-            if (img && crypto_aead_xchacha20poly1305_ietf_decrypt(img, &il, NULL, enc.data + MSG_NONCE,
-                                                                  enc.len - MSG_NONCE, NULL, 0, enc.data,
-                                                                  im.file_key) == 0 &&
-                (out = fopen(path, "wb")) && fwrite(img, 1, (size_t)il, out) == il && fclose(out) == 0) {
+            int saved = img && crypto_aead_xchacha20poly1305_ietf_decrypt(img, &il, NULL, enc.data + MSG_NONCE,
+                                                                          enc.len - MSG_NONCE, NULL, 0, enc.data,
+                                                                          im.file_key) == 0;
+            FILE *out = saved ? fopen(path, "wb") : NULL;
+            if (out) {
+                saved = fwrite(img, 1, (size_t)il, out) == il;
+                if (fclose(out) != 0)
+                    saved = 0;
+            }
+            if (saved && out) {
                 fprintf(js, ", \"image\": \"%s\"", file);
                 fprintf(tx, "[image %s]", file);
                 images++;
             } else {
-                if (out)
-                    fclose(out);
                 fprintf(js, ", \"image\": null, \"error\": \"image missing or could not be decrypted\"");
                 fprintf(tx, "[image missing]");
             }

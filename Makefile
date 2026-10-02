@@ -23,6 +23,11 @@ src/%.o: src/%.c src/proto.h src/web.h src/msg.h
 tests/unit: tests/unit.c src/msg.o src/proto.o src/web.o src/proto.h src/web.h src/msg.h
 	$(CC) $(HUSH_CFLAGS) -Isrc $(CFLAGS) $(LDFLAGS) -o $@ $(filter-out %.h,$^) $(LDLIBS) $(HUSH_LIBS)
 
+# clang-tidy (checks in .clang-tidy) and gcc's -fanalyzer, any finding fails
+analyze:
+	clang-tidy --quiet src/*.c tests/unit.c -- $(HUSH_CFLAGS) -Isrc
+	for f in src/*.c; do gcc $(HUSH_CFLAGS) -O2 -fanalyzer -Werror -c -o /dev/null $$f || exit 1; done
+
 # Objects don't remember their flags, so these rebuild from scratch.
 debug:
 	$(MAKE) clean
@@ -44,4 +49,4 @@ install: all
 clean:
 	rm -f hush hushd src/*.o tests/unit
 
-.PHONY: all debug asan test install clean
+.PHONY: all debug asan test analyze install clean

@@ -10,3 +10,6 @@ hushd-users.txt
 hushd.db*
 blobs/
 hushd-admins.txt
+
+# local notes
+vault/

@@ -8,6 +8,7 @@
 #include "web.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -115,6 +116,7 @@ static struct stat users_st, keys_st, admins_st;
 static uint8_t (*admins)[16];
 static size_t nadmins;
 static int trust_proxy;
+static volatile sig_atomic_t stopping;
 
 #define LIMIT_SLOTS 4096
 #define LIMIT_PROBE 8
@@ -1349,9 +1351,13 @@ static void client_close(int i)
 {
     struct client *c = clients[i];
     clients[i] = NULL;
-    /* Close code 4000 tells the web client it was refused, 1000 is a normal close. */
+    /* close codes: 4000 refused, 1001 server stopping, 1000 normal */
     if (c->ws && !c->closing)
-        ws_put(&c->out, WS_CLOSE, c->refused ? "\x0f\xa0" : "\x03\xe8", 2, NULL, 0);
+        ws_put(&c->out, WS_CLOSE, c->refused ? "\x0f\xa0" : stopping ? "\x03\xe9" : "\x03\xe8", 2, NULL, 0);
+    else if (stopping && !c->ws && c->st != ST_HTTP) {
+        static const char bye[] = "the server is shutting down";
+        frame_put(&c->out, T_ERROR, bye, sizeof bye - 1);
+    }
     if (c->out.len) /* best effort, so a final error message gets through */
         send(c->fd, c->out.data, c->out.len, MSG_NOSIGNAL | MSG_DONTWAIT);
     close(c->fd);
@@ -1363,7 +1369,7 @@ static void client_close(int i)
         if (l->conns > 0)
             l->conns--;
     }
-    if (c->st == ST_READY) {
+    if (c->st == ST_READY && !stopping) {
         note("%s: %s left", c->addr, c->name);
         struct buf b = { 0 };
         name_put(&b, c->name);
@@ -1435,6 +1441,46 @@ static void accept_client(int lfd, int web)
         c->deadline = time(NULL) + (web ? HTTP_TIMEOUT : AUTH_TIMEOUT);
         clients[slot] = c;
     }
+}
+
+/* Partial uploads left behind by a crash */
+static void remove_partial_uploads(void)
+{
+    DIR *d = opendir(blob_dir);
+    if (!d)
+        return;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(d));) {
+        char path[4200];
+        snprintf(path, sizeof path, "%s/%s", blob_dir, e->d_name);
+        if (!strncmp(e->d_name, ".up-", 4) && unlink(path) == 0)
+            n++;
+    }
+    closedir(d);
+    if (n)
+        note("hushd: removed %d unfinished uploads", n);
+}
+
+static void on_stop(int sig)
+{
+    (void)sig;
+    stopping = 1;
+}
+
+/* Say goodbye to everyone and close the database so nothing is left half written. */
+static void shut_down(int lfd, int wfd)
+{
+    note("hushd: shutting down");
+    close(lfd);
+    if (wfd >= 0)
+        close(wfd);
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i])
+            client_close(i);
+    for (int i = 0; i < NQUERIES; i++)
+        sqlite3_finalize(queries[i]);
+    if (sqlite3_close(db) != SQLITE_OK)
+        note("hushd: closing %s: %s", db_path, sqlite3_errmsg(db));
 }
 
 /* Listen on all interfaces, dual-stack IPv6 when available. */
@@ -1996,7 +2042,11 @@ int main(int argc, char **argv)
     }
 
     signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa = { .sa_handler = on_stop }; /* no SA_RESTART, so poll() wakes up */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
     db_open();
+    remove_partial_uploads();
     users_load();
     keys_load();
     admins_load();
@@ -2030,7 +2080,7 @@ int main(int argc, char **argv)
 
     static struct pollfd pfds[MAX_CLIENTS + 2];
     static int slot_of[MAX_CLIENTS + 2];
-    for (;;) {
+    while (!stopping) {
         int n = 0;
         pfds[n++] = (struct pollfd){ .fd = lfd, .events = POLLIN };
         pfds[n++] = (struct pollfd){ .fd = wfd, .events = POLLIN }; /* fd -1 is ignored */
@@ -2101,4 +2151,6 @@ int main(int argc, char **argv)
                 client_close(i);
         }
     }
+    shut_down(lfd, wfd);
+    return 0;
 }

@@ -253,9 +253,21 @@ admin approve main bob >/dev/null
 wait $m
 check "$T/mallory1.out" "chat: main" "hushd forget frees a name, without a restart"
 
-# The server forgets its registrations (or lies): "bob" shows up with a new key.
+# SIGTERM: connected clients are told, and the database is closed cleanly.
+(sleep 4) | client alice a >"$T/alice-stop.out" 2>&1 &
+a=$!
+sleep 1
 kill $srv
-wait $srv 2>/dev/null
+wait $srv
+st=$?
+wait $a
+[ $st = 0 ] && echo "ok   - hushd exits cleanly on SIGTERM" || { echo "FAIL - hushd exit status $st on SIGTERM"; fail=1; }
+check "$T/server.log"     "shutting down"               "...and says so in its log"
+check "$T/alice-stop.out" "the server is shutting down" "...and tells connected clients"
+[ ! -e "$T/s1/hushd.db-wal" ] && echo "ok   - ...and closes the database (no WAL left)" ||
+    { echo "FAIL - WAL left after SIGTERM"; fail=1; }
+
+# The server forgets its registrations (or lies): "bob" shows up with a new key.
 S="$T/s2"
 mkdir -p "$S"
 cp "$T/s1/hushd-keys.txt" "$T/s1/hushd-admins.txt" "$S/"

@@ -4,7 +4,8 @@ End-to-end encrypted group chat for you and your friends, in C. Chat in the brow
 with history, private messages and images. New people wait on a waitlist until you let them in.
 
 - `hushd` is the server. It serves the web page and stores and passes on encrypted messages and
-  images, which it cannot read. Only the person running it can create the keys that let people into a chat.
+  images, which it cannot read. Only the person running it, and the admins they pick, can create the keys
+  that let people into a chat.
 - The web page (`web/`) and the terminal client (`hush`) hold your keys and do the encryption.
   Both talk the same protocol, so browser and terminal users can chat together.
 
@@ -21,8 +22,6 @@ make
 ./test.sh           # optional: end-to-end tests on localhost
 ```
 
-`hush` and `hushd` are build output, so they aren't in git. `make` creates them from `src/`.
-
 ## Quick start
 
 ```sh
@@ -30,7 +29,7 @@ make
 ./hushd                    # web page on port 8080, terminal clients on port 7777
 ```
 
-Open `http://SERVER-IP:8080`. The login page shows **your fingerprint**; make yourself admin with it,
+Open `http://SERVER-IP:8080`. The login page shows your fingerprint. Make yourself admin with it,
 then enter the key and a name:
 
 ```sh
@@ -107,9 +106,10 @@ Names and fingerprints stay the same. People who were already in a chat don't ha
 
 ## Managing chats
 
-Each key opens one chat, and looks like `k3x7-9fqa`. Admins create chats on the home page: **+ Add
-session**, then **Create your own** (or `/newchat NAME` in the terminal). The key is made on their
-device, and the server only ever gets a hash of a value derived from it. On the server:
+Each key opens one chat, and looks like `k3x7-9fqa`. Admins create chats on the home page:
+**+ Add session**, then **Create your own** (or `/newchat NAME` in the terminal). The key is made on
+their device. The server only gets a login token derived from it, and stores just a hash of that.
+On the server:
 
 ```sh
 hushd newkey NAME     # new chat; prints its key once (the server keeps only a hash)
@@ -146,13 +146,13 @@ hushd deny CHAT NAME
 
 ### Getting the data out
 
-- **Everyone:** the **My data** button downloads a zip of everything you sent in the chat and every DM
-  sent to you, with your images, decrypted in your browser. In the terminal, `/mydata` saves the same
-  to a folder in `~/Downloads`.
-- **The operator:** `hushd export CHAT DIR` asks for the chat's key and decrypts the whole chat into
-  `DIR`: `messages.txt` (readable), `messages.json` (with signature checks) and `images/`. DMs can't
-  be opened with the chat key, so they're listed without their contents. The folder is the chat in
-  plain form: copy it off the server and delete it there.
+- Anyone can use the **My data** button to download a zip of everything they sent in the chat and
+  every DM sent to them, with their images, decrypted in the browser. In the terminal, `/mydata`
+  saves the same to a folder in `~/Downloads`.
+- The operator can run `hushd export CHAT DIR`. It asks for the chat's key and decrypts the whole
+  chat into `DIR`: `messages.txt` (readable), `messages.json` (with signature checks) and `images/`.
+  DMs can't be opened with the chat key, so they're listed without their contents. The folder is the
+  chat in plain form: copy it off the server and delete it there.
 
 Messages and images are kept until you `clear` or `revoke` the chat. Uploads are refused
 while the disk has less than 1 GB free.
@@ -187,8 +187,9 @@ Back it up. If you lose it, your friends will get a "key changed" warning.
 | `/newchat NAME` | admins: create a chat and get its key (in the page: + Add session, Create your own) |
 
 In the browser, chats you've joined are saved on the login page: click one to rejoin, or
-**+ Add session** to join another with its key. Send an image with the **+** button or by pasting it; whatever is typed in the box
-goes along as its caption. Click an image to see it full size and save it. **Load older messages** at the top goes back in time.
+**+ Add session** to join another with its key. Send an image with the **+** button or by pasting
+it; whatever is typed in the box goes along as its caption. Click an image to see it full size and
+save it. **Load older messages** at the top goes back in time.
 
 In the terminal: `/img FILE [caption]` sends an image (jpeg, png, gif or webp, up to 25 MB),
 `/save N` saves image N to `~/Downloads`, `/more` shows older messages, and `/mydata` saves your data.
@@ -250,7 +251,7 @@ or pose as your friends without you getting a loud warning.
 
 ## Limitations (read these)
 
-This is a hobby project, not a professional security audit. Specifically:
+This is a hobby project and hasn't had a professional security audit.
 
 - **The web page comes from the server.** If someone takes over your server, they can change the page to
   leak messages from browser users. That's true of any web-based encrypted chat. The terminal client
@@ -272,7 +273,7 @@ This is a hobby project, not a professional security audit. Specifically:
   and how big each image is. The terminal client's connection isn't wrapped in TLS, so anyone on the
   network path sees that metadata too.
 - Identity keys, and in the browser the keys of saved chats, are stored unencrypted (file permission 0600,
-  or the browser's storage). Anyone with
-  access to your account or browser profile can take them. A new browser or device is a new identity.
+  or the browser's storage). Anyone with access to your account or browser profile can take them.
+  A new browser or device is a new identity.
 - A malicious server can drop, hide or reorder messages. It can't read or forge them without you
   noticing a key change.

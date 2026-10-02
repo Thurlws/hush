@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Arch, so CI uses the same gcc and clang hush is developed with
+env:
+  DEPS: base-devel clang compiler-rt libsodium sqlite nodejs python curl git
+
+jobs:
+  test:
+    name: test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - run: pacman -Syu --noconfirm --needed $DEPS
+      - uses: actions/checkout@v4
+      - run: make CC=${{ matrix.cc }} CFLAGS="-O2 -g -Werror" test
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm --needed $DEPS
+      - uses: actions/checkout@v4
+      - run: make asan test
+
+  analyze:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm --needed $DEPS
+      - uses: actions/checkout@v4
+      - run: make analyze
+
+  fuzz:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm --needed $DEPS
+      - uses: actions/checkout@v4
+      - run: make fuzz FUZZ_TIME=30

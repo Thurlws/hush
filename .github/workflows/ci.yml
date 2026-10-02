@@ -19,7 +19,7 @@ jobs:
         cc: [gcc, clang]
     steps:
       - run: pacman -Syu --noconfirm --needed $DEPS
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: make CC=${{ matrix.cc }} CFLAGS="-O2 -g -Werror" test
 
   sanitizers:
@@ -27,7 +27,7 @@ jobs:
     container: archlinux:latest
     steps:
       - run: pacman -Syu --noconfirm --needed $DEPS
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: make asan test
 
   analyze:
@@ -35,7 +35,7 @@ jobs:
     container: archlinux:latest
     steps:
       - run: pacman -Syu --noconfirm --needed $DEPS
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: make analyze
 
   fuzz:
@@ -43,5 +43,5 @@ jobs:
     container: archlinux:latest
     steps:
       - run: pacman -Syu --noconfirm --needed $DEPS
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: make fuzz FUZZ_TIME=30

@@ -1,6 +1,7 @@
 # Used by make analyze. Off: the Annex K _s functions glibc doesn't have, printf-style
-# return values nobody checks, strcpy of names already checked to fit, and three
-# checks that only flag the house style (!strcmp, assignments in if, parameter order).
+# return values nobody checks, strcpy of names already checked to fit, and checks that
+# only flag the house style (!strcmp, assignments in if, parameter order, and byte
+# masks like 0x80 | op being signed ints).
 Checks: >-
   -*,
   bugprone-*,
@@ -11,5 +12,6 @@ Checks: >-
   -clang-analyzer-security.insecureAPI.strcpy,
   -bugprone-suspicious-string-compare,
   -bugprone-assignment-in-if-condition,
-  -bugprone-easily-swappable-parameters
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise
 WarningsAsErrors: '*'

@@ -49,7 +49,7 @@
 #define REQ_BURST 60.0
 #define REQ_RATE  5.0
 
-enum cstate { ST_HTTP, ST_HELLO, ST_AUTH, ST_WAITING, ST_READY, ST_ADMIN };
+enum cstate { ST_HTTP, ST_HELLO, ST_AUTH, ST_WAITING, ST_READY, ST_ADMIN, ST_GONE };
 /* A name's standing in a chat (members.state). */
 enum { MEMBER_NONE = -1, MEMBER_WAITING = 0, MEMBER_IN = 1, MEMBER_DENIED = 2 };
 
@@ -61,6 +61,7 @@ struct client {
     int counted;  /* holds one of its address's connection slots */
     int dead, closing;
     int refused;     /* dropped with an error, web clients shouldn't reconnect */
+    int lingering;   /* refused, draining input before the close. 2 once our side is shut */
     int admin;       /* its identity key is on the admin list */
     int no_chat;     /* logged in with a zero token, to create chats */
     time_t deadline; /* drop the connection after this, 0 for never */
@@ -1380,6 +1381,40 @@ static void client_write(struct client *c)
         buf_consume(&c->out, (size_t)r);
 }
 
+static void announce_leave(struct client *c)
+{
+    note("%s: %s left", c->addr, c->name);
+    struct buf b = { 0 };
+    name_put(&b, c->name);
+    for (int j = 0; j < MAX_CLIENTS; j++)
+        if (clients[j] && clients[j] != c && clients[j]->st == ST_READY && same_room(clients[j], c))
+            send_to(clients[j], T_LEAVE, b.data, b.len);
+    buf_free(&b);
+}
+
+/* A refused client may still be sending. Closing with unread input makes the kernel
+ * send a reset, and the browser then loses the error we just sent. So send the goodbye,
+ * shut our side once it's out, and drain until they hang up or 2 seconds pass. */
+static void linger(struct client *c)
+{
+    if (c->ws)
+        ws_put(&c->out, WS_CLOSE, "\x0f\xa0", 2, NULL, 0);
+    if (c->st == ST_READY)
+        announce_leave(c);
+    c->st = ST_GONE;
+    c->closing = c->lingering = 1;
+    c->dead = 0;
+    c->deadline = time(NULL) + 2;
+}
+
+static void drain(struct client *c)
+{
+    uint8_t junk[4096];
+    ssize_t r = recv(c->fd, junk, sizeof junk, 0);
+    if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR))
+        c->dead = 1;
+}
+
 static void client_close(int i)
 {
     struct client *c = clients[i];
@@ -1402,15 +1437,8 @@ static void client_close(int i)
         if (l->conns > 0)
             l->conns--;
     }
-    if (c->st == ST_READY && !stopping) {
-        note("%s: %s left", c->addr, c->name);
-        struct buf b = { 0 };
-        name_put(&b, c->name);
-        for (int j = 0; j < MAX_CLIENTS; j++)
-            if (clients[j] && clients[j]->st == ST_READY && same_room(clients[j], c))
-                send_to(clients[j], T_LEAVE, b.data, b.len);
-        buf_free(&b);
-    }
+    if (c->st == ST_READY && !stopping)
+        announce_leave(c);
     buf_free(&c->in);
     buf_free(&c->out);
     free(c);
@@ -2122,7 +2150,7 @@ int main(int argc, char **argv)
             if (!c)
                 continue;
             short ev = c->out.len ? POLLOUT : 0;
-            if (!c->closing)
+            if (!c->closing || c->lingering)
                 ev |= POLLIN;
             pfds[n] = (struct pollfd){ .fd = c->fd, .events = ev };
             slot_of[n++] = i;
@@ -2142,6 +2170,8 @@ int main(int argc, char **argv)
                 continue;
             if (!c->closing && (pfds[k].revents & (POLLIN | POLLHUP | POLLERR)))
                 client_read(c);
+            else if (c->lingering && (pfds[k].revents & POLLIN))
+                drain(c);
             else if (pfds[k].revents & (POLLHUP | POLLERR))
                 c->dead = 1;
             if (!c->dead && (pfds[k].revents & POLLOUT))
@@ -2178,8 +2208,14 @@ int main(int argc, char **argv)
             struct client *c = clients[i];
             if (!c)
                 continue;
-            if ((c->deadline && now > c->deadline) || (c->closing && !c->out.len))
+            if (c->lingering == 1 && !c->out.len) {
+                shutdown(c->fd, SHUT_WR);
+                c->lingering = 2;
+            }
+            if ((c->deadline && now > c->deadline) || (c->closing && !c->lingering && !c->out.len))
                 c->dead = 1;
+            if (c->dead && c->refused && !c->lingering && !stopping)
+                linger(c);
             if (c->dead)
                 client_close(i);
         }

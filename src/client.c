@@ -429,6 +429,8 @@ static void handshake(void)
     name_put(&b, my_name);
     buf_put(&b, my_pk, sizeof my_pk);
     buf_put(&b, token, sizeof token);
+    uint8_t version = HUSH_PROTO;
+    buf_put(&b, &version, 1);
     net_send(T_HELLO, &b);
 
     expect(T_CHALLENGE, &p, &n, &fs);

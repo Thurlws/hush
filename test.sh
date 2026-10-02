@@ -81,6 +81,32 @@ absent "$S/hushd-keys.txt" "$K1" "the keys file holds no plaintext keys"
 
 server "$S"
 
+# Protocol versions: a HELLO without the version byte (old clients) still gets in, a newer
+# version is refused with a reason. The zero token is the admin login, so no wrong-key strikes.
+python3 - "$PORT" >"$T/proto.out" <<'EOF'
+import socket, struct, sys
+def hello(tag, extra):
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+    p = bytes([5]) + b"probe" + bytes(32) + bytes(32) + extra
+    s.sendall(struct.pack(">IB", len(p) + 1, 1) + p)
+    hdr = b""
+    while len(hdr) < 5:
+        hdr += s.recv(5 - len(hdr))
+    n, t = struct.unpack(">IB", hdr)
+    body = b""
+    while len(body) < n - 1:
+        body += s.recv(n - 1 - len(body))
+    print(tag, "CHALLENGE" if t == 10 else f"type {t}", body.decode(errors="replace") if t == 15 else "")
+    s.close()
+hello("v0", b"")
+hello("v1", b"\x01")
+hello("v9", b"\x09")
+EOF
+check "$T/proto.out" "v0 CHALLENGE" "a HELLO without a version (old clients) still works"
+check "$T/proto.out" "v1 CHALLENGE" "the current protocol version works"
+check "$T/proto.out" "v9 type 15 unsupported protocol version 9 (this server speaks 0 to 1), the server needs updating" \
+    "a newer protocol version is refused with a reason"
+
 # The first person in, before there's an admin: they wait, until the operator
 # makes their key an admin from the command line.
 (sleep 3) | client alice a >"$T/alice0.out" 2>&1 &

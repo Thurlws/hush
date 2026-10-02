@@ -9,7 +9,7 @@ const T = {
 };
 const HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2, WELCOME_ADMIN = 1;
 const PEER_ONLINE = 1, PEER_NEW = 2, UP_FIRST = 1, UP_LAST = 2, BLOB_LAST = 1, BLOB_MISSING = 2;
-const KIND_TEXT = 0, KIND_IMAGE = 1, VERSION = 3;
+const KIND_TEXT = 0, KIND_IMAGE = 1, VERSION = 3, PROTOCOL = 1; // PROTOCOL matches HUSH_PROTO
 const AUTH_CONTEXT = "hush-auth-v3", MSG_CONTEXT = "hush-msg-v3";
 const NONCE = 24, MAC = 16, SIG = 64, HEAD = 26, CHUNK = 48 * 1024;
 export const MAX_TEXT = 4000;
@@ -117,7 +117,7 @@ export function createChat({ sodium, url, name, secretKey, WebSocket: WS = globa
     };
     const send = (type, ...parts) => ws.send(concat(Uint8Array.of(type), ...parts));
     ws.binaryType = "arraybuffer";
-    ws.onopen = () => send(T.HELLO, nameBytes(name), publicKey(secretKey), new Uint8Array(32));
+    ws.onopen = () => send(T.HELLO, nameBytes(name), publicKey(secretKey), new Uint8Array(32), Uint8Array.of(PROTOCOL));
     ws.onmessage = e => {
       const f = new Uint8Array(e.data), type = f[0], p = f.subarray(1);
       if (type === T.ERROR) finish(clean(dec.decode(p)));
@@ -173,7 +173,7 @@ export class Session {
     this.fetchQueue = [];
     this.ws = new WS(url);
     this.ws.binaryType = "arraybuffer";
-    this.ws.onopen = () => this.send(T.HELLO, nameBytes(this.name), this.pk, this.token);
+    this.ws.onopen = () => this.send(T.HELLO, nameBytes(this.name), this.pk, this.token, Uint8Array.of(PROTOCOL));
     this.ws.onmessage = e => this.onFrame(new Uint8Array(e.data));
     // Close code 4000 means the server refused us, anything else is a dropped connection.
     this.ws.onclose = e => {

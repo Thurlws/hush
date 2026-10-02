@@ -12,7 +12,7 @@
  * slow. Older 24-character keys (120 bits) are used as they are.
  *
  * Handshake (client -> server -> client):
- *   HELLO     name, ed25519 public key, login token
+ *   HELLO     name, ed25519 public key, login token, protocol version
  *   CHALLENGE 32 random bytes
  *   AUTH      ed25519 signature over HUSH_AUTH_CONTEXT || challenge
  *   WELCOME   chat label, then one PEER for every member of the chat
@@ -63,10 +63,15 @@
 #define HUSH_CHUNK         (48 * 1024) /* upload/download piece */
 #define HUSH_BLOB_ID       16
 #define HUSH_HISTORY_MAX   200 /* messages per HISTORY request */
+/* Protocol version, the last byte of HELLO. A HELLO without it is version 0,
+ * from before versions. hushd refuses anything outside MIN..HUSH_PROTO, so
+ * the first incompatible change bumps both. */
+#define HUSH_PROTO         1
+#define HUSH_PROTO_MIN     0
 
 enum {
     /* client -> server */
-    T_HELLO = 1,   /* name, pk[32], token[32] */
+    T_HELLO = 1,   /* name, pk[32], token[32], u8 version */
     T_AUTH = 2,    /* sig[64] */
     T_POST = 3,    /* to (name, empty for the chat), body */
     T_HISTORY = 4, /* u8 dir, u64 anchor id, u16 limit. dir 0: older than anchor (anchor 0 = newest),

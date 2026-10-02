@@ -639,8 +639,18 @@ static int take_request(struct client *c)
 static void on_hello(struct client *c, const uint8_t *p, size_t n)
 {
     int k = name_get(p, n, c->name);
-    if (k < 0 || n - (size_t)k != crypto_sign_PUBLICKEYBYTES + 32) {
+    size_t rest = k < 0 ? 0 : n - (size_t)k;
+    if (k < 0 || rest < crypto_sign_PUBLICKEYBYTES + 32 || rest > crypto_sign_PUBLICKEYBYTES + 33) {
         send_error(c, "bad hello (names are 1-24 of A-Z a-z 0-9 _ . -)", 1);
+        return;
+    }
+    int version = rest == crypto_sign_PUBLICKEYBYTES + 33 ? p[n - 1] : 0;
+    if (version < HUSH_PROTO_MIN || version > HUSH_PROTO) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "unsupported protocol version %d (this server speaks %d to %d), %s", version,
+                 HUSH_PROTO_MIN, HUSH_PROTO, version > HUSH_PROTO ? "the server needs updating" : "update your client");
+        note("%s: refused protocol version %d", c->addr, version);
+        send_error(c, msg, 1);
         return;
     }
     /* Check the key before saying anything about names, so strangers learn nothing. */

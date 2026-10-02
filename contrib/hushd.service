@@ -1,4 +1,4 @@
-# systemd unit for hushd behind a reverse proxy (see README).
+# systemd unit for hushd behind a reverse proxy (see docs/DEPLOYMENT.md).
 # Install: sudo cp contrib/hushd.service /etc/systemd/system/ && sudo systemctl enable --now hushd
 [Unit]
 Description=hush chat server

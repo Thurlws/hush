@@ -3,11 +3,41 @@
 End-to-end encrypted group chat for you and your friends, in C. Chat in the browser or in the terminal,
 with history, private messages and images. New people wait on a waitlist until you let them in.
 
+![alice types in the browser while bob and carol answer from their terminals](docs/img/demo.gif)
+
 - `hushd` is the server. It serves the web page and stores and passes on encrypted messages and
   images, which it cannot read. Only the person running it, and the admins they pick, can create the keys
   that let people into a chat.
 - The web page (`web/`) and the terminal client (`hush`) hold your keys and do the encryption.
   Both talk the same protocol, so browser and terminal users can chat together.
+
+```mermaid
+flowchart LR
+    subgraph device["Your device: holds the keys"]
+        B["Browser<br/>web/app.js, hush.js, libsodium.js"]
+        T["Terminal client<br/>hush"]
+    end
+    subgraph server["Server: sees ciphertext and metadata only"]
+        C["Caddy<br/>TLS, optional"]
+        D["hushd<br/>one thread, poll()"]
+        DB[("hushd.db<br/>SQLite")]
+        BL[("blobs/<br/>encrypted images")]
+        F[("key hashes, name pins,<br/>admin list")]
+    end
+    B -->|"HTTPS + WebSocket"| C -->|"HTTP :8080"| D
+    T -->|"TCP :7777, length-prefixed frames"| D
+    D --> DB
+    D --> BL
+    D --> F
+```
+
+| Choice | Reason |
+|---|---|
+| C, no framework | hushd is one binary that needs only libsodium and SQLite. The HTTP and WebSocket code is about 400 lines (`src/web.c`), small enough to read and fuzz in full. |
+| libsodium | Every primitive hush uses (XChaCha20-Poly1305, `crypto_box`, Ed25519, Argon2id, BLAKE2b) comes from one library. The browser runs the same library compiled to WebAssembly. |
+| SQLite | History, chat membership and the image index live in one file next to the server. No database server to run. |
+| WebSockets | Browsers can't open a raw TCP socket, so the page sends the same frames over a WebSocket, one frame per message. Terminal clients use plain TCP with a length prefix. |
+| One thread, `poll()` | No locks to get wrong. One process serves up to 512 connections. |
 
 ## Build
 
@@ -19,8 +49,24 @@ sudo dnf install gcc make pkgconf libsodium-devel sqlite-devel                  
 sudo pacman -S base-devel libsodium sqlite                                       # Arch
 
 make
-./test.sh           # optional: end-to-end tests on localhost
 ```
+
+Tested on Arch Linux with gcc 16, and clang 22 builds it without warnings too. Linux only:
+hushd uses `accept4` and `/proc/self/exe`.
+
+## Testing
+
+```sh
+make test          # build, then run test.sh
+make asan test     # the same under AddressSanitizer and UBSan
+make debug         # -O0 -g3 build for gdb
+```
+
+`test.sh` runs everything on localhost against a real hushd: scripted terminal clients, the web
+client's protocol code under Node, and the HTTP side with curl. It covers wrong and old keys, the
+waitlist, history and offline DMs, images and metadata stripping, data exports, name takeover,
+changed keys, `clear` and `revoke`, rate limits and the reverse-proxy mode. It needs `python3` and
+`curl`, plus `node` for the web tests, and takes about 75 seconds.
 
 ## Quick start
 
@@ -36,73 +82,14 @@ then enter the key and a name:
 ./hushd admin "6937 b1d5 6e73 e529 69b1 ba58 820e f284"     # your fingerprint from the login page
 ```
 
+<img src="docs/img/login.png" width="480" alt="The login page, with this browser's fingerprint at the bottom">
+
 Give the key to your friends. When they join, they wait until you approve them in the chat.
 
-## Running it on a VPS
+## Deploying
 
-This is the setup for a small cloud server, e.g. an Oracle Cloud free VM. You get
-`https://chat.example.com` with a real certificate, and hushd runs as a locked-down service.
-
-1. **A domain name.** HTTPS needs one. Any domain works, or a free subdomain from e.g.
-   [DuckDNS](https://www.duckdns.org). Point it at the VM's public IP.
-
-2. **Open ports 80 and 443** (and 7777 if anyone uses the terminal client). On Oracle Cloud there are two firewalls:
-   - In the web console: *Networking → Virtual cloud networks → your VCN → Security Lists → Add Ingress Rules*,
-     source `0.0.0.0/0`, TCP, destination ports `80,443,7777`.
-   - On the VM itself. The rules have to come before the image's catch-all REJECT rule, so insert them at the top:
-     ```sh
-     # Ubuntu images (iptables)
-     for p in 80 443 7777; do sudo iptables -I INPUT 1 -p tcp --dport $p -m state --state NEW -j ACCEPT; done
-     sudo netfilter-persistent save
-     # Oracle Linux images (firewalld)
-     for p in 80 443 7777; do sudo firewall-cmd --permanent --add-port=$p/tcp; done; sudo firewall-cmd --reload
-     ```
-   Keep 8080 closed: only the reverse proxy on the VM itself should talk to it.
-
-3. **Install hushd** as a service with its own user:
-   ```sh
-   git clone https://github.com/Thurlws/hush && cd hush
-   make && sudo make install PREFIX=/usr/local
-   sudo useradd --system --home-dir /var/lib/hush --create-home --shell /usr/sbin/nologin hush
-   sudo chmod 700 /var/lib/hush
-   sudo cp contrib/hushd.service /etc/systemd/system/
-   sudo systemctl enable --now hushd
-   ```
-
-4. **HTTPS with [Caddy](https://caddyserver.com/docs/install)**, which gets and renews the certificate itself.
-   Put this in `/etc/caddy/Caddyfile`, with your own domain, and run `sudo systemctl reload caddy`:
-   ```
-   chat.example.com {
-       reverse_proxy 127.0.0.1:8080
-   }
-   ```
-   The service runs `hushd -x`, which makes it trust the `X-Forwarded-For` header from Caddy,
-   so the rate limits apply to each visitor's real address.
-
-5. **Create a chat key and make yourself admin.** Open your site; the login page shows your fingerprint.
-   ```sh
-   sudo -u hush hushd -C /var/lib/hush newkey friends
-   sudo -u hush hushd -C /var/lib/hush admin "YOUR FINGERPRINT"
-   ```
-   Join with the key, then give it to your friends. Each of them waits until you approve them.
-
-Logs: `journalctl -u hushd -f`. Everything the server keeps is in `/var/lib/hush`; back that up.
-
-To update: `git pull && make && sudo make install PREFIX=/usr/local && sudo systemctl restart hushd`.
-
-### Upgrading from the version without history
-
-Chat keys work differently now, so old keys stop working. After updating (install `libsqlite3-dev`
-first), make each chat a new key and send it to your friends again:
-
-```sh
-sudo -u hush hushd -C /var/lib/hush keys             # old keys are marked as old
-sudo -u hush hushd -C /var/lib/hush revoke friends
-sudo -u hush hushd -C /var/lib/hush newkey friends
-sudo -u hush hushd -C /var/lib/hush admin "YOUR FINGERPRINT"
-```
-
-Names and fingerprints stay the same. People who were already in a chat don't have to be approved again.
+For a VPS with HTTPS, a firewall and a locked-down systemd service, see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). It also covers upgrading from the version without history.
 
 ## Managing chats
 
@@ -119,8 +106,8 @@ hushd revoke NAME     # delete a chat: its key, messages and images; everyone in
 hushd forget USER     # free up a name, e.g. when a friend lost their browser data
 ```
 
-A running server picks up these changes by itself. Add `-C DIR` to work on the files in DIR;
-for the VPS setup above that's `sudo -u hush hushd -C /var/lib/hush ...`.
+A running server picks up these changes by itself. Add `-C DIR` to work on the files in DIR.
+For the VPS setup in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) that's `sudo -u hush hushd -C /var/lib/hush ...`.
 
 ### Admins and the waitlist
 
@@ -143,6 +130,8 @@ hushd pending                 # who's waiting for which chat
 hushd approve CHAT NAME       # they get in within a second if they're waiting right now
 hushd deny CHAT NAME
 ```
+
+![The waitlist panel with two people waiting, each with a fingerprint and Approve and Deny buttons](docs/img/waitlist.png)
 
 ### Getting the data out
 
@@ -172,6 +161,24 @@ Prefer the prompt or `$HUSH_KEY` over `-k`, since other users on your machine ca
 Your identity key is created on first run in `~/.local/share/hush/identity.key`.
 Back it up. If you lose it, your friends will get a "key changed" warning.
 
+```text
+$ ./hush -n carol 127.0.0.1
+chat key:
+You're on the waitlist for "friends": an admin has to let you in.
+They'll see your fingerprint, b870 9e8f a96a 2124 0907 b1a2 e524 2016, so they can check it's you.
+Waiting... (Ctrl-C to give up)
+connected to 127.0.0.1:7777 as carol, chat: friends
+your fingerprint: b870 9e8f a96a 2124 0907 b1a2 e524 2016
+type /help for commands
+* alice is online. First time seeing them: fingerprint f536 7762 6293 3956 c816 6f99 ee7b 035e
+  Compare it with them on another channel (e.g. a call), then run /verify alice
+22:14 carol: anyone up for climbing on saturday?
+22:14 bob: yes, 10am at the usual place?
+22:14 alice: 10 works. I'll bring snacks
+22:14 [dm to alice] carol: can you bring the spare harness too?
+22:14 bob: [image 1600x1000, 1.2 MB, /save 5] view from the top last week
+```
+
 ## Commands
 
 | | |
@@ -191,6 +198,8 @@ In the browser, chats you've joined are saved on the login page: click one to re
 it; whatever is typed in the box goes along as its caption. Click an image to see it full size and
 save it. **Load older messages** at the top goes back in time.
 
+![A chat in the browser with a private message and a decrypted image](docs/img/chat.png)
+
 In the terminal: `/img FILE [caption]` sends an image (jpeg, png, gif or webp, up to 25 MB),
 `/save N` saves image N to `~/Downloads`, `/more` shows older messages, and `/mydata` saves your data.
 
@@ -198,6 +207,8 @@ Verify your friends once. On a call (or in person), each of you reads out
 the fingerprint from `/fp`, checks it against what `/fp THEIRNAME` shows, and then runs
 `/verify THEIRNAME`. After that, the server can't swap in its own key to read your DMs
 or pose as your friends without you getting a loud warning.
+
+![The warning a browser shows when bob's key changes, with the pinned and the new fingerprint](docs/img/key-changed.png)
 
 ## How it works
 
@@ -277,3 +288,7 @@ This is a hobby project and hasn't had a professional security audit.
   A new browser or device is a new identity.
 - A malicious server can drop, hide or reorder messages. It can't read or forge them without you
   noticing a key change.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

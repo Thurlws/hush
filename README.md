@@ -39,6 +39,10 @@ flowchart LR
 | WebSockets | Browsers can't open a raw TCP socket, so the page sends the same frames over a WebSocket, one frame per message. Terminal clients use plain TCP with a length prefix. |
 | One thread, `poll()` | No locks to get wrong. One process serves up to 512 connections. |
 
+More detail in `docs/`: the [protocol](docs/PROTOCOL.md), the [cryptography](docs/CRYPTOGRAPHY.md),
+the [threat model](docs/THREAT_MODEL.md), [how it's tested](docs/TESTING.md) and
+[deployment](docs/DEPLOYMENT.md).
+
 ## Build
 
 Needs a C compiler, [libsodium](https://libsodium.org) and SQLite:
@@ -59,6 +63,8 @@ hushd uses `accept4` and `/proc/self/exe`.
 ```sh
 make test          # build, run the unit tests, then test.sh
 make asan test     # the same under AddressSanitizer and UBSan
+make analyze       # clang-tidy and gcc -fanalyzer, any finding fails
+make fuzz          # each libFuzzer target for 60 seconds (FUZZ_TIME=600 for longer)
 make debug         # -O0 -g3 build for gdb
 ```
 
@@ -67,8 +73,10 @@ vectors from the browser code, so both clients stay in step), message encryption
 with every kind of tampering, and the HTTP and WebSocket parsers. `test.sh` runs everything on localhost against a real hushd: scripted terminal clients, the web
 client's protocol code under Node, and the HTTP side with curl. It covers wrong and old keys, the
 waitlist, history and offline DMs, images and metadata stripping, data exports, name takeover,
-changed keys, `clear` and `revoke`, rate limits and the reverse-proxy mode. It needs `python3` and
-`curl`, plus `node` for the web tests, and takes about 75 seconds.
+changed keys, `clear` and `revoke`, rate limits and the reverse-proxy mode. It also checks that
+the server enforces permissions itself, throws broken and random frames at it, and kills it in the
+middle of an upload. It needs `python3` and `curl`, plus `node` for the web tests, and takes about
+two minutes. [docs/TESTING.md](docs/TESTING.md) has the details.
 
 ## Quick start
 
@@ -259,8 +267,8 @@ or pose as your friends without you getting a loud warning.
 - WebSocket connections from other websites are refused by checking the `Origin` header.
 - `contrib/hushd.service` runs hushd as its own user, with no capabilities and a read-only view of
   the system apart from `/var/lib/hush`.
-- `./test.sh` covers the above. The HTTP and WebSocket parsers have been fuzzed with libFuzzer, and the
-  logged-in protocol with random messages, under ASan/UBSan.
+- `make test` covers the above, and `make asan test` runs all of it under AddressSanitizer and UBSan.
+  The HTTP, WebSocket, frame and message parsers have libFuzzer targets in `fuzz/`.
 
 ## Limitations (read these)
 

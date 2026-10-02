@@ -42,6 +42,16 @@ analyze:
 	clang-tidy --quiet src/*.c tests/unit.c fuzz/*.c -- $(HUSH_CFLAGS) -Isrc
 	for f in src/*.c; do gcc $(HUSH_CFLAGS) -O2 -fanalyzer -Werror -c -o /dev/null $$f || exit 1; done
 
+# Line coverage of the unit tests and test.sh together, per file. Cleans up after,
+# since instrumented objects can't be linked into a normal build.
+coverage:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="-O0 -g --coverage" LDFLAGS="--coverage" all tests/unit
+	./tests/unit
+	./test.sh >/dev/null
+	@gcov -n -o src src/*.c 2>/dev/null | awk -f tests/coverage.awk
+	@$(MAKE) clean >/dev/null
+
 # Objects don't remember their flags, so these rebuild from scratch.
 debug:
 	$(MAKE) clean
@@ -61,6 +71,6 @@ install: all
 	install -Dm644 $(WEB_FILES) -t $(PREFIX)/share/hush/web
 
 clean:
-	rm -f hush hushd src/*.o tests/unit $(FUZZERS)
+	rm -f hush hushd src/*.o src/*.gcda src/*.gcno tests/unit $(FUZZERS)
 
-.PHONY: all debug asan test fuzz analyze install clean
+.PHONY: all debug asan test fuzz analyze coverage install clean

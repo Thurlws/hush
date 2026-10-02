@@ -209,6 +209,31 @@ check  "$T/bob-save.out" "the view" "with its caption"
 absent "$T/home/Downloads/hush-$id.jpg" "GPS" "photo location data is stripped before sending"
 cmp -s <(tail -c 1004 "$T/photo.jpg") <(tail -c 1004 "$T/home/Downloads/hush-$id.jpg") &&
     echo "ok   - the picture itself is unchanged" || { echo "FAIL - image data changed"; fail=1; }
+# PNG text chunks and WebP EXIF go too.
+python3 - "$T/photo.png" "$T/photo.webp" <<'EOF'
+import struct, sys, zlib
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+rows = b"\0" + b"\xff\x00\x00" * 2 + b"\0" + b"\x00\xff\x00" * 2
+open(sys.argv[1], "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)) +
+                              chunk(b"tEXt", b"Location\0GPS-51.5007N") + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+def riff(t, d):
+    return t + struct.pack("<I", len(d)) + d + (b"\0" if len(d) % 2 else b"")
+body = b"WEBP" + riff(b"VP8X", bytes([0x08, 0, 0, 0, 1, 0, 0, 1, 0, 0])) + riff(b"VP8L", b"\x2f\x01\x00\x00\x00") + riff(b"EXIF", b"GPS-51.5007N")
+open(sys.argv[2], "wb").write(b"RIFF" + struct.pack("<I", len(body)) + body)
+EOF
+(sleep 0.5; echo "/img $T/photo.png"; sleep 1; echo "/img $T/photo.webp"; sleep 2) | client alice a >"$T/alice-img2.out" 2>&1
+ids=$(grep -ao '/save [0-9]*' "$T/alice-img2.out" | tail -2 | cut -d' ' -f2)
+(sleep 1; for i in $ids; do echo "/save $i"; sleep 0.5; done; sleep 1) | client bob b >/dev/null 2>&1
+png=$(ls "$T"/home/Downloads/hush-*.png | head -1) webp=$(ls "$T"/home/Downloads/hush-*.webp | head -1)
+absent "$png" "GPS" "PNG text chunks are stripped before sending"
+check  "$png" "IDAT" "...and the picture data stays"
+absent "$webp" "GPS" "WebP EXIF is stripped before sending"
+python3 -c "
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+print('webp riff ok' if struct.unpack('<I', d[4:8])[0] == len(d) - 8 and d[20] & 0x08 == 0 else 'webp riff broken')" "$webp" >"$T/webp.out"
+check "$T/webp.out" "webp riff ok" "...and the file stays valid without its EXIF flag"
 
 # My data: everything you sent, and DMs to you, but nobody else's messages.
 (sleep 1; echo "/mydata"; sleep 2) | client alice a >"$T/alice-my.out" 2>&1
@@ -305,6 +330,13 @@ check  "$T/alice2.out"   "key has CHANGED"                     "alice is warned 
 check  "$T/alice2.out"   "a message from bob isn't shown"      "alice doesn't show messages from the changed key"
 check  "$T/alice2.out"   "not sent to bob"                     "alice refuses to encrypt a DM to the changed key"
 absent "$T/mallory2.out" "can you read this"                   "impostor never sees alice's DM"
+(sleep 1; echo "/fp bob"; echo "/trust bob"; sleep 0.3; echo "/msg bob trusted now"; echo "/verify bob"; echo "/who";
+ echo "/help"; sleep 1) | client alice a >"$T/alice-trust.out" 2>&1
+check  "$T/alice-trust.out" "their NEW key"           "/fp shows the old and the new key"
+check  "$T/alice-trust.out" "accepted bob's new key"  "/trust accepts it"
+absent "$T/alice-trust.out" "not sent to bob"         "...and DMs to bob work again"
+check  "$T/alice-trust.out" "bob marked as verified"  "/verify marks it verified"
+check  "$T/alice-trust.out" "/msg NAME TEXT"          "/help lists the commands"
 
 # The web server.
 B="http://127.0.0.1:$WPORT"

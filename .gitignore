@@ -3,6 +3,8 @@ hush
 hushd
 src/*.o
 tests/unit
+src/*.gcda
+src/*.gcno
 fuzz/http
 fuzz/ws
 fuzz/frame

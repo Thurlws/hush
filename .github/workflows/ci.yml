@@ -38,6 +38,14 @@ jobs:
       - uses: actions/checkout@v5
       - run: make analyze
 
+  coverage:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm --needed $DEPS
+      - uses: actions/checkout@v5
+      - run: make coverage
+
   fuzz:
     runs-on: ubuntu-latest
     container: archlinux:latest

@@ -5,6 +5,7 @@ make test          # unit tests, then the end-to-end suite
 make asan test     # both under AddressSanitizer and UBSan
 make analyze       # clang-tidy and gcc -fanalyzer
 make fuzz          # libFuzzer, 60 seconds per target by default
+make coverage      # line coverage of both test suites together
 ```
 
 CI (`.github/workflows/ci.yml`) runs all four on every push, with gcc and clang
@@ -32,7 +33,7 @@ person's key. Each has to fail.
 
 `test.sh` builds nothing. It starts real hushd processes on localhost and drives
 terminal clients, the web client's protocol code under Node (`test-web.mjs`) and
-the HTTP side with curl. 145 checks, about two minutes. Without Node the web parts
+the HTTP side with curl. 156 checks, about two minutes. Without Node the web parts
 are skipped and say so.
 
 What it covers, roughly in order:
@@ -45,7 +46,9 @@ What it covers, roughly in order:
 - The waitlist: approving and denying from a client and from the command line,
   people waiting seeing nothing, denied people staying out.
 - Key changes: when the server hands out a new key for someone, clients hide their
-  messages and refuse to encrypt DMs to them.
+  messages and refuse to encrypt DMs to them, until `/trust`. Then `/verify`.
+- What gets shown: escape codes and bidi overrides sent from a browser arrive in a
+  terminal defused, and JPEG, PNG and WebP metadata is gone after sending.
 - The web server: headers, path traversal, methods, Origin checks.
 - Admin commands: `clear`, `revoke`, `forget`, old key formats, database migrations, and a
   backup of the running server, opened and exported again to compare with the original.
@@ -85,6 +88,30 @@ what the fuzzers learn goes in `fuzz/corpus/`, which isn't committed.
 The server's message handlers aren't fuzzed directly, because they need a database
 and connection state. The random-frames test in `test.sh` stands in for that.
 
+## Coverage
+
+`make coverage` builds with `--coverage`, runs both suites, and prints line coverage per
+file. Every process the suites start (hushd, terminal clients, the unit tests) adds to
+the same counts.
+
+| File | Lines | Covered |
+|---|---|---|
+| `src/proto.c` | 148 | 98.7% |
+| `src/msg.c` | 79 | 98.7% |
+| `src/web.c` | 255 | 94.5% |
+| `src/server.c` | 1565 | 84.0% |
+| `src/client.c` | 1121 | 77.5% |
+| total | 3168 | 83.6% |
+
+Most of what's left in `client.c` is the interactive terminal: raw mode, the line
+editor and the hidden key prompt, which a test feeding stdin through a pipe never
+reaches. In `server.c` it's mostly errors from the disk and the database, and the code
+that finds the installed web files. Looking at the first coverage report also found
+that `/trust`, `/verify` and PNG and WebP metadata stripping had no tests, and writing
+them turned up a real difference: the browser dropped Unicode bidi overrides from
+messages but the terminal showed them, so a message could display backwards in one
+client and not the other.
+
 ## Static analysis
 
 `make analyze` runs clang-tidy with the bugprone, CERT and clang-analyzer checks, and
@@ -107,6 +134,7 @@ Everything builds without warnings under `-Wall -Wextra -Wpedantic -Wconversion
 | Three read loops called `fread` again after EOF or an error, and `/img` sent a partial image when reading failed | clang-tidy | `1aad7ad` |
 | 16 implicit sign and float conversions, and a buffer in `handshake()` shadowing another | clang with `-Wconversion -Wshadow` | `153e01a` |
 | The sanitizer build linked the unit tests without sanitizer flags | the first `make asan test` | `2826df8` |
+| The terminal showed Unicode bidi overrides that the browser removes | writing tests for code that coverage showed untested | `ed58a8b` |
 
 ## What isn't covered
 

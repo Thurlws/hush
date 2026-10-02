@@ -368,6 +368,39 @@ echo "$(printf '%064d' 0) oldchat" >>"$S/hushd-keys.txt"
 admin keys >"$T/keys2.out"
 check "$T/keys2.out" "old key" "old-format keys are flagged"
 
+# Databases get upgraded in place, and one from a newer hushd is refused.
+python3 - "$T/old-db" <<'EOF'
+import os, sqlite3, sys
+os.makedirs(sys.argv[1], exist_ok=True)
+db = sqlite3.connect(sys.argv[1] + "/hushd.db")
+db.executescript("""
+CREATE TABLE messages (id INTEGER PRIMARY KEY, room BLOB NOT NULL, sender TEXT NOT NULL,
+  recipient TEXT, time INTEGER NOT NULL, body BLOB NOT NULL);
+CREATE INDEX messages_room ON messages (room, id);
+CREATE TABLE members (room BLOB NOT NULL, name TEXT NOT NULL, PRIMARY KEY (room, name));
+CREATE TABLE blobs (id BLOB PRIMARY KEY, room BLOB NOT NULL, size INTEGER NOT NULL, time INTEGER NOT NULL);
+CREATE INDEX blobs_room ON blobs (room);
+INSERT INTO members VALUES (x'00', 'olduser');
+""")
+db.commit()
+EOF
+schema() { # db file -> "version N state S" for olduser if present
+    python3 -c "
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+row = db.execute(\"SELECT state FROM members WHERE name = 'olduser'\").fetchone()
+print('version', db.execute('PRAGMA user_version').fetchone()[0], 'state', row[0] if row else '-')" "$1"
+}
+./hushd -C "$T/old-db" keys >/dev/null 2>"$T/migrate.out"
+schema "$T/old-db/hushd.db" >>"$T/migrate.out"
+schema "$S/hushd.db" >"$T/fresh-db.out"
+check "$T/migrate.out"  "upgrading hushd.db from schema 1 to 2" "an old database is upgraded in place"
+check "$T/migrate.out"  "version 2 state 1" "...and people who were in a chat stay in"
+check "$T/fresh-db.out" "version 2"         "a new database starts at the latest schema"
+python3 -c "import sqlite3, sys; sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version = 99')" "$T/old-db/hushd.db"
+./hushd -C "$T/old-db" keys >"$T/migrate2.out" 2>&1
+check "$T/migrate2.out" "written by a newer hushd" "a database from a newer hushd is refused"
+
 # Rate limits, on a fresh server so earlier tests don't count.
 kill $srv
 wait $srv 2>/dev/null

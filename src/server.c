@@ -495,29 +495,62 @@ static void db_exec(const char *sql)
         die("database %s: %s", db_path, err ? err : "error");
 }
 
+/* Schema changes in order. PRAGMA user_version counts how many have run. */
+static const char *const migrations[] = {
+    /* 1: history and images */
+    "CREATE TABLE messages (id INTEGER PRIMARY KEY, room BLOB NOT NULL, sender TEXT NOT NULL,"
+    "  recipient TEXT, time INTEGER NOT NULL, body BLOB NOT NULL);"
+    "CREATE INDEX messages_room ON messages (room, id);"
+    "CREATE TABLE members (room BLOB NOT NULL, name TEXT NOT NULL, PRIMARY KEY (room, name));"
+    "CREATE TABLE blobs (id BLOB PRIMARY KEY, room BLOB NOT NULL, size INTEGER NOT NULL,"
+    "  time INTEGER NOT NULL);"
+    "CREATE INDEX blobs_room ON blobs (room);",
+    /* 2: the waitlist. Members from before it stay in. */
+    "ALTER TABLE members ADD COLUMN state INTEGER NOT NULL DEFAULT 1;",
+};
+
+static int db_int(const char *sql)
+{
+    sqlite3_stmt *s;
+    int v = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW)
+        v = sqlite3_column_int(s, 0);
+    sqlite3_finalize(s);
+    return v;
+}
+
+static void db_migrate(void)
+{
+    int n = (int)(sizeof migrations / sizeof *migrations);
+    int v = db_int("PRAGMA user_version");
+    /* Databases from before migrations have version 0, so tell them apart by their tables */
+    if (v == 0 && db_int("SELECT count(*) FROM sqlite_master WHERE name = 'messages'") > 0)
+        v = db_int("SELECT count(*) FROM pragma_table_info('members') WHERE name = 'state'") > 0 ? 2 : 1;
+    if (v > n)
+        die("%s was written by a newer hushd (schema %d, this one knows up to %d)", db_path, v, n);
+    if (v > 0 && v < n)
+        note("hushd: upgrading %s from schema %d to %d", db_path, v, n);
+    char sql[64];
+    for (; v < n; v++) {
+        db_exec("BEGIN IMMEDIATE");
+        db_exec(migrations[v]);
+        snprintf(sql, sizeof sql, "PRAGMA user_version = %d", v + 1);
+        db_exec(sql);
+        db_exec("COMMIT");
+    }
+    if (db_int("PRAGMA user_version") != n) {
+        snprintf(sql, sizeof sql, "PRAGMA user_version = %d", n);
+        db_exec(sql);
+    }
+}
+
 static void db_open(void)
 {
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK)
         die("cannot open %s: %s", db_path, sqlite3_errmsg(db));
     sqlite3_busy_timeout(db, 5000);
-    db_exec("PRAGMA journal_mode = WAL;"
-            "PRAGMA foreign_keys = ON;"
-            "CREATE TABLE IF NOT EXISTS messages ("
-            "  id INTEGER PRIMARY KEY, room BLOB NOT NULL, sender TEXT NOT NULL,"
-            "  recipient TEXT, time INTEGER NOT NULL, body BLOB NOT NULL);"
-            "CREATE INDEX IF NOT EXISTS messages_room ON messages (room, id);"
-            "CREATE TABLE IF NOT EXISTS members ("
-            "  room BLOB NOT NULL, name TEXT NOT NULL, state INTEGER NOT NULL DEFAULT 1,"
-            "  PRIMARY KEY (room, name));"
-            "CREATE TABLE IF NOT EXISTS blobs ("
-            "  id BLOB PRIMARY KEY, room BLOB NOT NULL, size INTEGER NOT NULL, time INTEGER NOT NULL);"
-            "CREATE INDEX IF NOT EXISTS blobs_room ON blobs (room);");
-    /* Members from before the waitlist existed stay in. */
-    sqlite3_stmt *probe;
-    if (sqlite3_prepare_v2(db, "SELECT state FROM members LIMIT 0", -1, &probe, NULL) != SQLITE_OK)
-        db_exec("ALTER TABLE members ADD COLUMN state INTEGER NOT NULL DEFAULT 1");
-    else
-        sqlite3_finalize(probe);
+    db_exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    db_migrate();
     for (int i = 0; i < NQUERIES; i++)
         if (sqlite3_prepare_v3(db, query_sql[i], -1, SQLITE_PREPARE_PERSISTENT, &queries[i], NULL) !=
             SQLITE_OK)

@@ -39,7 +39,7 @@
 
 /* Per-address limits. IPv6 addresses count per /64, since one machine
  * usually has a whole /64 to pick from. */
-#define IP_CONNS    16                 /* open connections */
+#define IP_CONNS    16                 /* open connections, and by default chat sessions (-L) */
 #define CONN_BURST  30.0               /* new connections and HTTP requests ... */
 #define CONN_RATE   0.5                /* ... refilled per second */
 #define AUTH_BURST  5.0                /* wrong chat keys ... */
@@ -60,6 +60,7 @@ struct client {
     int ws;       /* speaks WebSocket (web client) */
     int proxied;  /* came through a trusted local reverse proxy */
     int counted;  /* holds one of its address's connection slots */
+    int session;  /* ... and one of its chat session slots */
     int dead, closing;
     int refused;     /* dropped with an error, web clients shouldn't reconnect */
     int lingering;   /* refused, draining input before the close. 2 once our side is shut */
@@ -102,7 +103,7 @@ struct room {
 
 struct limit {
     uint8_t ip[16];
-    int used, conns;
+    int used, conns, sessions;
     double conn, auth, up, t;
 };
 
@@ -117,7 +118,7 @@ static struct stat users_st, keys_st, admins_st;
 /* Admins are identity keys, listed by fingerprint (BLAKE2b-128 of the key). */
 static uint8_t (*admins)[16];
 static size_t nadmins;
-static int trust_proxy;
+static int trust_proxy, max_sessions = IP_CONNS;
 static volatile sig_atomic_t stopping;
 
 #define LIMIT_SLOTS 4096
@@ -732,6 +733,19 @@ static void on_hello(struct client *c, const uint8_t *p, size_t n)
         send_error(c, "wrong key", 1);
         return;
     }
+    /* admins logging in only to manage or create chats don't count */
+    if (!c->no_chat) {
+        if (l->sessions >= max_sessions) {
+            char msg[96];
+            snprintf(msg, sizeof msg, "this server allows %d chat session%s per address, and yours has that many open",
+                     max_sessions, max_sessions == 1 ? "" : "s");
+            note("%s: too many sessions from this address, refused", c->addr);
+            send_error(c, msg, 1);
+            return;
+        }
+        l->sessions++;
+        c->session = 1;
+    }
     memcpy(c->pk, p + k, sizeof c->pk);
     struct user *u = user_find(c->name);
     if (u && sodium_memcmp(u->pk, c->pk, sizeof c->pk) != 0) {
@@ -852,11 +866,21 @@ static void on_auth(struct client *c, const uint8_t *p, size_t n)
         send_error(c, "this chat's key was revoked", 1);
         return;
     }
+    /* One session per name, and per identity key */
     for (int i = 0; i < MAX_CLIENTS; i++) {
         struct client *o = clients[i];
-        if (o && o != c && !o->dead && (o->st == ST_READY || o->st == ST_WAITING) &&
-            !strcmp(o->name, c->name)) {
+        if (!o || o == c || o->dead || o->closing || (o->st != ST_READY && o->st != ST_WAITING))
+            continue;
+        if (!strcmp(o->name, c->name)) {
             send_error(c, "that name is already connected", 1);
+            return;
+        }
+        if (!sodium_memcmp(o->pk, c->pk, sizeof c->pk)) {
+            char why[96 + HUSH_NAME_MAX];
+            snprintf(why, sizeof why, "you're already connected as %s, from another window or device; one at a time",
+                     o->name);
+            note("%s: %s is already connected as %s, refused", c->addr, c->name, o->name);
+            send_error(c, why, 1);
             return;
         }
     }
@@ -1465,10 +1489,12 @@ static void client_close(int i)
     upload_abort(c);
     if (c->dl_fd >= 0)
         close(c->dl_fd);
-    if (c->counted) {
+    if (c->counted || c->session) {
         struct limit *l = limit_get(c->ip);
-        if (l->conns > 0)
+        if (c->counted && l->conns > 0)
             l->conns--;
+        if (c->session && l->sessions > 0)
+            l->sessions--;
     }
     if (c->st == ST_READY && !stopping)
         announce_leave(c);
@@ -2164,9 +2190,10 @@ static void usage(void)
             "  -w port       port for the web client, 0 for none (default " HUSH_DEFAULT_WEB ")\n"
             "  -d dir        web client files (default ./web, else ../share/hush/web from hushd)\n"
             "  -x            trust X-Forwarded-For from a reverse proxy on this machine\n"
+            "  -L n          chat sessions per address, 1 to %d (default %d)\n"
             "  -V            print the version\n"
             "files, relative to -C: %s (chat key hashes), %s, %s, %s, %s/\n",
-            keys_path, users_path, admins_path, db_path, blob_dir);
+            IP_CONNS, IP_CONNS, keys_path, users_path, admins_path, db_path, blob_dir);
     exit(2);
 }
 
@@ -2174,7 +2201,7 @@ int main(int argc, char **argv)
 {
     const char *port = HUSH_DEFAULT_PORT, *web_port = HUSH_DEFAULT_WEB, *web_dir = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "C:p:w:d:xhV")) != -1) {
+    while ((opt = getopt(argc, argv, "C:p:w:d:xL:hV")) != -1) {
         if (opt == 'C') {
             if (chdir(optarg) < 0)
                 die("cannot use %s: %s", optarg, strerror(errno));
@@ -2186,6 +2213,13 @@ int main(int argc, char **argv)
             web_dir = optarg;
         else if (opt == 'x')
             trust_proxy = 1;
+        else if (opt == 'L') {
+            char *end;
+            long n = strtol(optarg, &end, 10);
+            if (*end || n < 1 || n > IP_CONNS)
+                die("-L takes a number of sessions from 1 to %d", IP_CONNS);
+            max_sessions = (int)n;
+        }
         else if (opt == 'V') {
             printf("hushd %s\n", HUSH_VERSION);
             return 0;

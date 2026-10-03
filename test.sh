@@ -512,6 +512,35 @@ code -H "X-Forwarded-For: 203.0.113.9, 198.51.100.7" "$B/style.css" >"$T/proxy2.
 check "$T/proxy1.out" "429" "limits apply to the forwarded address"
 check "$T/proxy2.out" "200" "other forwarded addresses are unaffected"
 
+# One chat session per identity key, and -L caps chat sessions per address.
+kill $srv
+wait $srv 2>/dev/null
+S="$T/s6"
+mkdir -p "$S"
+cp "$T/s1/hushd-keys.txt" "$T/s1/hushd-admins.txt" "$S/"
+server "$S" -L 2
+(sleep 4) | client alice a >/dev/null 2>&1 &
+a=$!
+sleep 1
+sleep 0.5 | client alice2 a "$KC" >"$T/alice-twice.out" 2>&1
+(sleep 2.5) | client bob b >/dev/null 2>&1 &
+b=$!
+sleep 1
+sleep 0.5 | client carol c >"$T/carol-cap.out" 2>&1
+python3 - "$PORT" >"$T/admin-login.out" <<'EOF'
+import socket, struct, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+p = bytes([5]) + b"probe" + bytes(64) + b"\x01"
+s.sendall(struct.pack(">IB", len(p) + 1, 1) + p)
+print("admin login:", "CHALLENGE" if s.recv(5)[4:] == b"\x0a" else "refused")
+EOF
+wait $a $b
+sleep 0.5 | client carol c >"$T/carol-cap2.out" 2>&1
+check "$T/alice-twice.out"  "already connected as alice"         "one session per identity key, even under another name"
+check "$T/carol-cap.out"    "allows 2 chat sessions per address" "-L caps chat sessions per address"
+check "$T/admin-login.out"  "admin login: CHALLENGE"             "...but logging in only to manage chats isn't counted"
+check "$T/carol-cap2.out"   "chat: main"                         "...and a slot frees up when someone leaves"
+
 # Hostile input and a crash, on a fresh server so the rate limits above don't get in the way.
 kill $srv
 wait $srv 2>/dev/null

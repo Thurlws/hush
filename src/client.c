@@ -17,6 +17,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -371,6 +373,8 @@ static int dial(const char *host, const char *port)
     freeaddrinfo(res);
     if (fd < 0)
         die("cannot connect to %s port %s: %s", host, port, strerror(err));
+    int one = 1; /* send each message right away, see accept_client() in server.c */
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     return fd;
 }
 

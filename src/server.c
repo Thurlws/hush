@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <sqlite3.h>
@@ -1479,6 +1480,9 @@ static void accept_client(int lfd, int web)
         int fd = accept4(lfd, (struct sockaddr *)&ss, &sl, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0)
             return;
+        /* small frames go out right away, instead of waiting up to 40 ms on the peer's delayed ACK */
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         int slot = -1;
         for (int i = 0; i < MAX_CLIENTS && slot < 0; i++)
             if (!clients[i])

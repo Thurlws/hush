@@ -413,6 +413,8 @@ static void read_frame(uint8_t *type, const uint8_t **p, size_t *n, size_t *fs)
         buf_reserve(&rx, 16384);
         /* NOLINTNEXTLINE(clang-analyzer-unix.StdCLibraryFunctions): sock is open by now */
         ssize_t r = recv(sock, rx.data + rx.len, rx.cap - rx.len, 0);
+        if (r < 0 && errno == EINTR && !running) /* SIGTERM or SIGHUP, e.g. on the waitlist */
+            exit(1);
         if (r < 0 && errno == EINTR)
             continue;
         if (r <= 0)

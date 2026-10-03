@@ -528,6 +528,13 @@ static void on_peer(const uint8_t *p, size_t n)
     int flags = p[(size_t)k + crypto_sign_PUBLICKEYBYTES];
 
     struct peer *pe = peer_find(name);
+    if (flags & PEER_REMOVED) {
+        if (pe) {
+            *pe = peers[--npeers];
+            say("%s* %s was removed from the chat%s", col("\033[33m"), name, col("\033[0m"));
+        }
+        return;
+    }
     if (!pe) {
         if (npeers == MAX_PEERS)
             return;
@@ -961,6 +968,170 @@ static void cmd_share(char *arg)
     send_share(arg, days);
 }
 
+static void send_manage(uint8_t op, struct buf *args)
+{
+    struct buf b = { 0 };
+    buf_put(&b, &op, 1);
+    if (args)
+        buf_put(&b, args->data, args->len);
+    net_send(T_MANAGE, &b);
+    buf_free(&b);
+}
+
+static int listed; /* entries of the list being shown */
+
+/* /sessions, /chats, /bans, /members [CHAT] */
+static void cmd_list(uint8_t what, const char *chat)
+{
+    if (!am_admin) {
+        say("! only an admin can do that");
+        return;
+    }
+    struct buf b = { 0 };
+    buf_put(&b, &what, 1);
+    if (what == LIST_MEMBERS) {
+        if (!name_valid(chat, strlen(chat))) {
+            say("usage: /members [CHAT]");
+            buf_free(&b);
+            return;
+        }
+        name_put(&b, chat);
+    }
+    listed = 0;
+    say(what == LIST_SESSIONS ? "connected:" : what == LIST_CHATS ? "chats:" : what == LIST_BANS ? "banned:" : "in %s:", chat);
+    send_manage(MG_LIST, &b);
+    buf_free(&b);
+}
+
+static void local_time(uint64_t ms, char *out, size_t n)
+{
+    time_t t = (time_t)(ms / 1000);
+    struct tm tm;
+    if (!ms || !localtime_r(&t, &tm))
+        snprintf(out, n, "?");
+    else
+        strftime(out, n, "%Y-%m-%d %H:%M", &tm);
+}
+
+/* u8 len + printable text, like an address. Bytes used or -1. */
+static int text_get(const uint8_t *p, size_t n, char *out, size_t cap)
+{
+    if (n < 1 || p[0] >= cap || (size_t)p[0] + 1 > n)
+        return -1;
+    for (size_t i = 1; i <= p[0]; i++)
+        if (p[i] <= ' ' || p[i] > '~')
+            return -1;
+    memcpy(out, p + 1, p[0]);
+    out[p[0]] = '\0';
+    return p[0] + 1;
+}
+
+static void on_item(const uint8_t *p, size_t n)
+{
+    char a[HUSH_NAME_MAX + 1], b[HUSH_NAME_MAX + 1], addr[64], when[32], fp[HUSH_FP_LEN];
+    int k1, k2;
+    if (n < 1)
+        return;
+    if (p[0] == LIST_SESSIONS && n >= 14 && (k1 = text_get(p + 14, n - 14, addr, sizeof addr)) > 0 &&
+        (k2 = name_get_opt(p + 14 + k1, n - 14 - (size_t)k1, a)) >= 0 &&
+        name_get_opt(p + 14 + k1 + k2, n - 14 - (size_t)(k1 + k2), b) >= 0) {
+        int f = p[5];
+        local_time(get_u64(p + 6), when, sizeof when);
+        say("  #%-4u %-12s  %s%s%s  %s  %s  since %s%s", get_u32(p + 1), *a ? a : "?",
+            *b ? "in " : f & SESSION_LOGIN ? "logging in" : "managing", b, f & SESSION_WAITING ? " (waiting)" : "",
+            f & SESSION_WEB ? "web" : "terminal", addr, when, f & SESSION_YOU ? "  (you)" : "");
+    } else if (p[0] == LIST_CHATS && (k1 = name_get(p + 1, n - 1, a)) > 0 && n - 1 - (size_t)k1 == 37) {
+        const uint8_t *q = p + 1 + k1;
+        if (q[0])
+            say("  %-24s  old key, can only be deleted", a);
+        else
+            say("  %-24s  %u members, %u waiting, %u online, %llu messages, %llu images (%.1f MB)", a, get_u32(q + 1),
+                get_u32(q + 5), get_u32(q + 9), (unsigned long long)get_u64(q + 13),
+                (unsigned long long)get_u64(q + 21), (double)get_u64(q + 29) / 1048576.0);
+    } else if (p[0] == LIST_MEMBERS && (k1 = name_get(p + 1, n - 1, a)) > 0 && n - 1 - (size_t)k1 == 50) {
+        const uint8_t *q = p + 1 + k1;
+        uint64_t after = get_u64(q + 42);
+        char history[64] = "";
+        fingerprint(q, fp);
+        if (q[32] == 1 && after) {
+            local_time(after, when, sizeof when);
+            snprintf(history, sizeof history, ", sees history after %s", when);
+        } else if (q[32] == 1) {
+            snprintf(history, sizeof history, ", sees all history");
+        }
+        say("  %-12s  %s  %s%s%s%s", a, fp, q[32] == 1 ? "in" : q[32] == 0 ? "waiting" : "turned away",
+            q[33] & MEMBER_IS_ONLINE ? ", online" : "", q[33] & MEMBER_IS_ADMIN ? ", admin" : "", history);
+    } else if (p[0] == LIST_BANS && (k1 = text_get(p + 1, n - 1, addr, sizeof addr)) > 0 && n - 1 - (size_t)k1 >= 8 &&
+               name_get_opt(p + 1 + k1 + 8, n - 9 - (size_t)k1, a) >= 0) {
+        local_time(get_u64(p + 1 + k1), when, sizeof when);
+        say("  %-24s  %s%s%s", addr, when, *a ? "  by " : "", a);
+    } else {
+        return;
+    }
+    listed++;
+}
+
+static void on_list_end(void)
+{
+    if (!listed)
+        say("  (none)");
+}
+
+/* /kick N, /remove NAME, /ban ADDRESS, /unban ADDRESS */
+static void cmd_manage(const char *cmd, const char *arg)
+{
+    if (!am_admin) {
+        say("! only an admin can do that");
+        return;
+    }
+    struct buf b = { 0 };
+    if (!strcmp(cmd, "kick")) {
+        char *end;
+        unsigned long id = strtoul(arg + (*arg == '#'), &end, 10);
+        if (!*arg || *end || id > UINT32_MAX) {
+            say("usage: /kick N   (N from /sessions)");
+        } else {
+            uint8_t t[4];
+            put_u32(t, (uint32_t)id);
+            buf_put(&b, t, sizeof t);
+            send_manage(MG_KICK, &b);
+        }
+    } else if (!strcmp(cmd, "remove")) {
+        if (!name_valid(arg, strlen(arg))) {
+            say("usage: /remove NAME");
+        } else {
+            name_put(&b, chat_label);
+            name_put(&b, arg);
+            send_manage(MG_REMOVE, &b);
+        }
+    } else {
+        size_t len = strlen(arg);
+        if (!len || len > 60 || strchr(arg, ' ')) {
+            say("usage: /%s ADDRESS", cmd);
+        } else {
+            name_put(&b, arg);
+            send_manage(!strcmp(cmd, "ban") ? MG_BAN : MG_UNBAN, &b);
+        }
+    }
+    buf_free(&b);
+}
+
+static void on_cleared(void)
+{
+    oldest_id = 0;
+    more_history = 0;
+    say("%s* an admin deleted this chat's history%s", col("\033[33m"), col("\033[0m"));
+}
+
+static void on_renamed(const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1];
+    if (name_get(p, n, label) != (int)n)
+        return;
+    strcpy(chat_label, label);
+    say("%s* this chat is now called %s%s", col("\033[33m"), label, col("\033[0m"));
+}
+
 static void on_done(const uint8_t *p, size_t n)
 {
     char text[HUSH_MAX_FRAME + 1];
@@ -1353,6 +1524,14 @@ static void process_frames(void)
             on_done(p, n);
         else if (type == T_SHARED)
             on_shared(p, n);
+        else if (type == T_ITEM)
+            on_item(p, n);
+        else if (type == T_LIST_END)
+            on_list_end();
+        else if (type == T_CLEARED)
+            on_cleared();
+        else if (type == T_RENAMED)
+            on_renamed(p, n);
         else if (type == T_ERROR) {
             char msg[HUSH_MAX_FRAME + 1];
             sanitize(p, n, msg);
@@ -1406,6 +1585,12 @@ static void cmd_help(void)
             "  /deny NAME       turn NAME away\n"
             "  /share NAME [DAYS]  let NAME see history from before they joined: all of it,\n"
             "                   or the last DAYS days\n"
+            "  /members [CHAT]  who's in this chat (or CHAT), and how much history they see\n"
+            "  /remove NAME     take NAME out of this chat (they'd have to be let in again)\n"
+            "  /sessions        everyone connected to the server\n"
+            "  /kick N          disconnect session N\n"
+            "  /chats           every chat on the server\n"
+            "  /ban ADDRESS     refuse an IP address, /unban ADDRESS, /bans to list them\n"
             "  /newchat NAME    create a chat and get its key");
 }
 
@@ -1556,6 +1741,16 @@ static void submit(void)
             cmd_decide(arg, 0);
         else if (!strcmp(cmd, "share"))
             cmd_share(arg);
+        else if (!strcmp(cmd, "sessions"))
+            cmd_list(LIST_SESSIONS, "");
+        else if (!strcmp(cmd, "chats"))
+            cmd_list(LIST_CHATS, "");
+        else if (!strcmp(cmd, "bans"))
+            cmd_list(LIST_BANS, "");
+        else if (!strcmp(cmd, "members"))
+            cmd_list(LIST_MEMBERS, *arg ? arg : chat_label);
+        else if (!strcmp(cmd, "kick") || !strcmp(cmd, "remove") || !strcmp(cmd, "ban") || !strcmp(cmd, "unban"))
+            cmd_manage(cmd, arg);
         else if (!strcmp(cmd, "more")) {
             if (mydata.active) {
                 say("! wait for /mydata to finish");

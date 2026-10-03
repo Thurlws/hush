@@ -588,7 +588,22 @@ function onEvent(ev, name, key) {
   case "peer": showPeer(ev); showOnline(); break;
   case "leave": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} went offline`); showOnline(); break;
   case "notice": line(ev.level, ev.text); break;
-  case "done": line(ev.ok ? "info" : "warn", (ev.ok ? "" : "! ") + ev.text); break;
+  case "removed": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} was removed from the chat`); showOnline(); break;
+  case "cleared": // nothing before this is on the server any more
+    $("msgs").replaceChildren();
+    shown.clear();
+    lastId = 0;
+    moreOlder = false;
+    $("older").hidden = true;
+    if (log) { log.list = []; placed = new Set(); saveLog(); }
+    event("", "sys", "* an admin deleted this chat's history");
+    break;
+  case "renamed":
+    $("label").textContent = ev.label;
+    document.title = `hush · ${ev.label}`;
+    rememberSession(key, name, ev.label);
+    event("", "sys", `* this chat is now called ${ev.label}`);
+    break;
   case "shared":
     event("", "sys", ev.days ? `* an admin shared the last ${ev.days} day${ev.days === 1 ? "" : "s"} of history with you`
                              : "* an admin shared the chat's history with you");

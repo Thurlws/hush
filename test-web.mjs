@@ -8,10 +8,14 @@
 // For server tests: "/raw TYPE HEX" sends any frame, even while waiting,
 // "/garbage N" sends N random frames, "/lastblob" prints the newest image's
 // blob id, and every BLOB reply is printed with its status.
+// Admins: "/mg OP ARGS" makes an admin request (OP: sessions, chats, bans, members CHAT,
+// kick N, remove CHAT NAME, ban ADDR, unban ADDR, share CHAT NAME DAYS, clear CHAT,
+// revoke CHAT, rename CHAT NEW, decide CHAT NAME 1|0) and prints the answer. With "-"
+// as the key it logs in without a chat, like the home page's "Manage server".
 import { readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import sodium from "./web/sodium.mjs";
-import { Session, createChat } from "./web/hush.js";
+import { Session, AdminLink, createChat } from "./web/hush.js";
 
 await sodium.ready;
 const [name, key, url, origin, idFile] = process.argv.slice(2);
@@ -25,9 +29,14 @@ if (!sk || sk.length !== 64) {
 const knownMap = new Map();
 const known = { get: n => knownMap.get(n) || null, set: (n, r) => knownMap.set(n, r) };
 
-// Browsers always send Origin on the WebSocket handshake, Node only when asked.
+// Browsers always send Origin on the WebSocket handshake, Node only when asked. $HUSH_TEST_XFF
+// pretends to come through a reverse proxy, from that address.
 class WS extends WebSocket {
-  constructor(u) { super(u, { headers: origin ? { Origin: origin } : {} }); }
+  constructor(u) {
+    const headers = origin ? { Origin: origin } : {};
+    if (process.env.HUSH_TEST_XFF) headers["X-Forwarded-For"] = process.env.HUSH_TEST_XFF;
+    super(u, { headers });
+  }
 }
 
 let lastImage = null;
@@ -43,7 +52,11 @@ function show(m) {
 
 const queue = [];
 const hex = b => Buffer.from(b).toString("hex");
-const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket: WS }, ev => {
+const manageOnly = key === "-";
+const s = manageOnly ? new AdminLink({ sodium, url, name, secretKey: sk, WebSocket: WS }, ev => {
+  if (ev.type === "ready") { console.log("managing"); queue.splice(0).forEach(run); }
+  if (ev.type === "closed") { console.log(`closed${ev.error ? `: ${ev.error}` : ""}`); process.exit(0); }
+}) : new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket: WS }, ev => {
   switch (ev.type) {
   case "waiting": console.log(`waiting for approval to join ${ev.label}`); break;
   case "ready":
@@ -59,18 +72,39 @@ const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket:
   case "message": show(ev.msg); break;
   case "history": ev.messages.forEach(show); if (ev.more) console.log("(more history)"); break;
   case "notice": console.log(ev.text); break;
-  case "done": console.log(`${ev.ok ? "" : "! "}${ev.text}`); break;
   case "shared": console.log(`* history shared with you (${ev.days || "all"})`); break;
+  case "removed": console.log(`* ${ev.name} was removed`); break;
+  case "cleared": console.log("* history cleared"); break;
+  case "renamed": console.log(`* chat renamed to ${ev.label}`); break;
   case "error": console.log(`! server: ${ev.text}`); break;
   case "closed": console.log(`closed${ev.error ? `: ${ev.error}` : ""}`); process.exit(0);
   }
 });
 
-const onFrame = s.onFrame.bind(s);
-s.onFrame = f => {
-  if (f[0] === 18 && f.length >= 18) console.log(`blob ${hex(f.subarray(1, 17))} status ${f[17]}`);
-  onFrame(f);
-};
+if (!manageOnly) {
+  const onFrame = s.onFrame.bind(s);
+  s.onFrame = f => {
+    if (f[0] === 18 && f.length >= 18) console.log(`blob ${hex(f.subarray(1, 17))} status ${f[17]}`);
+    onFrame(f);
+  };
+}
+
+async function manage(args) {
+  const m = s.manage, [op, a, b, c] = args;
+  const calls = {
+    sessions: () => m.sessions(), chats: () => m.chats(), bans: () => m.bans(), members: () => m.members(a),
+    kick: () => m.kick(Number(a)), remove: () => m.remove(a, b), ban: () => m.ban(a), unban: () => m.unban(a),
+    share: () => m.share(a, b, Number(c)), clear: () => m.clear(a), revoke: () => m.revoke(a),
+    rename: () => m.rename(a, b), decide: () => m.decide(a, b, c === "1"),
+  };
+  try {
+    const r = await calls[op]();
+    if (typeof r === "string") console.log(`done: ${r}`);
+    else for (const item of r) console.log(`${op}: ${JSON.stringify(item)}`);
+  } catch (e) {
+    console.log(`failed: ${e.message}`);
+  }
+}
 
 function raw(l) {
   const r = /^\/raw (\d+) ?([0-9a-f]*)$/.exec(l), g = /^\/garbage (\d+)$/.exec(l);
@@ -83,7 +117,9 @@ function raw(l) {
 async function run(l) {
   const img = /^\/img (\S+) ?(.*)$/.exec(l), save = /^\/save (\S+)$/.exec(l), mine = /^\/mydata (\S+)$/.exec(l);
   try {
-    if (img) {
+    if (/^\/mg /.test(l)) {
+      await manage(l.slice(4).split(" "));
+    } else if (img) {
       const mime = { jpg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp" }[img[1].split(".").pop()];
       await s.sendImage(new Uint8Array(readFileSync(img[1])), { mime, width: 1, height: 1, caption: img[2] });
       console.log("image sent");
@@ -108,5 +144,5 @@ async function run(l) {
 }
 
 const rl = createInterface({ input: process.stdin });
-rl.on("line", l => raw(l) || (s.ready ? run(l) : queue.push(l)));
+rl.on("line", l => (!manageOnly && raw(l)) || (s.ready ? run(l) : queue.push(l)));
 rl.on("close", () => setTimeout(() => s.close(), 300));

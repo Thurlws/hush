@@ -66,6 +66,8 @@ struct client {
     int lingering;   /* refused, draining input before the close. 2 once our side is shut */
     int admin;       /* its identity key is on the admin list */
     int proto;       /* protocol version from its HELLO */
+    uint32_t id;     /* for admins' session list */
+    uint64_t connected; /* when, in ms */
     int no_chat;     /* logged in with a zero token, to create chats */
     time_t deadline; /* drop the connection after this, 0 for never */
     uint8_t ip[16];  /* rate-limit key */
@@ -102,6 +104,13 @@ struct room {
     int old; /* old-format key, can only be revoked */
 };
 
+/* Addresses refused outright, in hushd-bans.txt. */
+struct ban {
+    uint8_t ip[16];   /* same key as the limits: IPv6 per /64 */
+    uint64_t time;    /* ms */
+    char by[HUSH_NAME_MAX + 1]; /* the admin, empty from the command line */
+};
+
 struct limit {
     uint8_t ip[16];
     int used, conns, sessions;
@@ -115,7 +124,11 @@ static struct room *rooms;
 static size_t nrooms;
 static const char *users_path = "hushd-users.txt", *keys_path = "hushd-keys.txt";
 static const char *db_path = "hushd.db", *blob_dir = "blobs", *admins_path = "hushd-admins.txt";
-static struct stat users_st, keys_st, admins_st;
+static const char *bans_path = "hushd-bans.txt";
+static struct stat users_st, keys_st, admins_st, bans_st;
+static struct ban *bans;
+static size_t nbans;
+static uint32_t last_session_id;
 /* Admins are identity keys, listed by fingerprint (BLAKE2b-128 of the key). */
 static uint8_t (*admins)[16];
 static size_t nadmins;
@@ -182,20 +195,118 @@ static int ip_parse(const char *s, struct in6_addr *a)
     return inet_pton(AF_INET6, s, a) == 1 ? 0 : -1;
 }
 
+/* The key limits and bans use: IPv4 as is, IPv6 cut to its /64. */
+static void ip_key(const struct in6_addr *a, uint8_t out[16])
+{
+    memcpy(out, a, 16);
+    if (!IN6_IS_ADDR_V4MAPPED(a))
+        memset(out + 8, 0, 8);
+}
+
 static void ip_use(struct client *c, const struct in6_addr *a)
 {
-    memcpy(c->ip, a, sizeof c->ip);
+    ip_key(a, c->ip);
     if (IN6_IS_ADDR_V4MAPPED(a))
         inet_ntop(AF_INET, a->s6_addr + 12, c->addr, sizeof c->addr);
-    else {
-        memset(c->ip + 8, 0, 8);
+    else
         inet_ntop(AF_INET6, a, c->addr, sizeof c->addr);
+}
+
+/* A key as text: "203.0.113.9" or "2001:db8::/64". */
+static void ip_text(const uint8_t key[16], char *out, size_t n)
+{
+    char t[INET6_ADDRSTRLEN];
+    struct in6_addr a;
+    memcpy(&a, key, sizeof a);
+    if (IN6_IS_ADDR_V4MAPPED(&a)) {
+        inet_ntop(AF_INET, key + 12, t, sizeof t);
+        snprintf(out, n, "%s", t);
+    } else {
+        inet_ntop(AF_INET6, &a, t, sizeof t);
+        snprintf(out, n, "%s/64", t);
     }
+}
+
+/* "203.0.113.9", "2001:db8::1" or "2001:db8::/64" as a key. -1 if it's none of those. */
+static int ip_from_text(const char *s, uint8_t key[16])
+{
+    char t[INET6_ADDRSTRLEN + 4];
+    struct in6_addr a;
+    if (strlen(s) >= sizeof t)
+        return -1;
+    strcpy(t, s);
+    char *slash = strchr(t, '/');
+    if (slash) {
+        if (strcmp(slash, "/64"))
+            return -1;
+        *slash = '\0';
+    }
+    if (ip_parse(t, &a) != 0 || (slash && IN6_IS_ADDR_V4MAPPED(&a)))
+        return -1;
+    ip_key(&a, key);
+    return 0;
 }
 
 static int ip_loopback(const struct in6_addr *a)
 {
     return IN6_IS_ADDR_LOOPBACK(a) || (IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127);
+}
+
+static struct ban *ban_find(const uint8_t ip[16])
+{
+    for (size_t i = 0; i < nbans; i++)
+        if (!memcmp(bans[i].ip, ip, 16))
+            return &bans[i];
+    return NULL;
+}
+
+static void ban_add(const struct ban *b)
+{
+    struct ban *p = realloc(bans, (nbans + 1) * sizeof *bans);
+    if (!p)
+        die("out of memory");
+    bans = p;
+    bans[nbans++] = *b;
+}
+
+/* Lines are "ADDRESS [TIME [ADMIN]]". # starts a comment. */
+static void bans_load(void)
+{
+    nbans = 0;
+    FILE *f = fopen(bans_path, "r");
+    if (!f)
+        return;
+    char line[256], addr[128], when[64], by[64];
+    while (fgets(line, sizeof line, f)) {
+        size_t end = strcspn(line, "#\r\n");
+        if (end < sizeof line)
+            line[end] = '\0';
+        struct ban b = { 0 };
+        char *e;
+        when[0] = '\0'; /* a line can be just the address */
+        int k = sscanf(line, "%127s %63s %63s", addr, when, by);
+        if (k < 1)
+            continue;
+        b.time = strtoull(when, &e, 10);
+        if (ip_from_text(addr, b.ip) != 0 || *e) {
+            note("skipping bad line in %s", bans_path);
+            continue;
+        }
+        if (k == 3 && name_valid(by, strlen(by)))
+            strcpy(b.by, by);
+        if (!ban_find(b.ip))
+            ban_add(&b);
+    }
+    fclose(f);
+}
+
+static void bans_write(FILE *f)
+{
+    for (size_t i = 0; i < nbans; i++) {
+        char t[INET6_ADDRSTRLEN + 4];
+        ip_text(bans[i].ip, t, sizeof t);
+        fprintf(f, "%s %llu%s%s\n", t, (unsigned long long)bans[i].time, *bans[i].by ? " " : "", bans[i].by);
+    }
 }
 
 /* Limits for an address, refilled. With no free slot, the one with the fewest
@@ -472,7 +583,8 @@ static sqlite3 *db;
 enum {
     Q_INSERT_MSG, Q_OLDER, Q_NEWER, Q_MINE, Q_ADD_MEMBER, Q_MEMBERS, Q_IS_MEMBER,
     Q_MEMBER_STATE, Q_SET_STATE, Q_WAITING, Q_COUNT_WAITING,
-    Q_ADD_BLOB, Q_BLOB_ROOM, Q_JOIN, Q_SINCE, Q_SHARE_POINT, Q_SHARE, NQUERIES
+    Q_ADD_BLOB, Q_BLOB_ROOM, Q_JOIN, Q_SINCE, Q_SHARE_POINT, Q_SHARE, Q_CHAT_STATS, Q_MEMBER_LIST,
+    Q_DROP_MEMBER, NQUERIES
 };
 static const char *const query_sql[NQUERIES] = {
     [Q_INSERT_MSG] = "INSERT INTO messages (room, sender, recipient, time, body) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -496,6 +608,14 @@ static const char *const query_sql[NQUERIES] = {
     [Q_SINCE] = "SELECT since FROM members WHERE room = ?1 AND name = ?2",
     [Q_SHARE_POINT] = "SELECT coalesce(max(id), 0) FROM messages WHERE room = ?1 AND time < ?2",
     [Q_SHARE] = "UPDATE members SET since = ?3 WHERE room = ?1 AND name = ?2",
+    [Q_CHAT_STATS] = "SELECT (SELECT count(*) FROM members WHERE room = ?1 AND state = 1),"
+                     " (SELECT count(*) FROM members WHERE room = ?1 AND state = 0),"
+                     " (SELECT count(*) FROM messages WHERE room = ?1),"
+                     " (SELECT count(*) FROM blobs WHERE room = ?1),"
+                     " (SELECT coalesce(sum(size), 0) FROM blobs WHERE room = ?1)",
+    [Q_MEMBER_LIST] = "SELECT name, state, joined, since, (SELECT time FROM messages WHERE id = members.since) "
+                      "FROM members WHERE room = ?1 ORDER BY state, name",
+    [Q_DROP_MEMBER] = "DELETE FROM members WHERE room = ?1 AND name = ?2",
 };
 static sqlite3_stmt *queries[NQUERIES];
 
@@ -883,12 +1003,12 @@ static void on_auth(struct client *c, const uint8_t *p, size_t n)
         c->admin = is_admin(c->pk);
         if (!c->admin) {
             limit_get(c->ip)->auth -= 1;
-            note("%s: %s tried to create a chat without being an admin", c->addr, c->name);
-            send_error(c, "only an admin can create chats", 1);
+            note("%s: %s tried to log in without a chat, but isn't an admin", c->addr, c->name);
+            send_error(c, "only an admin can create or manage chats", 1);
             return;
         }
         c->st = ST_ADMIN;
-        c->deadline = time(NULL) + 60;
+        c->deadline = 0;
         c->req_tokens = REQ_BURST;
         c->req_t = now_mono();
         send_to(c, T_ADMIN, NULL, 0);
@@ -974,6 +1094,32 @@ static void recheck_waiting(struct client *c)
         refuse_denied(c);
 }
 
+/* Let name into room or turn them away, and tell whoever needs to know. -1 if they
+ * aren't waiting (or, to let in, turned away before). */
+static int decide(const uint8_t *room, const char *name, int approve)
+{
+    const struct user *u = user_find(name);
+    int state = member_state(room, name);
+    if (!u || (state != MEMBER_WAITING && !(approve && state == MEMBER_DENIED)))
+        return -1;
+    set_member_state(room, name, approve ? MEMBER_IN : MEMBER_DENIED);
+    notify_admins(room, 0, name, u->pk);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (o && !o->dead && o->st == ST_WAITING && !memcmp(o->room, room, 32) && !strcmp(o->name, name)) {
+            recheck_waiting(o);
+            return 0;
+        }
+    }
+    if (approve) /* not connected right now: tell the chat they're in */
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            struct client *o = clients[i];
+            if (o && !o->dead && o->st == ST_READY && !memcmp(o->room, room, 32))
+                send_peer(o, u->name, u->pk, PEER_NEW);
+        }
+    return 0;
+}
+
 static void on_decide(struct client *c, const uint8_t *p, size_t n)
 {
     char name[HUSH_NAME_MAX + 1];
@@ -985,29 +1131,13 @@ static void on_decide(struct client *c, const uint8_t *p, size_t n)
         send_error(c, "only an admin can do that", 0);
         return;
     }
-    const struct user *u = user_find(name);
-    if (!u || member_state(c->room, name) != MEMBER_WAITING) {
+    if (member_state(c->room, name) != MEMBER_WAITING || decide(c->room, name, p[0]) != 0) {
         char msg[64 + HUSH_NAME_MAX];
         snprintf(msg, sizeof msg, "%s isn't waiting to join", name);
         send_error(c, msg, 0);
         return;
     }
-    set_member_state(c->room, name, p[0] ? MEMBER_IN : MEMBER_DENIED);
     note("%s: %s %s %s", c->addr, c->name, p[0] ? "approved" : "denied", name);
-    notify_admins(c->room, 0, name, u->pk);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        struct client *o = clients[i];
-        if (o && !o->dead && o->st == ST_WAITING && same_room(o, c) && !strcmp(o->name, name)) {
-            recheck_waiting(o);
-            return;
-        }
-    }
-    if (p[0]) /* not connected right now: tell the chat they're in */
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            struct client *o = clients[i];
-            if (o && !o->dead && o->st == ST_READY && same_room(o, c))
-                send_peer(o, u->name, u->pk, PEER_NEW);
-        }
 }
 
 static void msg_frame(struct buf *b, int64_t id, int64_t time, uint8_t live, const char *from,
@@ -1325,6 +1455,49 @@ static void on_newchat(struct client *c, const uint8_t *p, size_t n)
     buf_free(&b);
 }
 
+/* Delete a chat's messages and images (and, with members, its member list). -1 if
+ * the database refused, and then nothing is deleted. */
+static int delete_history(const uint8_t *room, int members)
+{
+    /* With the messages gone their ids can be used again, so a member's since has to go too */
+    const char *const del[] = { "DELETE FROM blobs WHERE room = ?1", "DELETE FROM messages WHERE room = ?1",
+                                members ? "DELETE FROM members WHERE room = ?1"
+                                        : "UPDATE members SET since = 0 WHERE room = ?1" };
+    struct buf ids = { 0 };
+    sqlite3_stmt *s = NULL;
+    int ok = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK &&
+             sqlite3_prepare_v2(db, "SELECT id FROM blobs WHERE room = ?1", -1, &s, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+        while (sqlite3_step(s) == SQLITE_ROW)
+            if (sqlite3_column_bytes(s, 0) == HUSH_BLOB_ID)
+                buf_put(&ids, sqlite3_column_blob(s, 0), HUSH_BLOB_ID);
+    }
+    sqlite3_finalize(s);
+    for (int i = 0; ok && i < 3; i++) {
+        ok = sqlite3_prepare_v2(db, del[i], -1, &s, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+            ok = sqlite3_step(s) == SQLITE_DONE;
+        }
+        sqlite3_finalize(s);
+    }
+    if (ok)
+        ok = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
+    if (!ok) {
+        note("deleting history failed: %s", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    } else { /* images go once nothing points at them */
+        for (size_t i = 0; i + HUSH_BLOB_ID <= ids.len; i += HUSH_BLOB_ID) {
+            char path[128];
+            blob_path(ids.data + i, path, sizeof path);
+            unlink(path);
+        }
+    }
+    buf_free(&ids);
+    return ok ? 0 : -1;
+}
+
 /* Let name see more of room's history: the last days days, or all of it with 0. Shared
  * history is never taken back. 1 if they see more now. If they're online, their
  * client is told so it can load it. */
@@ -1407,6 +1580,430 @@ static void manage_share(struct client *c, const uint8_t *p, size_t n)
     note("%s: %s shared %s history with %s", c->addr, c->name, label, name);
 }
 
+static void put32(struct buf *b, uint32_t v)
+{
+    uint8_t t[4];
+    put_u32(t, v);
+    buf_put(b, t, sizeof t);
+}
+
+static void put64(struct buf *b, uint64_t v)
+{
+    uint8_t t[8];
+    put_u64(t, v);
+    buf_put(b, t, sizeof t);
+}
+
+static void list_end(struct client *c, uint8_t list)
+{
+    send_to(c, T_LIST_END, &list, 1);
+}
+
+static void list_sessions(struct client *c)
+{
+    struct buf b = { 0 };
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (!o || o->dead || o->closing || o->st == ST_HTTP || o->st == ST_GONE)
+            continue;
+        uint8_t flags = (uint8_t)((o->ws ? SESSION_WEB : 0) | (o->admin ? SESSION_ADMIN : 0) |
+                                  (o->st == ST_WAITING ? SESSION_WAITING : 0) | (o == c ? SESSION_YOU : 0) |
+                                  (o->st == ST_HELLO || o->st == ST_AUTH ? SESSION_LOGIN : 0));
+        const struct room *r = o->st != ST_HELLO && !o->no_chat ? room_find(o->room) : NULL;
+        uint8_t list = LIST_SESSIONS;
+        b.len = 0;
+        buf_put(&b, &list, 1);
+        put32(&b, o->id);
+        buf_put(&b, &flags, 1);
+        put64(&b, o->connected);
+        name_put(&b, o->addr);
+        name_put(&b, o->st == ST_HELLO ? "" : o->name);
+        name_put(&b, r ? r->label : "");
+        send_to(c, T_ITEM, b.data, b.len);
+    }
+    buf_free(&b);
+    list_end(c, LIST_SESSIONS);
+}
+
+static int online_in(const uint8_t *room)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i] && !clients[i]->dead && clients[i]->st == ST_READY && !memcmp(clients[i]->room, room, 32))
+            n++;
+    return n;
+}
+
+static void list_chats(struct client *c)
+{
+    struct buf b = { 0 };
+    for (size_t i = 0; i < nrooms; i++) {
+        int64_t v[5] = { 0 };
+        if (!rooms[i].old) {
+            sqlite3_stmt *s = q(Q_CHAT_STATS);
+            sqlite3_bind_blob(s, 1, rooms[i].hash, 32, SQLITE_STATIC);
+            if (sqlite3_step(s) == SQLITE_ROW)
+                for (int k = 0; k < 5; k++)
+                    v[k] = sqlite3_column_int64(s, k);
+            sqlite3_reset(s);
+        }
+        uint8_t list = LIST_CHATS, old = (uint8_t)rooms[i].old;
+        b.len = 0;
+        buf_put(&b, &list, 1);
+        name_put(&b, rooms[i].label);
+        buf_put(&b, &old, 1);
+        put32(&b, (uint32_t)v[0]);
+        put32(&b, (uint32_t)v[1]);
+        put32(&b, rooms[i].old ? 0 : (uint32_t)online_in(rooms[i].hash));
+        put64(&b, (uint64_t)v[2]);
+        put64(&b, (uint64_t)v[3]);
+        put64(&b, (uint64_t)v[4]);
+        send_to(c, T_ITEM, b.data, b.len);
+    }
+    buf_free(&b);
+    list_end(c, LIST_CHATS);
+}
+
+static void list_members(struct client *c, const struct room *r)
+{
+    struct buf b = { 0 };
+    sqlite3_stmt *s = q(Q_MEMBER_LIST);
+    sqlite3_bind_blob(s, 1, r->hash, 32, SQLITE_STATIC);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(s, 0);
+        const struct user *u = name ? user_find(name) : NULL;
+        if (!u)
+            continue;
+        const struct client *o = client_find(name);
+        int state = sqlite3_column_int(s, 1), admin = is_admin(u->pk);
+        int64_t since = sqlite3_column_int64(s, 3), joined = sqlite3_column_int64(s, 2);
+        /* what they see starts after the message at since, or when they joined if it's gone */
+        int64_t after = admin || since == 0 || state != MEMBER_IN ? 0
+                        : sqlite3_column_type(s, 4) == SQLITE_NULL ? joined : sqlite3_column_int64(s, 4);
+        uint8_t list = LIST_MEMBERS, st = (uint8_t)state,
+                flags = (uint8_t)((o && !memcmp(o->room, r->hash, 32) ? MEMBER_IS_ONLINE : 0) |
+                                  (admin ? MEMBER_IS_ADMIN : 0));
+        b.len = 0;
+        buf_put(&b, &list, 1);
+        name_put(&b, u->name);
+        buf_put(&b, u->pk, sizeof u->pk);
+        buf_put(&b, &st, 1);
+        buf_put(&b, &flags, 1);
+        put64(&b, (uint64_t)joined);
+        put64(&b, (uint64_t)after);
+        send_to(c, T_ITEM, b.data, b.len);
+    }
+    sqlite3_reset(s);
+    buf_free(&b);
+    list_end(c, LIST_MEMBERS);
+}
+
+static void list_bans(struct client *c)
+{
+    struct buf b = { 0 };
+    for (size_t i = 0; i < nbans; i++) {
+        char t[INET6_ADDRSTRLEN + 4];
+        uint8_t list = LIST_BANS;
+        ip_text(bans[i].ip, t, sizeof t);
+        b.len = 0;
+        buf_put(&b, &list, 1);
+        name_put(&b, t);
+        put64(&b, bans[i].time);
+        name_put(&b, bans[i].by);
+        send_to(c, T_ITEM, b.data, b.len);
+    }
+    buf_free(&b);
+    list_end(c, LIST_BANS);
+}
+
+/* An address argument: u8 len + printable ASCII. Bytes used, or -1. */
+static int text_get(const uint8_t *p, size_t n, char *out, size_t cap)
+{
+    if (n < 1 || p[0] < 1 || p[0] >= cap || (size_t)p[0] + 1 > n)
+        return -1;
+    for (size_t i = 1; i <= p[0]; i++)
+        if (p[i] <= ' ' || p[i] > '~')
+            return -1;
+    memcpy(out, p + 1, p[0]);
+    out[p[0]] = '\0';
+    return p[0] + 1;
+}
+
+/* Everyone connected to room (or waiting to get in) */
+static int in_room(const struct client *o, const uint8_t *room)
+{
+    return o && !o->dead && !o->closing && !o->no_chat &&
+           (o->st == ST_AUTH || o->st == ST_WAITING || o->st == ST_READY) && !memcmp(o->room, room, 32);
+}
+
+/* Close the connections from banned addresses. How many there were. */
+static int drop_banned(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (!o || o->dead || o->st == ST_GONE || !ban_find(o->ip))
+            continue;
+        if (o->st == ST_HTTP)
+            o->dead = 1;
+        else
+            send_error(o, "this server no longer accepts connections from your address", 1);
+        n++;
+    }
+    return n;
+}
+
+static void manage_kick(struct client *c, const uint8_t *p, size_t n)
+{
+    if (n != 4) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    uint32_t id = get_u32(p);
+    struct client *o = NULL;
+    for (int i = 0; i < MAX_CLIENTS && !o; i++)
+        if (clients[i] && clients[i]->id == id && !clients[i]->dead && !clients[i]->closing &&
+            clients[i]->st != ST_HTTP && clients[i]->st != ST_GONE)
+            o = clients[i];
+    if (!o) {
+        done(c, MG_KICK, 0, "that session isn't connected any more");
+        return;
+    }
+    if (o == c) {
+        done(c, MG_KICK, 0, "that's you");
+        return;
+    }
+    note("%s: %s disconnected %s (%s)", c->addr, c->name, o->st == ST_HELLO ? "someone" : o->name, o->addr);
+    done(c, MG_KICK, 1, "disconnected %s (%s)", o->st == ST_HELLO ? "a connection" : o->name, o->addr);
+    send_error(o, "an admin disconnected you", 1);
+}
+
+static void manage_remove(struct client *c, const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1], name[HUSH_NAME_MAX + 1];
+    int k1 = name_get(p, n, label), k2 = k1 < 0 ? -1 : name_get(p + k1, n - (size_t)k1, name);
+    if (k2 < 0 || (size_t)k1 + (size_t)k2 != n) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    struct room *r = chat_or_done(c, MG_REMOVE, label);
+    if (!r)
+        return;
+    const struct user *u = user_find(name);
+    if (!u || member_state(r->hash, name) != MEMBER_IN) {
+        done(c, MG_REMOVE, 0, "%s isn't in %s", name, label);
+        return;
+    }
+    if (is_admin(u->pk)) {
+        done(c, MG_REMOVE, 0, "%s is an admin, which lets them into every chat (hushd unadmin takes that away)", name);
+        return;
+    }
+    sqlite3_stmt *s = q(Q_DROP_MEMBER);
+    sqlite3_bind_blob(s, 1, r->hash, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    int ok = sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_reset(s);
+    if (!ok) {
+        done(c, MG_REMOVE, 0, "the server could not remove %s", name);
+        return;
+    }
+    note("%s: %s removed %s from %s", c->addr, c->name, name, label);
+    done(c, MG_REMOVE, 1, "removed %s from %s. If they come back, they wait for an admin again", name, label);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (!in_room(o, r->hash))
+            continue;
+        if (!strcmp(o->name, name))
+            send_error(o, "an admin removed you from this chat", 1);
+        else if (o->st == ST_READY)
+            send_peer(o, u->name, u->pk, PEER_REMOVED);
+    }
+}
+
+static void manage_ban(struct client *c, uint8_t op, const uint8_t *p, size_t n)
+{
+    char text[INET6_ADDRSTRLEN + 4], canon[INET6_ADDRSTRLEN + 4];
+    uint8_t ip[16];
+    if (text_get(p, n, text, sizeof text) != (int)n) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    if (ip_from_text(text, ip) != 0) {
+        done(c, op, 0, "%s isn't an IP address", text);
+        return;
+    }
+    ip_text(ip, canon, sizeof canon);
+    struct ban *b = ban_find(ip);
+    if (op == MG_UNBAN) {
+        if (!b) {
+            done(c, op, 0, "%s isn't banned", canon);
+            return;
+        }
+        struct ban keep = *b;
+        *b = bans[--nbans];
+        if (file_write(bans_path, bans_write) != 0) {
+            ban_add(&keep);
+            done(c, op, 0, "the server could not save the ban list");
+            return;
+        }
+        file_changed(bans_path, &bans_st);
+        note("%s: %s unbanned %s", c->addr, c->name, canon);
+        done(c, op, 1, "unbanned %s", canon);
+        return;
+    }
+    struct in6_addr a;
+    memcpy(&a, ip, sizeof a);
+    if (ip_loopback(&a)) {
+        done(c, op, 0, "%s is this machine itself. Behind a reverse proxy, start hushd with -x "
+                       "so it sees people's own addresses", canon);
+        return;
+    }
+    if (!memcmp(ip, c->ip, 16)) {
+        done(c, op, 0, "that's your own address");
+        return;
+    }
+    if (b) {
+        done(c, op, 0, "%s is already banned", canon);
+        return;
+    }
+    struct ban nb = { 0 };
+    memcpy(nb.ip, ip, 16);
+    nb.time = now_ms();
+    if (c->st != ST_HELLO)
+        strcpy(nb.by, c->name);
+    ban_add(&nb);
+    if (file_write(bans_path, bans_write) != 0) {
+        nbans--;
+        done(c, op, 0, "the server could not save the ban list");
+        return;
+    }
+    file_changed(bans_path, &bans_st);
+    note("%s: %s banned %s", c->addr, c->name, canon);
+    int k = drop_banned();
+    if (k)
+        done(c, op, 1, "banned %s and closed %d connection%s from it", canon, k, k == 1 ? "" : "s");
+    else
+        done(c, op, 1, "banned %s", canon);
+}
+
+/* Tell a chat's members something happened to it: a frame for clients that know it
+ * (protocol 2), a line of text for older ones. */
+static void tell_room(const uint8_t *room, uint8_t type, const void *p, size_t n, const char *old)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (!in_room(o, room) || o->st != ST_READY)
+            continue;
+        if (o->proto >= 2)
+            send_to(o, type, p, n);
+        else if (old)
+            send_error(o, old, 0);
+    }
+}
+
+static void manage_chat(struct client *c, uint8_t op, const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1], to[HUSH_NAME_MAX + 1];
+    int k = name_get(p, n, label), k2 = 0;
+    if (k >= 0 && op == MG_RENAME)
+        k2 = name_get(p + k, n - (size_t)k, to);
+    if (k < 0 || k2 < 0 || (size_t)k + (size_t)k2 != n) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    struct room *r = room_by_label(label);
+    if (!r || (r->old && op != MG_REVOKE)) {
+        done(c, op, 0, "there's no chat called %s", label);
+        return;
+    }
+    uint8_t hash[32];
+    memcpy(hash, r->hash, sizeof hash);
+    if (op == MG_CLEAR) {
+        if (delete_history(hash, 0) != 0) {
+            done(c, op, 0, "the server could not delete %s's history", label);
+            return;
+        }
+        note("%s: %s deleted the history of %s", c->addr, c->name, label);
+        done(c, op, 1, "deleted every message and image in %s", label);
+        tell_room(hash, T_CLEARED, NULL, 0, "an admin deleted this chat's history");
+    } else if (op == MG_RENAME) {
+        if (room_by_label(to)) {
+            done(c, op, 0, "there is already a chat called %s", to);
+            return;
+        }
+        strcpy(r->label, to);
+        if (file_write(keys_path, keys_write) != 0) {
+            strcpy(r->label, label);
+            done(c, op, 0, "the server could not save the new name");
+            return;
+        }
+        file_changed(keys_path, &keys_st);
+        note("%s: %s renamed %s to %s", c->addr, c->name, label, to);
+        done(c, op, 1, "%s is now called %s", label, to);
+        struct buf b = { 0 };
+        name_put(&b, to);
+        tell_room(hash, T_RENAMED, b.data, b.len, NULL);
+        buf_free(&b);
+    } else { /* MG_REVOKE */
+        struct room keep = *r;
+        *r = rooms[--nrooms];
+        if (file_write(keys_path, keys_write) != 0) {
+            room_add(&keep);
+            done(c, op, 0, "the server could not save the list of chats");
+            return;
+        }
+        file_changed(keys_path, &keys_st);
+        int gone = keep.old ? 0 : delete_history(hash, 1);
+        note("%s: %s deleted the chat %s", c->addr, c->name, label);
+        done(c, op, 1, "deleted the chat %s%s", label,
+             gone ? ". Its key no longer works, but its history couldn't be deleted (see the server log)" : "");
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (in_room(clients[i], hash))
+                send_error(clients[i], "this chat's key was revoked", 1);
+    }
+}
+
+static void manage_decide(struct client *c, const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1], name[HUSH_NAME_MAX + 1];
+    int k = name_get(p, n, label);
+    if (k < 0 || n - (size_t)k < 2 || p[k] > 1 || name_get(p + k + 1, n - (size_t)k - 1, name) != (int)(n - (size_t)k - 1)) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    int approve = p[k];
+    struct room *r = chat_or_done(c, MG_DECIDE, label);
+    if (!r)
+        return;
+    if (decide(r->hash, name, approve) != 0) {
+        done(c, MG_DECIDE, 0, "%s isn't waiting to join %s", name, label);
+        return;
+    }
+    note("%s: %s %s %s for %s", c->addr, c->name, approve ? "approved" : "denied", name, label);
+    done(c, MG_DECIDE, 1, approve ? "let %s into %s" : "turned %s away from %s", name, label);
+}
+
+static void manage_list(struct client *c, const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1];
+    if (n < 1 || p[0] > LIST_BANS || (p[0] != LIST_MEMBERS && n != 1) ||
+        (p[0] == LIST_MEMBERS && name_get(p + 1, n - 1, label) != (int)n - 1)) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    if (p[0] == LIST_SESSIONS)
+        list_sessions(c);
+    else if (p[0] == LIST_CHATS)
+        list_chats(c);
+    else if (p[0] == LIST_BANS)
+        list_bans(c);
+    else {
+        struct room *r = chat_or_done(c, MG_LIST, label);
+        if (r)
+            list_members(c, r);
+    }
+}
+
 /* Admins manage chats, members, sessions and bans, from a chat or from the
  * admin-only login. Each request gets one answer: a DONE, or ITEMs and a LIST_END. */
 static void on_manage(struct client *c, const uint8_t *p, size_t n)
@@ -1422,8 +2019,21 @@ static void on_manage(struct client *c, const uint8_t *p, size_t n)
     }
     if (!take_request(c))
         return;
-    if (op == MG_SHARE)
-        manage_share(c, p + 1, n - 1);
+    p++, n--;
+    if (op == MG_LIST)
+        manage_list(c, p, n);
+    else if (op == MG_KICK)
+        manage_kick(c, p, n);
+    else if (op == MG_REMOVE)
+        manage_remove(c, p, n);
+    else if (op == MG_BAN || op == MG_UNBAN)
+        manage_ban(c, op, p, n);
+    else if (op == MG_SHARE)
+        manage_share(c, p, n);
+    else if (op == MG_CLEAR || op == MG_RENAME || op == MG_REVOKE)
+        manage_chat(c, op, p, n);
+    else if (op == MG_DECIDE)
+        manage_decide(c, p, n);
     else
         send_error(c, "malformed request", 1);
 }
@@ -1481,6 +2091,11 @@ static void http_read(struct client *c)
         struct in6_addr a;
         if (ip_parse(s, &a) == 0)
             ip_use(c, &a);
+        if (ban_find(c->ip)) {
+            http_error(&c->out, 403);
+            finish_http(c);
+            return;
+        }
         struct limit *l = limit_get(c->ip);
         if (l->conn < 1 || (ws && l->conns >= IP_CONNS)) {
             http_error(&c->out, 429);
@@ -1644,16 +2259,18 @@ static void client_close(int i)
 }
 
 /* Refuse a connection before it gets a slot, with a one-line reason. */
-static void refuse(int fd, int web)
+static void refuse(int fd, int web, int banned)
 {
-    static const char http[] = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n"
-                               "Connection: close\r\n\r\n";
-    static const char msg[] = "too many connections from your address; try again later";
+    static const char busy[] = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    static const char forbidden[] = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const char *msg = banned ? "this server doesn't accept connections from your address"
+                             : "too many connections from your address; try again later";
     if (web) {
-        send(fd, http, sizeof http - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+        const char *h = banned ? forbidden : busy;
+        send(fd, h, strlen(h), MSG_NOSIGNAL | MSG_DONTWAIT);
     } else {
         struct buf b = { 0 };
-        frame_put(&b, T_ERROR, msg, sizeof msg - 1);
+        frame_put(&b, T_ERROR, msg, strlen(msg));
         send(fd, b.data, b.len, MSG_NOSIGNAL | MSG_DONTWAIT);
         buf_free(&b);
     }
@@ -1676,7 +2293,7 @@ static void accept_client(int lfd, int web)
             if (!clients[i])
                 slot = i;
         if (slot < 0) {
-            refuse(fd, web);
+            refuse(fd, web, 0);
             continue;
         }
         struct client *c = calloc(1, sizeof *c);
@@ -1685,13 +2302,14 @@ static void accept_client(int lfd, int web)
         struct in6_addr a;
         sa_to_in6(&ss, &a);
         ip_use(c, &a);
-        /* Behind a local reverse proxy, limits apply once the request says who it's for. */
+        /* Behind a local reverse proxy, limits and bans apply once the request says who it's for. */
         c->proxied = web && trust_proxy && ip_loopback(&a);
         if (!c->proxied) {
             struct limit *l = limit_get(c->ip);
-            if (l->conns >= IP_CONNS || l->conn < 1) {
+            int banned = ban_find(c->ip) != NULL;
+            if (banned || l->conns >= IP_CONNS || l->conn < 1) {
                 free(c);
-                refuse(fd, web);
+                refuse(fd, web, banned);
                 continue;
             }
             l->conn -= 1;
@@ -1699,6 +2317,8 @@ static void accept_client(int lfd, int web)
             c->counted = 1;
         }
         c->fd = fd;
+        c->id = ++last_session_id;
+        c->connected = now_ms();
         c->up_fd = c->dl_fd = -1;
         c->st = web ? ST_HTTP : ST_HELLO;
         c->deadline = time(NULL) + (web ? HTTP_TIMEOUT : AUTH_TIMEOUT);
@@ -1823,37 +2443,6 @@ static void cmd_newkey(const char *label)
     sodium_memzero(token, sizeof token);
 }
 
-/* Delete a chat's messages and images (and, with members, its member list). */
-static void delete_history(const uint8_t *room, int members)
-{
-    sqlite3_stmt *s;
-    db_exec("BEGIN IMMEDIATE");
-    if (sqlite3_prepare_v2(db, "SELECT id FROM blobs WHERE room = ?1", -1, &s, NULL) != SQLITE_OK)
-        die("database: %s", sqlite3_errmsg(db));
-    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        char path[128];
-        if (sqlite3_column_bytes(s, 0) != HUSH_BLOB_ID)
-            continue;
-        blob_path(sqlite3_column_blob(s, 0), path, sizeof path);
-        unlink(path);
-    }
-    sqlite3_finalize(s);
-    /* With the messages gone their ids can be used again, so a member's since has to go too */
-    const char *const del[] = { "DELETE FROM blobs WHERE room = ?1", "DELETE FROM messages WHERE room = ?1",
-                                members ? "DELETE FROM members WHERE room = ?1"
-                                        : "UPDATE members SET since = 0 WHERE room = ?1" };
-    for (int i = 0; i < 3; i++) {
-        if (sqlite3_prepare_v2(db, del[i], -1, &s, NULL) != SQLITE_OK)
-            die("database: %s", sqlite3_errmsg(db));
-        sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
-        if (sqlite3_step(s) != SQLITE_DONE)
-            die("database: %s", sqlite3_errmsg(db));
-        sqlite3_finalize(s);
-    }
-    db_exec("COMMIT");
-}
-
 static void cmd_keys(void)
 {
     int stored = db_exists();
@@ -1905,7 +2494,8 @@ static void cmd_revoke(const char *label)
     memcpy(hash, r->hash, sizeof hash);
     *r = rooms[--nrooms];
     file_replace(keys_path, keys_write);
-    delete_history(hash, 1);
+    if (delete_history(hash, 1) != 0)
+        die("revoked %s, but deleting its history failed: %s", label, sqlite3_errmsg(db));
     printf("revoked %s and deleted its history; a running hushd disconnects everyone in it\n", label);
 }
 
@@ -1915,7 +2505,8 @@ static void cmd_clear(const char *label)
     struct room *r = label ? room_by_label(label) : NULL;
     if (!r)
         die("no key called %s (see hushd keys)", label ? label : "?");
-    delete_history(r->hash, 0);
+    if (delete_history(r->hash, 0) != 0)
+        die("deleting %s's history failed: %s", label, sqlite3_errmsg(db));
     printf("deleted every message and image in %s; the key still works\n", label);
 }
 
@@ -2039,6 +2630,55 @@ static void cmd_decide(const char *label, const char *name, int approve)
            approve ? "is in" : "was turned away");
 }
 
+static void cmd_ban(const char *text, int add)
+{
+    uint8_t ip[16];
+    char canon[INET6_ADDRSTRLEN + 4];
+    if (!text || ip_from_text(text, ip) != 0)
+        die("give an IP address, e.g. hushd %s 203.0.113.9 (IPv6 counts per /64)", add ? "ban" : "unban");
+    ip_text(ip, canon, sizeof canon);
+    struct in6_addr a;
+    memcpy(&a, ip, sizeof a);
+    bans_load();
+    struct ban *b = ban_find(ip);
+    if (add && ip_loopback(&a))
+        die("%s is this machine itself. Behind a reverse proxy, start hushd with -x so it sees people's own "
+            "addresses", canon);
+    if (add && b)
+        die("%s is already banned", canon);
+    if (!add && !b)
+        die("%s isn't banned (see hushd bans)", canon);
+    if (add) {
+        struct ban nb = { 0 };
+        memcpy(nb.ip, ip, 16);
+        nb.time = now_ms();
+        ban_add(&nb);
+    } else {
+        *b = bans[--nbans];
+    }
+    file_replace(bans_path, bans_write);
+    if (add)
+        printf("banned %s; a running hushd closes its connections and refuses new ones\n", canon);
+    else
+        printf("unbanned %s\n", canon);
+}
+
+static void cmd_bans(void)
+{
+    bans_load();
+    if (!nbans)
+        printf("nobody is banned\n");
+    for (size_t i = 0; i < nbans; i++) {
+        char t[INET6_ADDRSTRLEN + 4], when[32] = "";
+        ip_text(bans[i].ip, t, sizeof t);
+        time_t sec = (time_t)(bans[i].time / 1000);
+        struct tm tm;
+        if (bans[i].time && localtime_r(&sec, &tm))
+            strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tm);
+        printf("%-24s  %s%s%s\n", t, when, *bans[i].by ? "  by " : "", bans[i].by);
+    }
+}
+
 static void cmd_share(const char *label, const char *name, const char *days_text)
 {
     struct room *r = room_or_die(label);
@@ -2153,7 +2793,7 @@ static void cmd_backup(const char *dir)
         die("cannot snapshot %s: %s", db_path, sqlite3_errmsg(db));
     sqlite3_finalize(s);
 
-    const char *files[] = { keys_path, users_path, admins_path };
+    const char *files[] = { keys_path, users_path, admins_path, bans_path };
     for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
         snprintf(path, sizeof path, "%s/%s", dir, files[i]);
         if (copy_file(files[i], path) < 0)
@@ -2179,7 +2819,7 @@ static void cmd_backup(const char *dir)
         images += k == 0; /* 1: deleted since the listing */
     }
     closedir(d);
-    printf("backed up the database, keys, users, admins and %ld images to %s\n"
+    printf("backed up the database, keys, users, admins, bans and %ld images to %s\n"
            "To restore, stop hushd and run it with -C pointing at a copy of that folder.\n",
            images, dir);
 }
@@ -2349,6 +2989,8 @@ static void usage(void)
             "       hushd [options] approve CHAT USER, deny CHAT USER\n"
             "       hushd [options] share CHAT USER [DAYS]  let USER see the chat's history from\n"
             "                    before they joined: all of it, or the last DAYS days\n"
+            "       hushd [options] ban ADDRESS, unban ADDRESS   refuse an IP address (IPv6: its /64)\n"
+            "       hushd [options] bans         list banned addresses\n"
             "       hushd [options] export CHAT DIR   decrypt a chat into DIR (asks for its key)\n"
             "       hushd [options] backup DIR   copy everything hushd keeps into DIR, safe while it runs\n"
             "options:\n"
@@ -2359,8 +3001,8 @@ static void usage(void)
             "  -x            trust X-Forwarded-For from a reverse proxy on this machine\n"
             "  -L n          chat sessions per address, 1 to %d (default %d)\n"
             "  -V            print the version\n"
-            "files, relative to -C: %s (chat key hashes), %s, %s, %s, %s/\n",
-            IP_CONNS, IP_CONNS, keys_path, users_path, admins_path, db_path, blob_dir);
+            "files, relative to -C: %s (chat key hashes), %s, %s, %s, %s, %s/\n",
+            IP_CONNS, IP_CONNS, keys_path, users_path, admins_path, bans_path, db_path, blob_dir);
     exit(2);
 }
 
@@ -2425,6 +3067,14 @@ int main(int argc, char **argv)
             cmd_admins();
             return 0;
         }
+        if (!strcmp(cmd, "ban") || !strcmp(cmd, "unban")) {
+            cmd_ban(arg, !strcmp(cmd, "ban"));
+            return 0;
+        }
+        if (!strcmp(cmd, "bans") && !arg) {
+            cmd_bans();
+            return 0;
+        }
         db_open_existing();
         if (!strcmp(cmd, "pending") && !arg)
             cmd_pending();
@@ -2456,9 +3106,11 @@ int main(int argc, char **argv)
     users_load();
     keys_load();
     admins_load();
+    bans_load();
     file_changed(users_path, &users_st);
     file_changed(keys_path, &keys_st);
     file_changed(admins_path, &admins_st);
+    file_changed(bans_path, &bans_st);
 
     int web = strcmp(web_port, "0") != 0;
     if (web) {
@@ -2525,14 +3177,22 @@ int main(int argc, char **argv)
                 pump_downloads(c);
         }
 
-        /* Pick up `hushd newkey/revoke/forget/admin/approve` run while we're up. */
+        /* Pick up `hushd newkey/revoke/forget/admin/approve/ban` run while we're up. */
         if (file_changed(users_path, &users_st))
             users_load();
         if (file_changed(admins_path, &admins_st)) {
             admins_load();
-            for (int i = 0; i < MAX_CLIENTS; i++)
-                if (clients[i] && clients[i]->st == ST_READY)
-                    clients[i]->admin = is_admin(clients[i]->pk);
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                struct client *c = clients[i];
+                if (c && (c->st == ST_READY || c->st == ST_ADMIN))
+                    c->admin = is_admin(c->pk);
+                if (c && c->st == ST_ADMIN && !c->admin)
+                    send_error(c, "you're not an admin any more", 1);
+            }
+        }
+        if (file_changed(bans_path, &bans_st)) {
+            bans_load();
+            drop_banned();
         }
         for (int i = 0; i < MAX_CLIENTS; i++)
             if (clients[i] && !clients[i]->dead && clients[i]->st == ST_WAITING)

@@ -17,6 +17,9 @@ export UBSAN_OPTIONS="log_path=$T/san/ubsan:print_stacktrace=1:${UBSAN_OPTIONS:-
 check() { # file pattern description
     if grep -qaF -- "$2" "$1"; then echo "ok   - $3"; else echo "FAIL - $3"; echo "---- $1:"; cat "$1"; fail=1; fi
 }
+checkre() { # file extended-regex description
+    if grep -qaE -- "$2" "$1"; then echo "ok   - $3"; else echo "FAIL - $3"; echo "---- $1:"; cat "$1"; fail=1; fi
+}
 absent() { # file pattern description
     if grep -qaF -- "$2" "$1"; then echo "FAIL - $3"; echo "---- $1:"; cat "$1"; fail=1; else echo "ok   - $3"; fi
 }
@@ -436,7 +439,7 @@ if command -v node >/dev/null; then
     sleep 1 | client alice a "$KW" >"$T/alice-webclub.out" 2>&1
     check "$T/alice-webclub.out" "chat: webclub" "...whose key works in the terminal"
     (sleep 1; echo "/newchat nope"; sleep 1) | web wendy >"$T/wendy-new.out" 2>&1
-    check "$T/wendy-new.out" "only an admin can create chats" "people who aren't admins can't create chats"
+    check "$T/wendy-new.out" "only an admin can create or manage chats" "people who aren't admins can't create chats"
     absent "$T/wendy-my.json" "hello from a terminal"      "...and not other people's"
     (sleep 1; echo "/save $T/web-saved.jpg"; sleep 1.5) | web wally >"$T/walter.out" 2>&1
     check  "$T/walter.out" "wendy: hello from a browser"   "web client gets history"
@@ -572,6 +575,130 @@ check "$T/alice-twice.out"  "already connected as alice"         "one session pe
 check "$T/carol-cap.out"    "allows 2 chat sessions per address" "-L caps chat sessions per address"
 check "$T/admin-login.out"  "admin login: CHALLENGE"             "...but logging in only to manage chats isn't counted"
 check "$T/carol-cap2.out"   "chat: main"                         "...and a slot frees up when someone leaves"
+
+# Admins manage the server from a chat or from the home page: who's connected, members and
+# their history, kicks, removals, bans and chats. Behind -x, so web clients can come from
+# addresses other than this machine's, which can't be banned.
+kill $srv
+wait $srv 2>/dev/null
+S="$T/s7"
+mkdir -p "$S"
+cp "$T/s1/hushd-keys.txt" "$T/s1/hushd-admins.txt" "$S/"
+server "$S" -x
+sleep 1 | client alice a >/dev/null 2>&1 # alice is in main
+(sleep 0.5; echo "before amy"; sleep 0.5) | client alice a >/dev/null 2>&1
+(sleep 12) | client amy am >"$T/amy-mg.out" 2>&1 &
+m=$!
+(sleep 12) | client carol c >"$T/carol-mg.out" 2>&1 &
+c=$!
+sleep 0.7
+admin approve main amy >/dev/null
+sleep 0.5
+(sleep 0.7; echo "/sessions"; echo "/members"; echo "/chats"; sleep 1) | client alice a >"$T/alice-mg.out" 2>&1
+checkre "$T/alice-mg.out" "#[0-9]+ +amy +in main  terminal  127\.0\.0\.1  since" "/sessions lists who's connected, in which chat, from where"
+checkre "$T/alice-mg.out" "amy +[0-9a-f ]{39}  in, online, sees history after" "/members shows when a member's history starts"
+checkre "$T/alice-mg.out" "alice +[0-9a-f ]{39}  in, online, admin, sees all history" "...and that admins see all of it"
+checkre "$T/alice-mg.out" "main +[0-9]+ members, 0 waiting, [0-9]+ online, 1 messages" "/chats lists chats with their numbers"
+id=$(sed -n 's/^  #\([0-9]*\) *carol .*/\1/p' "$T/alice-mg.out" | head -1)
+(sleep 3.5) | client bob b >"$T/bob-mg.out" 2>&1 &
+b=$!
+sleep 0.5
+(sleep 0.7; echo "/kick $id"; echo "/remove amy"; echo "/remove bob"; echo "/kick 99999"; sleep 1.5) |
+    client alice a >"$T/alice-mg2.out" 2>&1
+wait $b $m $c
+check "$T/alice-mg2.out" "disconnected carol (127.0.0.1)"  "/kick disconnects a session"
+check "$T/carol-mg.out"  "an admin disconnected you"       "...which is told why"
+check "$T/alice-mg2.out" "removed amy from main"           "/remove takes someone out of a chat"
+check "$T/amy-mg.out"    "an admin removed you from this chat" "...and disconnects them"
+check "$T/bob-mg.out"    "amy was removed from the chat"   "...and the others are told"
+check "$T/alice-mg2.out" "bob is an admin"                 "admins can't be removed"
+check "$T/alice-mg2.out" "that session isn't connected"    "kicking a session that's gone says so"
+# not through client(), so $! is hush itself and the kill reaches it
+HOME="$T/home" XDG_DATA_HOME="$T/am" ./hush -n amy -k "$K1" 127.0.0.1 "$PORT" >"$T/amy-mg2.out" 2>&1 </dev/null &
+m=$!
+sleep 1.5
+kill $m
+wait $m 2>/dev/null
+check "$T/amy-mg2.out"   "on the waitlist"                 "someone removed waits to be let in again"
+
+if command -v node >/dev/null; then
+    webx() { # address name [key]: a web client behind the proxy, from address
+        HUSH_TEST_XFF=$1 web "$2" "${3:-$K1}"
+    }
+    admin admin "$(fingerprint "$T/web-wally.id")" >/dev/null
+    # "Manage server": an admin logs in without a chat
+    (sleep 1; echo "/mg chats"; echo "/mg members main"; echo "/mg sessions"; sleep 1) | web wally - >"$T/wally-mg.out" 2>&1
+    check "$T/wally-mg.out" "managing"                     "an admin can log in just to manage"
+    check "$T/wally-mg.out" 'chats: {"label":"main"'       "...and list the chats"
+    check "$T/wally-mg.out" '"name":"amy","fp":'           "...and a chat's members, from outside it"
+    check "$T/wally-mg.out" '"you":true'                   "...and the sessions, theirs marked"
+    (sleep 1; echo "/mg sessions"; sleep 1) | web wendy - >"$T/wendy-mg.out" 2>&1
+    check "$T/wendy-mg.out" "only an admin can create or manage chats" "people who aren't admins can't"
+    (sleep 1; echo "/mg sessions"; sleep 1.5) | web wendy >"$T/wendy-mg2.out" 2>&1 &
+    w=$!
+    sleep 0.8
+    admin approve main wendy >/dev/null
+    wait $w
+    check "$T/wendy-mg2.out" "failed: only an admin can do that" "...not from inside a chat either"
+    (sleep 3) | client amy am >"$T/amy-mg3.out" 2>&1 &
+    m=$!
+    (sleep 1; echo "/mg decide main amy 1"; echo "/mg decide main zed 1"; sleep 1) | web wally - >"$T/wally-mg2.out" 2>&1
+    wait $m
+    check "$T/wally-mg2.out" "done: let amy into main"     "an admin lets someone in from the server page"
+    check "$T/amy-mg3.out"   "chat: main"                  "...right away"
+    check "$T/wally-mg2.out" "failed: zed isn't waiting"   "...and only people who asked to"
+
+    # Bans: wendy at 203.0.113.9 is banned while connected, then refused
+    (sleep 6) | webx 203.0.113.9 wendy >"$T/wendy-ban.out" 2>&1 &
+    w=$!
+    sleep 1.5
+    (sleep 1; echo "/mg ban 203.0.113.9"; echo "/mg ban 198.51.100.1"; echo "/mg ban 127.0.0.1"; echo "/mg ban 2001:db8:1:2::5";
+     echo "/mg ban nonsense"; echo "/mg bans"; sleep 1) | webx 198.51.100.1 wally - >"$T/wally-ban.out" 2>&1
+    wait $w
+    {
+        echo "banned $(code -H "X-Forwarded-For: 203.0.113.9" "$B/") $(code -H "X-Forwarded-For: 2001:db8:1:2:ffff::1" "$B/")"
+        echo "others $(code -H "X-Forwarded-For: 203.0.113.10" "$B/") $(code -H "X-Forwarded-For: 2001:db8:1:3::1" "$B/")"
+    } >"$T/ban-http.out"
+    check "$T/wally-ban.out" "done: banned 203.0.113.9 and closed 1 connection" "an admin bans an address"
+    check "$T/wendy-ban.out" "no longer accepts connections from your address" "...which is disconnected"
+    check "$T/ban-http.out"  "banned 403 403"            "...and refused, IPv6 for its whole /64"
+    check "$T/ban-http.out"  "others 200 200"            "...but not its neighbours"
+    check "$T/wally-ban.out" "failed: that's your own address" "admins can't ban themselves"
+    check "$T/wally-ban.out" "127.0.0.1 is this machine itself" "...or this machine"
+    check "$T/wally-ban.out" "failed: nonsense isn't an IP address" "...or something that isn't an address"
+    check "$T/wally-ban.out" '"address":"2001:db8:1:2::/64"' "bans are listed"
+    check "$S/hushd-bans.txt" "203.0.113.9"              "...and kept in hushd-bans.txt"
+    admin ban 203.0.113.50 >/dev/null
+    echo "203.0.113.77   # added by hand" >>"$S/hushd-bans.txt"
+    sleep 1.2
+    admin bans >"$T/bans.out"
+    echo "cli $(code -H "X-Forwarded-For: 203.0.113.50" "$B/") $(code -H "X-Forwarded-For: 203.0.113.77" "$B/")" >>"$T/ban-http.out"
+    admin unban 203.0.113.9 >/dev/null
+    sleep 1.2
+    echo "unbanned $(code -H "X-Forwarded-For: 203.0.113.9" "$B/")" >>"$T/ban-http.out"
+    checkre "$T/bans.out"   "203\.0\.113\.9 +[0-9-]+ [0-9:]+  by wally" "hushd bans lists bans, and who made them"
+    check "$T/ban-http.out" "cli 403 403"                "hushd ban works on a running server, and so does editing the file"
+    check "$T/ban-http.out" "unbanned 200"               "...and so does hushd unban"
+
+    # Chats: history cleared, renamed and deleted while someone's in them
+    (sleep 0.5; echo "in the club"; sleep 0.5) | client bob b "$KC" >/dev/null 2>&1
+    (sleep 9) | client alice a "$KC" >"$T/alice-club.out" 2>&1 &
+    a=$!
+    (sleep 1.5; echo "/mg clear club"; sleep 0.5; echo "/mg rename club climbers"; echo "/mg rename climbers main"; sleep 0.5;
+     echo "/mg members climbers"; sleep 1) | web wally - >"$T/wally-chat.out" 2>&1
+    sleep 1 | client bob b "$KC" >"$T/bob-club.out" 2>&1
+    (sleep 1; echo "/mg revoke climbers"; sleep 1) | web wally - >>"$T/wally-chat.out" 2>&1
+    wait $a
+    check  "$T/wally-chat.out" "done: deleted every message and image in club" "an admin clears a chat's history"
+    check  "$T/alice-club.out" "an admin deleted this chat's history" "...people in it are told"
+    absent "$T/bob-club.out"   "in the club"              "...and it's gone"
+    check  "$T/wally-chat.out" "done: club is now called climbers" "an admin renames a chat"
+    check  "$T/alice-club.out" "this chat is now called climbers" "...people in it are told"
+    check  "$T/bob-club.out"   "chat: climbers"           "...and its key still works"
+    check  "$T/wally-chat.out" "there is already a chat called main" "...but not to a name that's taken"
+    check  "$T/wally-chat.out" "done: deleted the chat climbers" "an admin deletes a chat"
+    check  "$T/alice-club.out" "key was revoked"          "...and everyone in it is disconnected"
+fi
 
 # Hostile input and a crash, on a fresh server so the rate limits above don't get in the way.
 kill $srv

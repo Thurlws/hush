@@ -10,7 +10,8 @@ const T = {
 };
 export const MG = { LIST: 0, KICK: 1, REMOVE: 2, BAN: 3, UNBAN: 4, SHARE: 5, CLEAR: 6, REVOKE: 7, RENAME: 8, DECIDE: 9 };
 const HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2, WELCOME_ADMIN = 1;
-const PEER_ONLINE = 1, PEER_NEW = 2, UP_FIRST = 1, UP_LAST = 2, BLOB_LAST = 1, BLOB_MISSING = 2;
+const PEER_ONLINE = 1, PEER_NEW = 2, PEER_REMOVED = 4, UP_FIRST = 1, UP_LAST = 2, BLOB_LAST = 1, BLOB_MISSING = 2;
+export const LIST = { SESSIONS: 0, CHATS: 1, MEMBERS: 2, BANS: 3 };
 const KIND_TEXT = 0, KIND_IMAGE = 1, VERSION = 3, PROTOCOL = 2; // PROTOCOL matches HUSH_PROTO
 const AUTH_CONTEXT = "hush-auth-v3", MSG_CONTEXT = "hush-msg-v3";
 const NONCE = 24, MAC = 16, SIG = 64, HEAD = 26, CHUNK = 48 * 1024;
@@ -89,6 +90,7 @@ function concat(...parts) {
 }
 
 const u16 = v => Uint8Array.of(v >> 8, v & 255);
+const u32v = v => Uint8Array.of(v >>> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255);
 const u32 = v => Uint8Array.of(v >>> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255);
 const view = p => new DataView(p.buffer, p.byteOffset, p.byteLength);
 const nameBytes = name => { const b = enc.encode(name); return concat(Uint8Array.of(b.length), b); };
@@ -99,6 +101,128 @@ function readName(p, off = 0, emptyOk = false) {
   if (p[off] === 0) return emptyOk ? ["", off + 1] : null;
   const s = dec.decode(p.subarray(off + 1, off + 1 + p[off]));
   return NAME_RE.test(s) ? [s, off + 1 + p[off]] : null;
+}
+
+// [text, offset after it] for a u8-length printable ASCII field (addresses), or null.
+function readText(p, off, emptyOk = false) {
+  if (off >= p.length || off + 1 + p[off] > p.length || (!p[off] && !emptyOk)) return null;
+  const t = dec.decode(p.subarray(off + 1, off + 1 + p[off]));
+  return /^[\x21-\x7e]*$/.test(t) ? [t, off + 1 + p[off]] : null;
+}
+
+// Admin requests (MANAGE), for an admin in a chat or logged in only to manage (AdminLink).
+// The server answers each one in order: a list with ITEMs and a LIST_END, anything else
+// with a DONE. Every method returns a promise: the list, or the server's sentence.
+export class Manager {
+  constructor(sodium, send) {
+    this.s = sodium;
+    this.send = send;
+    this.waiting = [];
+  }
+
+  request(op, ...args) {
+    return new Promise((resolve, reject) => {
+      this.waiting.push({ resolve, reject, items: [] });
+      this.send(T.MANAGE, Uint8Array.of(op), ...args);
+    });
+  }
+
+  list(what, chat = null) { return this.request(MG.LIST, Uint8Array.of(what), ...(chat === null ? [] : [nameBytes(chat)])); }
+  sessions() { return this.list(LIST.SESSIONS); }
+  chats() { return this.list(LIST.CHATS); }
+  members(chat) { return this.list(LIST.MEMBERS, chat); }
+  bans() { return this.list(LIST.BANS); }
+  kick(id) { return this.request(MG.KICK, u32v(id)); }
+  remove(chat, name) { return this.request(MG.REMOVE, nameBytes(chat), nameBytes(name)); }
+  ban(address) { return this.request(MG.BAN, nameBytes(address)); }
+  unban(address) { return this.request(MG.UNBAN, nameBytes(address)); }
+  share(chat, name, days = 0) { return this.request(MG.SHARE, nameBytes(chat), nameBytes(name), u16(days)); }
+  clear(chat) { return this.request(MG.CLEAR, nameBytes(chat)); }
+  revoke(chat) { return this.request(MG.REVOKE, nameBytes(chat)); }
+  rename(chat, label) { return this.request(MG.RENAME, nameBytes(chat), nameBytes(label)); }
+  decide(chat, name, approve) { return this.request(MG.DECIDE, nameBytes(chat), Uint8Array.of(approve ? 1 : 0), nameBytes(name)); }
+
+  // A frame for us? Returns true if it was.
+  onFrame(type, p) {
+    const w = this.waiting[0];
+    if (type === T.ITEM) {
+      const item = this.item(p);
+      if (w && item) w.items.push(item);
+    } else if (type === T.LIST_END) {
+      if (w) { this.waiting.shift(); w.resolve(w.items); }
+    } else if (type === T.DONE && p.length >= 2) {
+      const text = clean(dec.decode(p.subarray(2)));
+      if (w) { this.waiting.shift(); if (p[1]) w.resolve(text); else w.reject(new Error(text)); }
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  fail(err) {
+    for (const w of this.waiting.splice(0)) w.reject(err);
+  }
+
+  item(p) {
+    const v = p.length ? view(p) : null, big = o => Number(v.getBigUint64(o));
+    if (p[0] === LIST.SESSIONS && p.length >= 14) {
+      const a = readText(p, 14), n = a && readName(p, a[1], true), c = n && readName(p, n[1], true);
+      if (!c || c[1] !== p.length) return null;
+      const f = p[5];
+      return { id: v.getUint32(1), web: !!(f & 1), admin: !!(f & 2), waiting: !!(f & 4), you: !!(f & 8), login: !!(f & 16),
+               connected: big(6), address: a[0], name: n[0], chat: c[0] };
+    }
+    if (p[0] === LIST.CHATS) {
+      const l = readName(p, 1);
+      if (!l || p.length - l[1] !== 37) return null;
+      const o = l[1];
+      return { label: l[0], old: p[o] === 1, members: v.getUint32(o + 1), waiting: v.getUint32(o + 5),
+               online: v.getUint32(o + 9), messages: big(o + 13), images: big(o + 21), bytes: big(o + 29) };
+    }
+    if (p[0] === LIST.MEMBERS) {
+      const n = readName(p, 1);
+      if (!n || p.length - n[1] !== 50) return null;
+      const o = n[1];
+      return { name: n[0], fp: fingerprint(this.s, p.subarray(o, o + 32)), state: ["waiting", "in", "out"][p[o + 32]] || "out",
+               online: !!(p[o + 33] & 1), admin: !!(p[o + 33] & 2), joined: big(o + 34), after: big(o + 42) };
+    }
+    if (p[0] === LIST.BANS) {
+      const a = readText(p, 1), b = a && a[1] + 8 <= p.length && readName(p, a[1] + 8, true);
+      if (!b || b[1] !== p.length) return null;
+      return { address: a[0], time: big(a[1]), by: b[0] };
+    }
+    return null;
+  }
+}
+
+// Admins: log in without a chat, to manage the server (the home page's "Manage server").
+// Events: ready, closed {error}. Requests go through .manage once ready.
+export class AdminLink {
+  constructor({ sodium, url, name, secretKey, WebSocket: WS = globalThis.WebSocket }, onEvent) {
+    this.s = sodium;
+    this.ready = false;
+    this.lastError = null;
+    this.manage = new Manager(sodium, (type, ...parts) => {
+      if (this.ws.readyState === 1) this.ws.send(concat(Uint8Array.of(type), ...parts));
+    });
+    this.ws = new WS(url);
+    this.ws.binaryType = "arraybuffer";
+    const send = (type, ...parts) => this.ws.send(concat(Uint8Array.of(type), ...parts));
+    this.ws.onopen = () => send(T.HELLO, nameBytes(name), publicKey(secretKey), new Uint8Array(32), Uint8Array.of(PROTOCOL));
+    this.ws.onmessage = e => {
+      const f = new Uint8Array(e.data), type = f[0], p = f.subarray(1);
+      if (type === T.ERROR) this.lastError = clean(dec.decode(p));
+      else if (this.ready) this.manage.onFrame(type, p);
+      else if (type === T.CHALLENGE && p.length === 32) send(T.AUTH, sodium.crypto_sign_detached(concat(enc.encode(AUTH_CONTEXT), p), secretKey));
+      else if (type === T.ADMIN) { this.ready = true; onEvent({ type: "ready" }); }
+    };
+    this.ws.onclose = () => {
+      this.manage.fail(new Error(this.lastError || "disconnected"));
+      onEvent({ type: "closed", error: this.lastError });
+    };
+  }
+
+  close() { this.ws.close(); }
 }
 
 // Admins: create a chat without being in one (the home page's "Create your
@@ -142,7 +266,9 @@ export function createChat({ sodium, url, name, secretKey, WebSocket: WS = globa
 //   message {msg}             a new message (msg: see openMessage)
 //   history {messages, dir, more}   a page of stored messages, oldest first
 //   shared {days}             an admin let you see more history (days, or 0 for all of it). It loads as history
-//   done {op, ok, text}       admins: what an admin request did
+//   removed {name}            an admin removed name from the chat
+//   cleared {}                an admin deleted the chat's history
+//   renamed {label}           the chat has a new name
 //   notice {level: "info"|"warn", text}
 //   error {text}              the server refused something
 //   closed {error, wasReady, quit}  error is set if the server refused us
@@ -172,6 +298,7 @@ export class Session {
     this.upload = null;
     this.admin = false;
     this.pending = new Map(); // admins: name -> fingerprint of people waiting
+    this.manage = new Manager(sodium, (type, ...parts) => this.send(type, ...parts));
     this.exporting = null;
     this.fetches = new Map(); // blob id hex -> {image, resolve, reject, parts, size}
     this.fetchQueue = [];
@@ -186,6 +313,7 @@ export class Session {
       if (this.exporting) this.exporting.reject(err);
       for (const f of this.fetches.values()) f.reject(err);
       for (const f of this.fetchQueue) f.reject(err);
+      this.manage.fail(err);
       this.fetches.clear();
       this.fetchQueue = [];
       this.emit({ type: "closed", wasReady: this.ready, quit: this.quit,
@@ -247,8 +375,15 @@ export class Session {
     else if (type === T.UPLOADED && p.length === 16 && this.upload) this.upload.resolve(p.slice());
     else if (type === T.BLOB && p.length >= 17) this.onBlob(p);
     else if (type === T.PENDING) this.onPending(p);
-    else if (type === T.DONE && p.length >= 2) this.emit({ type: "done", op: p[0], ok: p[1] === 1, text: clean(dec.decode(p.subarray(2))) });
-    else if (type === T.SHARED && p.length === 2) {
+    else if (this.manage.onFrame(type, p)) { /* an admin request's answer */ }
+    else if (type === T.CLEARED) {
+      this.oldestId = this.newestId = 0;
+      this.seen.clear();
+      this.emit({ type: "cleared" });
+    } else if (type === T.RENAMED && readName(p)) {
+      this.label = readName(p)[0];
+      this.emit({ type: "renamed", label: this.label });
+    } else if (type === T.SHARED && p.length === 2) {
       this.emit({ type: "shared", days: view(p).getUint16(0) });
       if (!this.exporting) this.history(HIST_OLDER, this.oldestId);
     }
@@ -275,7 +410,12 @@ export class Session {
   // Admins: let a member see the last days days of history, or all of it with 0.
   share(name, days = 0) {
     if (!this.admin) return this.notice("only an admin can do that", "warn");
-    this.send(T.MANAGE, Uint8Array.of(MG.SHARE), nameBytes(this.label), nameBytes(name), u16(days));
+    this.report(this.manage.share(this.label, name, days));
+  }
+
+  // Say how an admin request went.
+  report(promise) {
+    promise.then(text => { if (typeof text === "string") this.notice(text); }, e => this.notice(e.message, "warn"));
   }
 
   // Everything you sent in this chat and the DMs sent to you, decrypted:
@@ -292,6 +432,10 @@ export class Session {
     const r = readName(p);
     if (!r || p.length - r[1] !== 33 || r[0] === this.name) return;
     const [name, off] = r, pk = p.slice(off, off + 32), flags = p[off + 32];
+    if (flags & PEER_REMOVED) {
+      if (this.peers.delete(name)) this.emit({ type: "removed", name });
+      return;
+    }
     let pe = this.peers.get(name);
     if (!pe) this.peers.set(name, pe = { name, online: false });
     const wasOnline = pe.online;
@@ -529,6 +673,7 @@ export class Session {
       else if (cmd === "approve" || cmd === "share") this.shareCommand(cmd, arg);
       else if (cmd === "deny") this.decide(arg, false);
       else if (cmd === "waiting") this.listWaiting();
+      else if (["sessions", "kick", "chats", "members", "remove", "ban", "unban", "bans"].includes(cmd)) this.adminCommand(cmd, arg);
       else this.notice("unknown command; try /help", "warn");
       return;
     }
@@ -543,6 +688,41 @@ export class Session {
       return this.notice(`usage: /${cmd} NAME [DAYS|all]`);
     if (cmd === "approve") this.decide(m[1], true, days);
     else this.share(m[1], days ?? 0);
+  }
+
+  // /sessions, /kick N, /chats, /members [CHAT], /remove NAME, /ban ADDRESS, /unban ADDRESS, /bans
+  adminCommand(cmd, arg) {
+    if (!this.admin) return this.notice("only an admin can do that", "warn");
+    const m = this.manage, when = ms => new Date(ms).toLocaleString([], { dateStyle: "short", timeStyle: "short" });
+    const show = (title, rows) => this.notice(`${title}\n${rows.length ? rows.join("\n") : "  (none)"}`);
+    if (cmd === "sessions")
+      return m.sessions().then(list => show("connected:", list.map(x =>
+        `  #${x.id}  ${(x.name || "?").padEnd(12)}  ${x.chat ? `in ${x.chat}` : x.login ? "logging in" : "managing"}` +
+        `${x.waiting ? " (waiting)" : ""}  ${x.web ? "web" : "terminal"}  ${x.address}  since ${when(x.connected)}${x.you ? "  (you)" : ""}`)),
+      e => this.notice(e.message, "warn"));
+    if (cmd === "chats")
+      return m.chats().then(list => show("chats:", list.map(x => x.old ? `  ${x.label.padEnd(24)}  old key, can only be deleted` :
+        `  ${x.label.padEnd(24)}  ${x.members} members, ${x.waiting} waiting, ${x.online} online, ${x.messages} messages, ` +
+        `${x.images} images (${(x.bytes / 1048576).toFixed(1)} MB)`)), e => this.notice(e.message, "warn"));
+    if (cmd === "members")
+      return m.members(arg || this.label).then(list => show(`in ${arg || this.label}:`, list.map(x =>
+        `  ${x.name.padEnd(12)}  ${x.fp}  ${x.state === "in" ? "in" : x.state === "waiting" ? "waiting" : "turned away"}` +
+        `${x.online ? ", online" : ""}${x.admin ? ", admin" : ""}` +
+        (x.state !== "in" ? "" : x.after ? `, sees history after ${when(x.after)}` : ", sees all history"))),
+      e => this.notice(e.message, "warn"));
+    if (cmd === "bans")
+      return m.bans().then(list => show("banned:", list.map(x =>
+        `  ${x.address.padEnd(24)}  ${x.time ? when(x.time) : ""}${x.by ? `  by ${x.by}` : ""}`)), e => this.notice(e.message, "warn"));
+    if (cmd === "kick") {
+      if (!/^#?\d+$/.test(arg)) return this.notice("usage: /kick N   (N from /sessions)");
+      return this.report(m.kick(Number(arg.replace("#", ""))));
+    }
+    if (cmd === "remove") {
+      if (!NAME_RE.test(arg)) return this.notice("usage: /remove NAME");
+      return this.report(m.remove(this.label, arg));
+    }
+    if (!/^\S+$/.test(arg)) return this.notice(`usage: /${cmd} ADDRESS`);
+    this.report(cmd === "ban" ? m.ban(arg) : m.unban(arg));
   }
 
   fits(text) {
@@ -568,6 +748,12 @@ export class Session {
         "  /deny NAME       turn NAME away\n" +
         "  /share NAME [DAYS]  let NAME see history from before they joined: all of it,\n" +
         "                   or the last DAYS days\n" +
+        "  /members [CHAT]  who's in this chat (or CHAT), and how much history they see\n" +
+        "  /remove NAME     take NAME out of this chat (they'd have to be let in again)\n" +
+        "  /sessions        everyone connected to the server\n" +
+        "  /kick N          disconnect session N\n" +
+        "  /chats           every chat on the server\n" +
+        "  /ban ADDRESS     refuse an IP address, /unban ADDRESS, /bans to list them\n" +
         "Create chats on the home page: + Add session, then Create your own." : ""));
   }
 

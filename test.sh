@@ -20,13 +20,18 @@ check() { # file pattern description
 absent() { # file pattern description
     if grep -qaF -- "$2" "$1"; then echo "FAIL - $3"; echo "---- $1:"; cat "$1"; fail=1; else echo "ok   - $3"; fi
 }
-server() { # dir [extra options]: start hushd with its files in dir
-    local dir=$1
+server() { # dir [extra options]: start hushd with its files in dir, and wait until it listens
+    local dir=$1 before
     shift
     mkdir -p "$dir"
+    before=$(grep -c "terminal clients on port" "$T/server.log" 2>/dev/null)
     ./hushd -C "$dir" -p "$PORT" -w "$WPORT" -d "$PWD/web" "$@" 2>>"$T/server.log" &
     srv=$!
-    sleep 0.3
+    # it logs this once both ports are listening. Probing the port would use up rate limit tokens
+    for _ in $(seq 200); do
+        [ "$(grep -c "terminal clients on port" "$T/server.log")" -gt "${before:-0}" ] && return
+        sleep 0.05
+    done
 }
 admin() { # hushd admin command in the current server's dir
     ./hushd -C "$S" "$@"

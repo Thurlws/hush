@@ -38,7 +38,7 @@ const known = {
   set(n, rec) { knownMap.set(n, rec); local.set("hush.known", JSON.stringify(Object.fromEntries(knownMap))); },
 };
 
-let chat = null, retries = 0, retryTimer = null, lastId = 0;
+let chat = null, retries = 0, retryTimer = null, lastId = 0, moreOlder = false;
 const shown = new Set(); // message ids on the page
 const imageUrls = new Map(); // blob id -> object URL of the decrypted image
 const history = [];
@@ -114,6 +114,7 @@ function imageBox(msg) {
 
 function messageNode(msg) {
   const div = el("div", "msg");
+  div.dataset.id = msg.id;
   div.append(el("span", "ts", stamp(msg.time) + " "));
   if (msg.dm) div.append(el("span", "tag", msg.from === chat.name ? `[dm to ${msg.to}] ` : "[dm] "));
   div.append(el("span", "name " + hue(msg.from), msg.from), ": ");
@@ -139,6 +140,76 @@ function addMessages(messages, where) {
     const stick = nearBottom();
     $("msgs").append(...nodes);
     if (stick) toBottom();
+  }
+}
+
+// Joins, leaves and key warnings aren't messages, so the server doesn't keep them. This
+// browser does, per chat and name, each placed after the newest message there was at the
+// time, so they're still there after a reload or rejoin. Also remembered: who was last
+// seen online, so a reload doesn't announce everyone again.
+const LOG_MAX = 300;
+let log = null, placed = new Set(), unplaced = [], anchored = false;
+
+function logKey(key, name) {
+  const norm = normalizeKey(key) || "";
+  return `hush.log.${sodium.to_hex(sodium.crypto_generichash(16, new TextEncoder().encode(norm)))}.${name}`;
+}
+
+function loadLog(key, name) {
+  const k = logKey(key, name);
+  let list = [], on = [];
+  try {
+    const d = JSON.parse(local.get(k) || "{}");
+    if (Array.isArray(d.list))
+      list = d.list.filter(e => e && Number.isSafeInteger(e.after) && typeof e.text === "string" &&
+        (e.cls === "sys" || e.cls === "warn") && typeof e.who === "string");
+    if (Array.isArray(d.on)) on = d.on.filter(x => Array.isArray(x) && typeof x[0] === "string");
+  } catch { /* start fresh */ }
+  return { key: k, list, online: new Map(on.map(([n, v]) => [n, v === true])) };
+}
+
+function saveLog() {
+  if (!log) return;
+  log.list = log.list.slice(-LOG_MAX);
+  local.set(log.key, JSON.stringify({ list: log.list, on: [...log.online] }));
+}
+
+const wasOnline = (name, fallback) => log && log.online.has(name) ? log.online.get(name) : fallback;
+function setOnline(name, on) {
+  if (!log) return;
+  log.online.set(name, on);
+  saveLog();
+}
+
+// One line about who. Before the first page of history there's no message to place it after
+// yet, so it waits for that.
+function event(who, cls, text) {
+  const e = { after: lastId, cls, text, who };
+  if (!log) return line(cls, text);
+  if (cls === "warn") { // the same warning on every connect only needs saying once
+    const last = log.list.findLast(x => x.who === who);
+    if (last && last.text === text) return;
+  }
+  if (!anchored) return unplaced.push(e);
+  log.list.push(e);
+  saveLog();
+  placed.add(e);
+  line(cls, text);
+}
+
+// Put saved lines back where they belong. A line after a message that isn't on the page
+// yet waits for older history, unless there's none.
+function placeEvents() {
+  if (!log) return;
+  const msgs = [...$("msgs").querySelectorAll(".msg")];
+  const oldest = msgs.length ? Number(msgs[0].dataset.id) : Infinity;
+  for (const e of log.list) {
+    if (placed.has(e) || (e.after < oldest && moreOlder)) continue;
+    placed.add(e);
+    const next = msgs.find(m => Number(m.dataset.id) > e.after);
+    const node = el("div", e.cls, e.text);
+    if (next) next.before(node);
+    else append(node);
   }
 }
 
@@ -291,19 +362,21 @@ function showWaiting(label) {
 }
 
 function showPeer(ev) {
-  if (ev.trust === "bad") line("warn", `! ${ev.name} presented an invalid key; ignoring them`);
+  const was = wasOnline(ev.name, ev.wasOnline);
+  setOnline(ev.name, ev.online);
+  if (ev.trust === "bad") event(ev.name, "warn", `! ${ev.name} presented an invalid key; ignoring them`);
   else if (ev.trust === "changed")
-    line("warn", `!!! WARNING: ${ev.name}'s key has CHANGED !!!\n` +
+    event(ev.name, "warn", `!!! WARNING: ${ev.name}'s key has CHANGED !!!\n` +
       "Either they reset their identity (new browser or device), or someone (the server?) is\n" +
       "trying to pose as them. Nothing will be sent to or accepted from them.\n" +
       `  pinned: ${ev.oldFp}\n  now:    ${ev.fp}\n` +
       `Call them, compare the new fingerprint, then type /trust ${ev.name}`);
   else if (ev.first)
-    line("sys", `* ${ev.name} ${ev.joined ? "joined the chat" : ev.online ? "is online" : "is in this chat"}. ` +
+    event(ev.name, "sys", `* ${ev.name} ${ev.joined ? "joined the chat" : ev.online ? "is online" : "is in this chat"}. ` +
       `First time seeing them: fingerprint ${ev.fp}\n` +
       `  Compare it with them on another channel (e.g. a call), then type /verify ${ev.name}`);
-  else if (ev.joined) line("sys", `* ${ev.name} joined the chat`);
-  else if (ev.online && !ev.wasOnline) line("sys", `* ${ev.name} is online${ev.verified ? "" : " (unverified)"}`);
+  else if (ev.joined) event(ev.name, "sys", `* ${ev.name} joined the chat`);
+  else if (ev.online && !was) event(ev.name, "sys", `* ${ev.name} is online${ev.verified ? "" : " (unverified)"}`);
 }
 
 function showOnline() {
@@ -319,6 +392,7 @@ function showLogin(err) {
   chat = null;
   lastId = 0;
   shown.clear();
+  log = null;
   $("chat").hidden = true;
   $("waiting").hidden = true;
   $("waitlist").hidden = true;
@@ -413,6 +487,7 @@ function showSessions() {
       if (!confirm(`Remove "${x.label || "this chat"}" from this list? You'll need its key to join again.`)) return;
       sessions = sessions.filter(y => y !== x);
       storeSessions();
+      local.del(logKey(x.key, x.name));
       showSessions();
     };
     li.append(join, forget);
@@ -468,6 +543,10 @@ function onEvent(ev, name, key) {
       $("chat").hidden = false;
       $("msgs").replaceChildren();
       $("older").hidden = true;
+      log = loadLog(key, name);
+      placed = new Set();
+      unplaced = [];
+      anchored = false;
       line("info", `connected as ${name} to the chat "${ev.label}"\nyour fingerprint: ${myFp}\ntype /help for commands` +
         (ev.admin ? "\nyou're an admin: people who want to join are under Waitlist" : ""));
       $("msg").focus();
@@ -479,8 +558,15 @@ function onEvent(ev, name, key) {
     if (ev.dir === 0) {
       const first = !$("msgs").querySelector(".msg");
       addMessages(ev.messages, first ? "bottom" : "top");
+      moreOlder = ev.more;
       $("older").hidden = !ev.more;
       $("older").disabled = false;
+      if (!anchored) { // the newest message is known now, so lines from before this can go after it
+        anchored = true;
+        for (const e of unplaced.splice(0)) { e.after = lastId; log.list.push(e); }
+        saveLog();
+      }
+      placeEvents();
       if (first) toBottom();
     } else {
       addMessages(ev.messages, "bottom");
@@ -488,7 +574,7 @@ function onEvent(ev, name, key) {
     break;
   case "message": addMessages([ev.msg], "bottom"); break;
   case "peer": showPeer(ev); showOnline(); break;
-  case "leave": line("sys", `* ${ev.name} went offline`); showOnline(); break;
+  case "leave": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} went offline`); showOnline(); break;
   case "notice": line(ev.level, ev.text); break;
   case "error": if (inChat && chat && chat.ready) line("warn", `! server: ${ev.text}`); break;
   case "closed":

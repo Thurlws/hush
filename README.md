@@ -316,6 +316,11 @@ This is a hobby project and hasn't had a professional security audit.
 - A malicious server can drop, hide or reorder messages. It can't read or forge them without you
   noticing a key change.
 
+## Reporting security problems
+
+Privately, through the repository's Security tab. [SECURITY.md](SECURITY.md) has the details, and
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each release.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

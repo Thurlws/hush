@@ -4,7 +4,7 @@ on:
   push:
   pull_request:
 
-# Arch, so CI uses the same gcc and clang hush is developed with
+# Most jobs run on Arch, so CI uses the same gcc and clang hush is developed with
 env:
   DEPS: base-devel clang compiler-rt libsodium sqlite nodejs python curl git
 
@@ -21,6 +21,31 @@ jobs:
       - run: pacman -Syu --noconfirm --needed $DEPS
       - uses: actions/checkout@v5
       - run: make CC=${{ matrix.cc }} CFLAGS="-O2 -g -Werror" test
+
+  # Older compilers and libraries than Arch, the way most people would build it
+  ubuntu:
+    name: test (ubuntu 24.04, ${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y clang pkg-config libsodium-dev libsqlite3-dev
+      - run: make CC=${{ matrix.cc }} CFLAGS="-O2 -g -Werror" test
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker compose up -d --build --wait
+      - run: curl -fs http://127.0.0.1:8080/health
+      - run: docker compose exec -T hushd /opt/hush/bin/hushd -C /data newkey ci
+      - run: docker compose down -v
 
   sanitizers:
     runs-on: ubuntu-latest

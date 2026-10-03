@@ -5,6 +5,7 @@ src/*.o
 tests/unit
 bench/bench
 bench/run-*/
+dist/
 src/*.gcda
 src/*.gcno
 tests/*.gcda

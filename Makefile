@@ -82,6 +82,6 @@ install: all
 	install -Dm644 $(WEB_FILES) -t $(PREFIX)/share/hush/web
 
 clean:
-	rm -f hush hushd src/*.o src/*.gcda src/*.gcno tests/unit bench/bench $(FUZZERS)
+	rm -f hush hushd src/*.o src/*.gcda src/*.gcno tests/unit tests/*.gcda tests/*.gcno bench/bench $(FUZZERS)
 
 .PHONY: all debug asan test fuzz analyze coverage bench install clean

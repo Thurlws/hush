@@ -1,6 +1,6 @@
 // The page: login form, chat log, input and images. The protocol is in hush.js.
 import sodium from "./sodium.mjs";
-import { Session, NAME_RE, KEY_MAX, MAX_IMAGE, IMAGE_TYPES, fingerprint, publicKey, normalizeKey, createChat } from "./hush.js";
+import { Session, AdminLink, NAME_RE, KEY_MAX, MAX_IMAGE, IMAGE_TYPES, fingerprint, publicKey, normalizeKey, createChat } from "./hush.js";
 import { zip } from "./zip.js";
 
 const $ = id => document.getElementById(id);
@@ -322,12 +322,13 @@ async function saveMyData() {
   }
 }
 
-// Admins only: a Waitlist button with a count, which opens the list.
+// Admins only: an Admin button with the waitlist's count, which opens the panel.
+let panel = null;
 function showWaitlist() {
   const admin = !!(chat && chat.admin), n = admin ? chat.pending.size : 0;
-  $("waitlist-btn").hidden = !admin;
-  $("waitlist-count").textContent = n ? String(n) : "";
-  $("waitlist-count").hidden = !n;
+  $("admin-btn").hidden = !admin;
+  $("admin-count").textContent = n ? String(n) : "";
+  $("admin-count").hidden = !n;
   const list = $("waitlist-list");
   list.replaceChildren();
   if (admin)
@@ -344,7 +345,7 @@ function showWaitlist() {
       list.append(row);
     }
   $("waitlist-empty").hidden = n > 0;
-  if (!admin) $("waitlist").hidden = true;
+  if (!admin) $("admin").hidden = true;
 }
 
 // How much of the history from before they joined someone gets to see.
@@ -358,10 +359,192 @@ function historyPicker(none = "no history") {
 }
 const pickedDays = sel => sel.value === "" ? null : Number(sel.value);
 
-function toggleWaitlist(open = $("waitlist").hidden) {
-  $("waitlist").hidden = !open;
-  $("waitlist-btn").setAttribute("aria-expanded", String(open));
-  if (open) $("waitlist-close").focus();
+// Admins: tabs over the server's sessions, chats and bans, and in a chat its waitlist and
+// members too. The same panel sits in the chat header and on the "Manage server" page.
+const DAYS = [["", "no history"], ["1", "last day"], ["7", "last 7 days"], ["30", "last 30 days"], ["0", "all history"]];
+const when = ms => new Date(ms).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+const mb = n => `${(n / 1048576).toFixed(1)} MB`;
+const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
+
+function button(text, cls, onclick) {
+  const b = el("button", cls, text);
+  b.type = "button";
+  b.onclick = onclick;
+  return b;
+}
+
+function row(title, details, ...actions) {
+  const r = el("div", "request"), who = el("div", "who-box"), act = el("div", "actions");
+  who.append(el("span", "who", title));
+  for (const d of details.filter(Boolean)) who.append(el("span", "fp", d));
+  act.append(...actions);
+  r.append(who, act);
+  return r;
+}
+
+function adminPanel({ tabs, status, pane, waitlist = null, manager, chat = null, saved }) {
+  const names = chat ? ["Waitlist", "Members", "Sessions", "Chats", "Bans"] : ["Sessions", "Chats", "Bans"];
+  let current = null, membersOf = chat, busy = false;
+  const say = (text, bad = false) => { status.textContent = text; status.className = bad ? "warn" : "hint"; };
+
+  // Run an admin request, say how it went, then redraw
+  async function act(promise) {
+    try { say(await promise); } catch (e) { say(e.message, true); }
+    refresh();
+  }
+
+  const buttons = names.map(n => {
+    const b = button(n, "tab", () => show(n));
+    b.setAttribute("role", "tab");
+    return b;
+  });
+  tabs.replaceChildren(...buttons);
+
+  function show(name) {
+    current = names.includes(name) ? name : names[0];
+    if (current !== "Members") membersOf = chat;
+    for (const b of buttons) b.setAttribute("aria-selected", String(b.textContent === current));
+    local.set(saved, current);
+    say("");
+    refresh();
+  }
+
+  async function refresh() {
+    if (busy) return;
+    const tab = current;
+    if (waitlist) waitlist.hidden = tab !== "Waitlist";
+    pane.hidden = tab === "Waitlist";
+    if (tab === "Waitlist") return;
+    busy = true;
+    try {
+      const nodes = await draw[tab]();
+      if (tab === current) pane.replaceChildren(...nodes);
+    } catch (e) {
+      say(e.message, true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  const draw = {
+    async Sessions() {
+      const list = await manager().sessions();
+      return [el("p", "hint", `${plural(list.length, "connection")} right now.`), ...list.map(x => row(
+        `${x.name || "?"}${x.you ? " (you)" : ""}`,
+        [`${x.chat ? `in ${x.chat}` : x.login ? "logging in" : "managing the server"}${x.waiting ? ", waiting to be let in" : ""}` +
+           `${x.admin ? ", admin" : ""}`,
+         `${x.web ? "browser" : "terminal"} from ${x.address}, since ${when(x.connected)}`],
+        ...(x.you ? [] : [button("Kick", "", () => act(manager().kick(x.id))),
+          button("Ban address", "danger", () => {
+            if (confirm(`Ban ${x.address}? Everyone connecting from it is refused until it's unbanned.`)) act(manager().ban(x.address));
+          })])))];
+    },
+    async Chats() {
+      const list = await manager().chats();
+      return [el("p", "hint", plural(list.length, "chat")), ...list.map(x => row(x.label,
+        x.old ? ["an old key from before keys got shorter: it no longer works"]
+              : [`${plural(x.members, "member")}, ${x.waiting} waiting, ${x.online} online`,
+                 `${plural(x.messages, "message")}, ${plural(x.images, "image")} (${mb(x.bytes)})`],
+        ...(x.old ? [] : [
+          button("Members", "", () => { membersOf = x.label; current = "Members"; refresh(); }),
+          button("Rename", "", () => {
+            const to = prompt(`New name for ${x.label} (letters, digits, _ . -)`, x.label);
+            if (to && to !== x.label) act(manager().rename(x.label, to.trim()));
+          }),
+          button("Clear history", "danger", () => {
+            if (confirm(`Delete every message and image in ${x.label}? The key keeps working. This can't be undone.`))
+              act(manager().clear(x.label));
+          })]),
+        button("Delete", "danger", () => {
+          if (confirm(`Delete the chat ${x.label}? Its key stops working and everything in it is deleted. This can't be undone.`))
+            act(manager().revoke(x.label));
+        })))];
+    },
+    async Members() {
+      const chatName = membersOf, list = await manager().members(chatName), nodes = [];
+      if (chatName !== chat) nodes.push(button("← All chats", "link", () => show("Chats")));
+      nodes.push(el("p", "hint", `${chatName}: ${plural(list.filter(x => x.state === "in").length, "member")}. ` +
+        "New members see what's said after they're let in. Share more with the picker."));
+      for (const x of list) {
+        const picker = historyPicker(x.state === "in" ? "how much?" : "no history"), details = [x.fp];
+        if (x.state === "in")
+          details.push(`${x.online ? "online" : "offline"}${x.admin ? ", admin: sees everything" : x.after ? `, sees history after ${when(x.after)}`
+            : ", sees all history"}`);
+        else details.push(x.state === "waiting" ? "waiting to be let in" : "turned away");
+        const actions = [];
+        if (x.state === "in" && !x.admin)
+          actions.push(picker, button("Share", "", () => {
+            const d = pickedDays(picker);
+            if (d === null) return say("Pick how much history to share first.", true);
+            act(manager().share(chatName, x.name, d));
+          }), button("Remove", "danger", () => {
+            if (confirm(`Take ${x.name} out of ${chatName}? If they come back, an admin has to let them in again.`))
+              act(manager().remove(chatName, x.name));
+          }));
+        else if (x.state !== "in")
+          actions.push(picker, button(x.state === "waiting" ? "Approve" : "Let in", "approve", async () => {
+            const d = pickedDays(picker);
+            try {
+              say(await manager().decide(chatName, x.name, true));
+              if (d !== null) say(await manager().share(chatName, x.name, d));
+            } catch (e) { say(e.message, true); }
+            refresh();
+          }), ...(x.state === "waiting" ? [button("Deny", "", () => act(manager().decide(chatName, x.name, false)))] : []));
+        nodes.push(row(x.name, details, ...actions));
+      }
+      if (!list.length) nodes.push(el("p", "hint", "Nobody yet."));
+      return nodes;
+    },
+    async Bans() {
+      const list = await manager().bans();
+      const form = el("form", "ban-form"), input = el("input");
+      input.placeholder = "IP address, e.g. 203.0.113.9";
+      input.setAttribute("aria-label", "IP address to ban");
+      form.append(input, Object.assign(el("button", "danger", "Ban"), { type: "submit" }));
+      form.onsubmit = e => {
+        e.preventDefault();
+        const a = input.value.trim();
+        if (a) act(manager().ban(a));
+      };
+      return [form, el("p", "hint", list.length ? "IPv6 addresses are banned per /64, the block one home connection gets."
+                                                 : "Nobody is banned."),
+              ...list.map(x => row(x.address, [`since ${x.time ? when(x.time) : "?"}${x.by ? `, by ${x.by}` : ""}`],
+                button("Unban", "", () => act(manager().unban(x.address)))))];
+    },
+  };
+
+  // The chat this panel is in got a new name
+  function relabel(label) {
+    if (membersOf === chat) membersOf = label;
+    chat = label;
+    refresh();
+  }
+
+  show(local.get(saved) || names[0]);
+  return { show, refresh, relabel, get current() { return current; } };
+}
+
+function toggleAdmin(open = $("admin").hidden) {
+  $("admin").hidden = !open;
+  $("admin-btn").setAttribute("aria-expanded", String(open));
+  if (!open) return;
+  const s = chat;
+  if (!panel || panel.chat !== s) {
+    panel = adminPanel({ tabs: $("admin-tabs"), status: $("admin-status"), pane: $("admin-pane"), waitlist: $("waitlist-pane"),
+                         manager: () => s.manage, chat: s.label, saved: "hush.admintab" });
+    panel.chat = s;
+  } else {
+    panel.refresh();
+  }
+  $("admin-close").focus();
+}
+
+// Who's online changed: redraw the panel's lists if one is showing
+let redrawTimer = null;
+function adminChanged() {
+  if (!panel || $("admin").hidden || panel.current === "Waitlist") return;
+  clearTimeout(redrawTimer);
+  redrawTimer = setTimeout(() => panel.refresh(), 300);
 }
 
 function showWaiting(label) {
@@ -407,8 +590,10 @@ function showLogin(err) {
   log = null;
   $("chat").hidden = true;
   $("waiting").hidden = true;
-  $("waitlist").hidden = true;
+  $("admin").hidden = true;
+  $("manage").hidden = true;
   $("login").hidden = false;
+  panel = null;
   $("join").disabled = false;
   $("join").textContent = mode === "create" ? "Create" : "Join";
   $("login-error").textContent = err || "";
@@ -537,7 +722,7 @@ function onEvent(ev, name, key) {
     rememberSession(key, name, ev.label);
     showWaiting(ev.label);
     break;
-  case "pending": showWaitlist(); break;
+  case "pending": showWaitlist(); adminChanged(); break;
   case "ready":
     retries = 0;
     local.set("hush.name", name);
@@ -585,10 +770,10 @@ function onEvent(ev, name, key) {
     }
     break;
   case "message": addMessages([ev.msg], "bottom"); break;
-  case "peer": showPeer(ev); showOnline(); break;
-  case "leave": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} went offline`); showOnline(); break;
+  case "peer": showPeer(ev); showOnline(); adminChanged(); break;
+  case "leave": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} went offline`); showOnline(); adminChanged(); break;
   case "notice": line(ev.level, ev.text); break;
-  case "removed": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} was removed from the chat`); showOnline(); break;
+  case "removed": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} was removed from the chat`); showOnline(); adminChanged(); break;
   case "cleared": // nothing before this is on the server any more
     $("msgs").replaceChildren();
     shown.clear();
@@ -599,6 +784,7 @@ function onEvent(ev, name, key) {
     event("", "sys", "* an admin deleted this chat's history");
     break;
   case "renamed":
+    if (panel) panel.relabel(ev.label);
     $("label").textContent = ev.label;
     document.title = `hush · ${ev.label}`;
     rememberSession(key, name, ev.label);
@@ -682,13 +868,46 @@ $("viewer-close").addEventListener("click", closeViewer);
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
   if (!$("viewer").hidden) closeViewer();
-  else if (!$("waitlist").hidden) toggleWaitlist(false);
+  else if (!$("admin").hidden) toggleAdmin(false);
 });
-$("waitlist-btn").addEventListener("click", () => toggleWaitlist());
-$("waitlist-close").addEventListener("click", () => toggleWaitlist(false));
+$("admin-btn").addEventListener("click", () => toggleAdmin());
+$("admin-close").addEventListener("click", () => toggleAdmin(false));
 document.addEventListener("click", e => { // clicking outside the panel closes it
-  if (!$("waitlist").hidden && !$("waitlist").contains(e.target) && !$("waitlist-btn").contains(e.target))
-    toggleWaitlist(false);
+  if (!$("admin").hidden && e.target.isConnected && !$("admin").contains(e.target) && !$("admin-btn").contains(e.target))
+    toggleAdmin(false);
+});
+
+// "Manage server": admins log in without a chat, and get the same panel full page.
+let link = null;
+$("manage-open").addEventListener("click", () => {
+  const name = $("name").value.trim() || local.get("hush.name") || "";
+  if (!NAME_RE.test(name)) {
+    $("login-form").hidden = false;
+    $("sessions-box").hidden = true;
+    $("name").focus();
+    return showLogin("Type your name first: 1-24 letters, digits, _ . or -");
+  }
+  $("login-error").textContent = "Connecting…";
+  const l = new AdminLink({ sodium, url: wsUrl(), name, secretKey: sk }, ev => {
+    if (l !== link) return;
+    if (ev.type === "ready") {
+      $("login").hidden = true;
+      $("manage").hidden = false;
+      document.title = "hush · manage";
+      adminPanel({ tabs: $("manage-tabs"), status: $("manage-status"), pane: $("manage-pane"), manager: () => l.manage,
+                   saved: "hush.managetab" });
+    } else if (ev.type === "closed") {
+      link = null;
+      showLogin(ev.error ? capitalize(ev.error) + "." : l.ready ? "Disconnected from the server." : "Couldn't reach the server.");
+    }
+  });
+  link = l;
+});
+$("manage-close").addEventListener("click", () => {
+  const l = link;
+  link = null;
+  if (l) l.close();
+  showLogin();
 });
 
 $("mydata").addEventListener("click", saveMyData);

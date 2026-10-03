@@ -50,8 +50,19 @@
   </div>
   <p id="login-error" role="alert"></p>
   <p class="fine">Your fingerprint<br><span id="myfp">…</span></p>
+  <button id="manage-open" type="button" class="link">Manage server (admins)</button>
   </div>
   <noscript>hush needs JavaScript: your messages are encrypted in the browser.</noscript>
+</main>
+
+<main id="manage" hidden>
+  <div class="card wide">
+    <div class="panel-head"><h1>hush</h1><button id="manage-close" type="button">Close</button></div>
+    <p class="sub">Manage this server</p>
+    <div id="manage-tabs" class="tabs" role="tablist"></div>
+    <p id="manage-status" class="hint" role="status"></p>
+    <div id="manage-pane"></div>
+  </div>
 </main>
 
 <main id="waiting" hidden>
@@ -68,15 +79,20 @@
 <div id="chat" hidden>
   <header>
     <span id="dot"></span><b id="label">hush</b><span id="online"></span>
-    <button id="waitlist-btn" type="button" hidden aria-expanded="false" aria-controls="waitlist">Waitlist <span id="waitlist-count" hidden></span></button>
+    <button id="admin-btn" type="button" hidden aria-expanded="false" aria-controls="admin">Admin <span id="admin-count" hidden></span></button>
     <button id="mydata" type="button" title="Download everything you sent here, and the DMs sent to you">My data</button>
     <button id="leave" type="button">Leave</button>
   </header>
-  <div id="waitlist" class="panel" hidden role="dialog" aria-label="Waitlist">
-    <div class="panel-head"><b>Waitlist</b><button id="waitlist-close" type="button">Close</button></div>
-    <p class="hint">Check each fingerprint with the person (e.g. on a call) before you let them in.</p>
-    <div id="waitlist-list"></div>
-    <p id="waitlist-empty" class="hint">Nobody is waiting.</p>
+  <div id="admin" class="panel" hidden role="dialog" aria-label="Admin">
+    <div class="panel-head"><b>Admin</b><button id="admin-close" type="button">Close</button></div>
+    <div id="admin-tabs" class="tabs" role="tablist"></div>
+    <p id="admin-status" class="hint" role="status"></p>
+    <div id="waitlist-pane">
+      <p class="hint">Check each fingerprint with the person (e.g. on a call) before you let them in.</p>
+      <div id="waitlist-list"></div>
+      <p id="waitlist-empty" class="hint">Nobody is waiting.</p>
+    </div>
+    <div id="admin-pane"></div>
   </div>
   <div id="log">
     <button id="older" type="button" hidden>Load older messages</button>

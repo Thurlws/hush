@@ -550,9 +550,11 @@ static void db_migrate(void)
     }
 }
 
-static void db_open(void)
+/* Only the server creates the database. The commands use the one in the current
+ * folder (-C), and a missing one usually means they're looking in the wrong place. */
+static void db_open(int create)
 {
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK)
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0), NULL) != SQLITE_OK)
         die("cannot open %s: %s", db_path, sqlite3_errmsg(db));
     sqlite3_busy_timeout(db, 5000);
     db_exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
@@ -561,8 +563,28 @@ static void db_open(void)
         if (sqlite3_prepare_v3(db, query_sql[i], -1, SQLITE_PREPARE_PERSISTENT, &queries[i], NULL) !=
             SQLITE_OK)
             die("database %s: %s", db_path, sqlite3_errmsg(db));
-    if (mkdir(blob_dir, 0700) < 0 && errno != EEXIST)
+    if (create && mkdir(blob_dir, 0700) < 0 && errno != EEXIST)
         die("cannot create %s: %s", blob_dir, strerror(errno));
+}
+
+static const char *here(void)
+{
+    static char dir[4096];
+    if (!getcwd(dir, sizeof dir))
+        strcpy(dir, ".");
+    return dir;
+}
+
+static int db_exists(void)
+{
+    return access(db_path, F_OK) == 0;
+}
+
+static void db_open_existing(void)
+{
+    if (!db_exists())
+        die("there's no %s in %s: hushd hasn't run in this folder, or it runs with another -C", db_path, here());
+    db_open(0);
 }
 
 static sqlite3_stmt *q(int which)
@@ -1667,9 +1689,22 @@ static void delete_history(const uint8_t *room, int members)
 
 static void cmd_keys(void)
 {
+    int stored = db_exists();
+    if (stored)
+        db_open(0);
     keys_load();
-    if (!nrooms)
-        printf("no keys yet; create one with: hushd newkey NAME\n");
+    if (!nrooms) {
+        printf("no keys in %s yet; create one with: hushd newkey NAME\n", here());
+        return;
+    }
+    printf("chats in %s\n", here());
+    if (!stored) {
+        printf("nothing is stored here yet (no %s): hushd hasn't run in this folder, or it runs with another -C\n",
+               db_path);
+        for (size_t i = 0; i < nrooms; i++)
+            printf("%s\n", rooms[i].label);
+        return;
+    }
     sqlite3_stmt *s;
     if (sqlite3_prepare_v2(db,
                            "SELECT (SELECT count(*) FROM messages WHERE room = ?1),"
@@ -2179,12 +2214,16 @@ int main(int argc, char **argv)
             cmd_newkey(arg);
             return 0;
         }
-        db_open();
-        if (!strcmp(cmd, "keys") && !arg)
+        if (!strcmp(cmd, "keys") && !arg) {
             cmd_keys();
-        else if (!strcmp(cmd, "admins") && !arg)
+            return 0;
+        }
+        if (!strcmp(cmd, "admins") && !arg) {
             cmd_admins();
-        else if (!strcmp(cmd, "pending") && !arg)
+            return 0;
+        }
+        db_open_existing();
+        if (!strcmp(cmd, "pending") && !arg)
             cmd_pending();
         else if ((!strcmp(cmd, "approve") || !strcmp(cmd, "deny")) && arg2)
             cmd_decide(arg, arg2, !strcmp(cmd, "approve"));
@@ -2207,7 +2246,7 @@ int main(int argc, char **argv)
     struct sigaction sa = { .sa_handler = on_stop }; /* no SA_RESTART, so poll() wakes up */
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
-    db_open();
+    db_open(1);
     remove_partial_uploads();
     users_load();
     keys_load();

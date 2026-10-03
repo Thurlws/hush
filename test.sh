@@ -90,6 +90,12 @@ verifier = hashlib.blake2b(token, digest_size=32, key=b"hush-chat-verify-v3").he
 open(sys.argv[1], "a").write(f"3 {verifier} oldstyle\n")
 EOF
 absent "$S/hushd-keys.txt" "$K1" "the keys file holds no plaintext keys"
+admin keys >"$T/keys-nodb.out"
+admin pending >>"$T/keys-nodb.out" 2>&1
+check "$T/keys-nodb.out" "nothing is stored here yet" "hushd keys says when hushd hasn't run in its folder..."
+check "$T/keys-nodb.out" "there's no hushd.db in $S" "...and so do the other commands"
+[ ! -e "$S/hushd.db" ] && echo "ok   - ...without creating a database there" ||
+    { echo "FAIL - a hushd command created a database"; fail=1; }
 
 server "$S"
 
@@ -269,7 +275,8 @@ admin backup "$T/backup" >"$T/backup.out" 2>&1
 check "$T/backup.out" "backed up" "hushd backup copies a running server"
 admin keys >"$T/keys-live.out"
 ./hushd -C "$T/backup" keys >"$T/keys-backup.out"
-cmp -s "$T/keys-live.out" "$T/keys-backup.out" && echo "ok   - ...with every chat and its message and image counts" ||
+cmp -s <(tail -n +2 "$T/keys-live.out") <(tail -n +2 "$T/keys-backup.out") &&
+    echo "ok   - ...with every chat and its message and image counts" ||
     { echo "FAIL - backup counts differ"; diff "$T/keys-live.out" "$T/keys-backup.out"; fail=1; }
 HUSH_KEY="$K1" ./hushd -C "$T/backup" export main "$T/export-backup" >/dev/null 2>&1
 cmp -s <(tail -n +3 "$T/export/messages.txt") <(tail -n +3 "$T/export-backup/messages.txt") &&

@@ -98,6 +98,20 @@ then enter the key and a name:
 
 Give the key to your friends. When they join, they wait until you approve them in the chat.
 
+### With Docker
+
+```sh
+docker compose up -d --build
+docker compose exec hushd /opt/hush/bin/hushd -C /data newkey friends
+docker compose exec hushd /opt/hush/bin/hushd -C /data admin "YOUR FINGERPRINT"
+```
+
+Then open `http://localhost:8080`. Everything hushd keeps is in the `hush-data` volume, and
+`docker compose stop` shuts it down cleanly. Connections from the machine running Docker all
+arrive from the bridge's address, so they share one set of rate limits. For a server people
+actually use, follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) instead: behind Caddy on the same
+machine, hushd sees each visitor's real address.
+
 ## Deploying
 
 For a VPS with HTTPS, a firewall and a locked-down systemd service, see

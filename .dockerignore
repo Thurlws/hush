@@ -1,0 +1,10 @@
+.git
+vault
+docs
+tests
+fuzz
+bench
+hush
+hushd
+src/*.o
+src/*.gc*

@@ -1,0 +1,12 @@
+services:
+  hushd:
+    build: .
+    ports:
+      - "8080:8080"
+      - "7777:7777"
+    volumes:
+      - hush-data:/data
+    restart: unless-stopped
+
+volumes:
+  hush-data:

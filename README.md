@@ -40,8 +40,8 @@ flowchart LR
 | One thread, `poll()` | No locks to get wrong. One process serves up to 512 connections. |
 
 More detail in `docs/`: the [protocol](docs/PROTOCOL.md), the [cryptography](docs/CRYPTOGRAPHY.md),
-the [threat model](docs/THREAT_MODEL.md), [how it's tested](docs/TESTING.md) and
-[deployment](docs/DEPLOYMENT.md).
+the [threat model](docs/THREAT_MODEL.md), [how it's tested](docs/TESTING.md), the
+[benchmark](docs/BENCHMARK.md) and [deployment](docs/DEPLOYMENT.md).
 
 ## Build
 
@@ -65,6 +65,8 @@ make test          # build, run the unit tests, then test.sh
 make asan test     # the same under AddressSanitizer and UBSan
 make analyze       # clang-tidy and gcc -fanalyzer, any finding fails
 make fuzz          # each libFuzzer target for 60 seconds (FUZZ_TIME=600 for longer)
+make coverage      # line coverage of both suites
+make bench         # a real hushd under load, see docs/BENCHMARK.md
 make debug         # -O0 -g3 build for gdb
 ```
 

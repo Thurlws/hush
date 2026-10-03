@@ -37,9 +37,20 @@ fuzz: $(FUZZERS)
 	    ./fuzz/$$f -max_total_time=$(FUZZ_TIME) -artifact_prefix=fuzz/ fuzz/corpus/$$f fuzz/seeds/$$f || exit 1; \
 	done
 
+bench/bench: bench/bench.c src/proto.o src/proto.h
+	$(CC) $(HUSH_CFLAGS) -Isrc $(CFLAGS) $(LDFLAGS) -o $@ $(filter-out %.h,$^) $(LDLIBS) $(HUSH_LIBS)
+
+# A real hushd under load at a few sizes. The numbers depend on the machine and its disk.
+bench: all bench/bench
+	./bench/bench -n 2 -m 50 -r 20
+	./bench/bench -n 16 -m 50
+	./bench/bench -n 64 -m 20
+	./bench/bench -n 256 -m 10
+	./bench/bench -n 512 -m 5
+
 # clang-tidy (checks in .clang-tidy) and gcc's -fanalyzer, any finding fails
 analyze:
-	clang-tidy --quiet src/*.c tests/unit.c fuzz/*.c -- $(HUSH_CFLAGS) -Isrc
+	clang-tidy --quiet src/*.c tests/unit.c fuzz/*.c bench/*.c -- $(HUSH_CFLAGS) -Isrc
 	for f in src/*.c; do gcc $(HUSH_CFLAGS) -O2 -fanalyzer -Werror -c -o /dev/null $$f || exit 1; done
 
 # Line coverage of the unit tests and test.sh together, per file. Cleans up after,
@@ -71,6 +82,6 @@ install: all
 	install -Dm644 $(WEB_FILES) -t $(PREFIX)/share/hush/web
 
 clean:
-	rm -f hush hushd src/*.o src/*.gcda src/*.gcno tests/unit $(FUZZERS)
+	rm -f hush hushd src/*.o src/*.gcda src/*.gcno tests/unit bench/bench $(FUZZERS)
 
-.PHONY: all debug asan test fuzz analyze coverage install clean
+.PHONY: all debug asan test fuzz analyze coverage bench install clean

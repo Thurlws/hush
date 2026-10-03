@@ -3,6 +3,8 @@ hush
 hushd
 src/*.o
 tests/unit
+bench/bench
+bench/run-*/
 src/*.gcda
 src/*.gcno
 fuzz/http

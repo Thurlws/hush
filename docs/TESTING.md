@@ -6,6 +6,7 @@ make asan test     # both under AddressSanitizer and UBSan
 make analyze       # clang-tidy and gcc -fanalyzer
 make fuzz          # libFuzzer, 60 seconds per target by default
 make coverage      # line coverage of both test suites together
+make bench         # load on a real hushd, see BENCHMARK.md
 ```
 
 CI (`.github/workflows/ci.yml`) runs all four on every push, with gcc and clang
@@ -134,6 +135,7 @@ Everything builds without warnings under `-Wall -Wextra -Wpedantic -Wconversion
 | Three read loops called `fread` again after EOF or an error, and `/img` sent a partial image when reading failed | clang-tidy | `1aad7ad` |
 | 16 implicit sign and float conversions, and a buffer in `handshake()` shadowing another | clang with `-Wconversion -Wshadow` | `153e01a` |
 | The sanitizer build linked the unit tests without sanitizer flags | the first `make asan test` | `2826df8` |
+| A 40 ms stall on small messages: neither side set `TCP_NODELAY`, so frames waited for delayed ACKs | the benchmark | `7dab041` |
 | The terminal showed Unicode bidi overrides that the browser removes | writing tests for code that coverage showed untested | `ed58a8b` |
 
 ## What isn't covered
@@ -142,6 +144,6 @@ Everything builds without warnings under `-Wall -Wextra -Wpedantic -Wconversion
   The screenshots in the README come from a scripted run of the real UI, but nothing
   checks it automatically.
 - Running out of disk. The low-disk refusals exist but are hard to trigger in a test.
-- Load. There's no benchmark yet, and the limits have only been exercised one
-  client at a time.
+- Load. [BENCHMARK.md](BENCHMARK.md) measures it, but nothing fails a build when it
+  gets slower.
 - Other systems. hush is Linux only, and CI runs on Arch.

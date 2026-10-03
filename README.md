@@ -1,7 +1,10 @@
 # hush
 
+[![CI](https://github.com/Thurlws/hush/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Thurlws/hush/actions/workflows/ci.yml)
+
 End-to-end encrypted group chat for you and your friends, in C. Chat in the browser or in the terminal,
-with history, private messages and images. New people wait on a waitlist until you let them in.
+with history, private messages and images. New people wait on a waitlist until you let them in, and
+see the history from then on, plus whatever you choose to share.
 
 ![alice types in the browser while bob and carol answer from their terminals](docs/img/demo.gif)
 
@@ -22,7 +25,7 @@ flowchart LR
         D["hushd<br/>one thread, poll()"]
         DB[("hushd.db<br/>SQLite")]
         BL[("blobs/<br/>encrypted images")]
-        F[("key hashes, name pins,<br/>admin list")]
+        F[("key hashes, name pins,<br/>admins, bans")]
     end
     B -->|"HTTPS + WebSocket"| C -->|"HTTP :8080"| D
     T -->|"TCP :7777, length-prefixed frames"| D
@@ -74,11 +77,12 @@ make debug         # -O0 -g3 build for gdb
 vectors from the browser code, so both clients stay in step), message encryption and signatures
 with every kind of tampering, and the HTTP and WebSocket parsers. `test.sh` runs everything on localhost against a real hushd: scripted terminal clients, the web
 client's protocol code under Node, and the HTTP side with curl. It covers wrong and old keys, the
-waitlist, history and offline DMs, images and metadata stripping, data exports, name takeover,
-changed keys, `clear` and `revoke`, rate limits and the reverse-proxy mode. It also checks that
+waitlist, history and sharing it, offline DMs, images and metadata stripping, data exports, name
+takeover, changed keys, every admin request (sessions, kicks, removals, bans, renaming, clearing and
+deleting chats), session limits, rate limits and the reverse-proxy mode. It also checks that
 the server enforces permissions itself, throws broken and random frames at it, and kills it in the
 middle of an upload. It needs `python3` and `curl`, plus `node` for the web tests, and takes about
-two minutes. [docs/TESTING.md](docs/TESTING.md) has the details.
+three minutes. [docs/TESTING.md](docs/TESTING.md) has the details.
 
 ## Quick start
 
@@ -130,8 +134,12 @@ hushd keys            # list chats, with how many messages and images each one s
 hushd clear NAME      # delete a chat's messages and images; the key keeps working
 hushd revoke NAME     # delete a chat: its key, messages and images; everyone in it is disconnected
 hushd forget USER     # free up a name, e.g. when a friend lost their browser data
+hushd ban ADDRESS     # refuse an IP address (IPv6 per /64); unban ADDRESS, bans to list them
 hushd backup DIR      # copy everything into a new DIR, safe while hushd runs
 ```
+
+Each IP address can have 16 chat sessions open, and each identity key one. Start hushd with
+`-L 1` to allow a single session per address.
 
 A running server picks up these changes by itself. Add `-C DIR` to work on the files in DIR.
 For the VPS setup in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) that's `sudo -u hush hushd -C /var/lib/hush ...`.
@@ -150,15 +158,34 @@ hushd admins                  # list them
 The first time someone joins a chat, they land on a waiting screen and see nothing of the chat.
 Admins in the chat get a request with the person's name and fingerprint, and **Approve** / **Deny**
 buttons (in the terminal: `/approve NAME`, `/deny NAME`, `/waiting`). Check the fingerprint with them
-before approving, e.g. over a call. Denied people can't try again. Without being online:
+before approving, e.g. over a call. Denied people can't try again.
+
+Once in, they see what's said from then on. Next to **Approve** you pick how much of the history from
+before they get too: none, the last day, 7 or 30 days, or all of it (`/approve NAME 7`,
+`/approve NAME all`). You can share more later from the **Members** tab or with `/share NAME [DAYS]`,
+but never take it back. Without being online:
 
 ```sh
 hushd pending                 # who's waiting for which chat
 hushd approve CHAT NAME       # they get in within a second if they're waiting right now
 hushd deny CHAT NAME
+hushd share CHAT NAME [DAYS]  # let NAME see the last DAYS days of history, or all of it
 ```
 
 ![The waitlist panel with two people waiting, each with a fingerprint and Approve and Deny buttons](docs/img/waitlist.png)
+
+### The admin panel
+
+The **Admin** button in a chat opens the waitlist and four more tabs. **Members** lists the chat's
+members with their fingerprints and how much history each one sees, with buttons to share more or
+remove them (they go back to the waitlist if they return). **Sessions** shows everyone connected to
+the server, in which chat, from which address, with **Kick** and **Ban address**. **Chats** lists
+every chat with its numbers, and renames, clears or deletes them. **Bans** lists banned addresses
+and takes new ones. **Manage server (admins)** on the login page opens the same tabs without joining
+a chat. In the terminal: `/members`, `/remove NAME`, `/sessions`, `/kick N`, `/chats`, `/ban`,
+`/unban` and `/bans`.
+
+![The admin panel's Members tab, with each member's history and Share and Remove buttons](docs/img/admin.png)
 
 ### Getting the data out
 
@@ -217,7 +244,9 @@ type /help for commands
 | `/verify NAME` | mark NAME as verified after comparing fingerprints |
 | `/trust NAME` | accept NAME's new key after it changed |
 | `/quit` | leave (also the Leave button, or Ctrl-C in the terminal) |
-| `/waiting`, `/approve NAME`, `/deny NAME` | admins: the waitlist |
+| `/waiting`, `/approve NAME [DAYS\|all]`, `/deny NAME` | admins: the waitlist, and how much history a newcomer sees |
+| `/share NAME [DAYS]`, `/members`, `/remove NAME` | admins: this chat's members and their history |
+| `/sessions`, `/kick N`, `/chats`, `/ban ADDRESS`, `/unban ADDRESS`, `/bans` | admins: the whole server |
 | `/newchat NAME` | admins: create a chat and get its key (in the page: + Add session, Create your own) |
 
 In the browser, chats you've joined are saved on the login page: click one to rejoin, or
@@ -244,9 +273,10 @@ or pose as your friends without you getting a loud warning.
 - Each user has an Ed25519 identity keypair: in `identity.key` for the terminal client, and in the
   browser's local storage for the web page. It never leaves your device. To log in, you sign a random
   challenge from the server, and the server ties each name to the first identity key that registers it.
-- Chat messages are encrypted with the chat's key (XChaCha20-Poly1305), so everyone in the chat,
-  including people who join later, can read its history. DMs are encrypted for just the two people
-  involved with `crypto_box` (X25519, XSalsa20-Poly1305).
+- Chat messages are encrypted with the chat's key (XChaCha20-Poly1305), so everyone with the key can
+  read them. The server sends people who join later only what's said after they're let in, plus what
+  an admin shares. DMs are encrypted for just the two people involved with `crypto_box` (X25519,
+  XSalsa20-Poly1305).
 - Every message is signed by its sender's identity key. The signature covers the chat, the sender, the
   recipient, the time and a random ID, so nobody (members or server) can forge, relabel, move or
   replay a message without it being rejected.
@@ -268,9 +298,11 @@ or pose as your friends without you getting a loud warning.
   from it, so every guess costs real time and memory. The server stores only a hash of the login token,
   in a `0600` file. Guessing keys by logging in is capped by the rate limits below.
 - Rate limits per IP address (per /64 for IPv6): new connections and page requests (burst of 30,
-  then one every 2 seconds), open connections (16), wrong chat keys (5, then one a minute) and
-  uploaded bytes (100 MB, then 1 MB a second), plus messages and requests per connection.
-  Over the limit, requests get `429` and logins get refused.
+  then one every 2 seconds), open connections (16), chat sessions (16, or what `-L` sets), wrong chat
+  keys (5, then one a minute) and uploaded bytes (100 MB, then 1 MB a second), plus messages and
+  requests per connection. Over the limit, requests get `429` and logins get refused. An identity
+  key gets one chat session at a time.
+- Banned addresses are refused before they get a connection slot.
 - Connections that don't finish their request within 10 seconds, or their login within 15, are dropped.
 - The HTTP parser is strict and small: GET/HEAD only, 8 KB of headers, no control characters, no line folding,
   no duplicate `Host`. Only a fixed list of files is served, so request paths never touch the filesystem;
@@ -299,8 +331,10 @@ This is a hobby project and hasn't had a professional security audit.
   rate limits, but someone who steals the server's files can try keys offline; Argon2id makes that
   cost thousands of CPU-years per chat, not seconds. Keys made before keys got shorter (24 characters)
   are much stronger and keep working.
-- **Anyone with a chat key can read that chat's whole history**, including what was said before they
-  joined. If a key leaks, `hushd revoke` it (which deletes the history) and make a new one.
+- **Anyone with a chat key can decrypt that chat's whole history.** The server only sends newcomers
+  what they've been given, but someone with the key and a copy of the stored messages can read all of
+  it, and so can someone you removed from the chat. If a key leaks, or you remove someone you don't
+  trust, `hushd revoke` the chat (which deletes the history) and make a new key.
 - The waitlist keeps people out of the server, not out of the encryption: someone who has the chat key
   and also gets a copy of the server's files could read the chat without ever being approved.
 - History is kept forever unless you `clear` it, and there's no forward secrecy: whoever gets both a copy

@@ -19,8 +19,10 @@ run hush. It proves who they are when logging in and signs every message they se
 Its fingerprint (`6937 b1d5 ...`) is what people compare on a call to know they're
 talking to each other and not to someone the server slipped in.
 
-Messages to the chat are encrypted with the chat key, so anyone with the key can read
-the whole history, including what was said before they joined. Private messages are
+Messages to the chat are encrypted with the chat key, so anyone with the key can
+decrypt the whole history, including what was said before they joined. The server
+only sends a new member what came after they were let in, unless an admin shares
+more, but the key would open all of it. Private messages are
 encrypted between the two people's identity keys, so nobody else in the chat can
 read them. Images get a fresh key each, which travels inside the message.
 
@@ -142,8 +144,9 @@ the server can't swap in its own key without the warning.
 ## What isn't protected
 
 The server sees who is in which chat, who sends to whom, when, and how big each
-message and image is. Anyone who gets the chat key can read the chat's whole history,
-and there's no forward secrecy, so a key that leaks later still opens old messages.
+message and image is. Anyone who gets the chat key can read the chat's whole history
+if they get the ciphertext too, whatever the server would have shown them, and there's
+no forward secrecy, so a key that leaks later still opens old messages.
 Identity and chat keys are stored unencrypted on the device. The browser runs whatever
 JavaScript the server sends. [THREAT_MODEL.md](THREAT_MODEL.md) goes through what that
 means in practice.

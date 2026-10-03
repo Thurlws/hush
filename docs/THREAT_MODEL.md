@@ -19,6 +19,7 @@ The mechanisms are in [CRYPTOGRAPHY.md](CRYPTOGRAPHY.md) and
 | Someone on the network | can watch traffic, and change it if it isn't TLS |
 | A stranger on the internet | the server's address, no chat key |
 | A member | a chat key, and maybe a seat in the chat |
+| An admin | the admin panel: who's connected from where, every chat's members, kicks, bans, deleting chats |
 | The person running the server | everything the server stores and sends |
 | Someone with the server's files | a copy of the disk or a backup |
 | Someone with your device | your identity key and saved chat keys |
@@ -49,6 +50,10 @@ The mechanisms are in [CRYPTOGRAPHY.md](CRYPTOGRAPHY.md) and
 - Only people with the chat key can log in to a chat, and only an admin can let a
   new person in. The server enforces both: someone waiting gets nothing from the
   chat, not even who's in it.
+- A new member gets the history from when they were let in, and an admin decides
+  whether they see more. The server enforces that as well (see below for its limits).
+- Being an admin doesn't open any chat. Admins can manage a chat from outside it,
+  but reading it still takes its key.
 - Strangers without a key can't do much beyond loading the web page. Logins, page
   loads, uploads and open connections are rate limited per address.
 
@@ -56,21 +61,25 @@ The mechanisms are in [CRYPTOGRAPHY.md](CRYPTOGRAPHY.md) and
 
 - Metadata. The server knows who is in which chat, who messages whom, when, and how
   big each message and image is. The terminal client's connection has no TLS, so the
-  network sees that too.
+  network sees that too. Admins see part of it: the session list shows everyone's
+  name, chat and IP address, and since when they've been connected.
 - A malicious server serving a malicious page. Browser users run the JavaScript the
   server sends. The terminal client doesn't have this problem.
 - Forward secrecy. A chat key that leaks later still opens the whole stored history,
   and so does one person's identity key for their DMs.
-- Members reading history. Anyone with the chat key can read everything ever said in
-  the chat. That's the design, so newcomers get the history.
+- History the server didn't send. Everyone in a chat has the same key, so a member
+  who gets the stored ciphertext some other way (a backup, or another member's copy)
+  can read all of it, from before they joined too. The same goes for someone an
+  admin removed: the server stops sending them anything, but only a new key
+  (`hushd revoke`, then `newkey`) locks them out of the encryption.
 - A compromised device. Identity and chat keys are stored unencrypted, protected only
   by file permissions and the browser profile.
 - Availability against the server or a big attack. The server can drop, delay or
   reorder messages, and the rate limits won't stop a large botnet.
 - Members being annoying. Someone with the key can post as much as the rate limits
-  allow, register many names, or send images built to make browsers struggle to
-  decode them. WebSocket pings aren't rate limited either, though each one only gets
-  a pong back.
+  allow, register many names one after another (an identity key gets one session at
+  a time), or send images built to make browsers struggle to decode them. WebSocket
+  pings aren't rate limited either, though each one only gets a pong back.
 
 ## Walkthroughs
 
@@ -113,6 +122,16 @@ newcomers land on the waitlist and get nothing from the chat until an admin appr
 them. The waitlist protects the server, not the encryption, though. Someone with the
 key and a copy of the server's files could decrypt the chat without ever being let in.
 
+### Someone keeps coming back
+
+An admin can kick a session, remove a member from a chat and ban an IP address.
+Bans are the weakest of the three: a phone network or another Wi-Fi gives a new
+address, and an IPv6 ban covers one /64. Every new identity has to get past the
+waitlist, though, and a removed member goes back on it, so what decides who gets in
+is still an admin approving them. Someone denied stays out until an admin changes
+their mind. Loopback addresses can't be banned: behind a reverse proxy without `-x`,
+everyone arrives from 127.0.0.1, and a ban would lock out the whole server.
+
 ### A client sends garbage
 
 Frames over 64 KB, zero-length frames, unmasked or
@@ -131,6 +150,8 @@ Content-Security-Policy and the browser's same-origin rules.
 ### Your laptop is stolen
 
 The thief gets your identity key and, in the browser, the
-keys of chats you saved. They can read those chats and post as you. What to do: have
-an admin `hushd revoke` the chats and make new keys, and `hushd forget` your name so
-you can register a new identity.
+keys of chats you saved. They can read those chats and post as you. What to do: an
+admin can remove that identity from the chats in the admin panel straight away, which
+stops the server sending it anything. To lock it out of the encryption too, `hushd
+revoke` the chats and make new keys. Then `hushd forget` your name so you can register
+a new identity.

@@ -37,7 +37,7 @@ This is the setup for a small cloud server, e.g. an Oracle Cloud free VM. You ge
    }
    ```
    The service runs `hushd -x`, which makes it trust the `X-Forwarded-For` header from Caddy,
-   so the rate limits apply to each visitor's real address.
+   so the rate limits and bans apply to each visitor's real address.
 
 5. **Create a chat key and make yourself admin.** Open your site. The login page shows your fingerprint.
    ```sh
@@ -52,6 +52,25 @@ For uptime monitoring, poll `https://chat.example.com/health`. It answers `ok` a
 event loop is running. `hushd -V` prints the version.
 
 To update: `git pull && make && sudo make install PREFIX=/usr/local && sudo systemctl restart hushd`.
+
+## Admins, bans and limits
+
+Admins manage the server from the browser: the **Admin** button in a chat, or **Manage server
+(admins)** on the login page. That shows who's connected and from where, each chat's members and
+how much history they see, and the banned addresses, with buttons to kick, remove, ban, share
+history, rename, clear and delete. The terminal client has the same as commands (`/help` lists
+them), and bans work from the shell too:
+
+```sh
+sudo -u hush hushd -C /var/lib/hush ban 203.0.113.9     # IPv6 is banned per /64
+sudo -u hush hushd -C /var/lib/hush bans
+sudo -u hush hushd -C /var/lib/hush unban 203.0.113.9
+```
+
+Bans live in `/var/lib/hush/hushd-bans.txt`, and a running hushd picks up changes to it by
+itself. Each address can have 16 chat sessions open. To allow fewer, say one, change the
+service's `ExecStart` to `/usr/local/bin/hushd -x -L 1` and restart it. Page loads don't count
+against it, and neither do admins managing the server.
 
 ## Backups
 
@@ -87,6 +106,14 @@ sudo cp -a /var/backups/hush/2026-10-03 /var/lib/hush
 sudo chown -R hush:hush /var/lib/hush
 sudo systemctl start hushd
 ```
+
+## Upgrading from 0.1.0
+
+The database upgrades itself on the first start (schema 3). People who were already in a chat
+keep seeing all of its history. From then on, people you let in see what's said after that,
+unless you share more: pick an amount when you approve them, or later from their row under
+**Members**. Old terminal clients keep working with the new server, but the new terminal client
+needs the new server, so update the server first.
 
 ## Upgrading from the version without history
 

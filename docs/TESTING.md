@@ -34,16 +34,20 @@ person's key. Each has to fail.
 
 `test.sh` builds nothing. It starts real hushd processes on localhost and drives
 terminal clients, the web client's protocol code under Node (`test-web.mjs`) and
-the HTTP side with curl. 156 checks, about two minutes. Without Node the web parts
+the HTTP side with curl. 218 checks, about three minutes. Without Node the web parts
 are skipped and say so.
 
 What it covers, roughly in order:
 
 - Logging in: wrong keys, old 24-character keys, keys typed in odd ways, protocol
-  versions, the first admin, names already taken.
-- Chats: messages, DMs across terminal and browser, history for newcomers without
-  other people's DMs, offline DMs, images with their metadata stripped, "My data",
+  versions, the first admin, names already taken, one session per identity key and
+  `-L` per address.
+- Chats: messages, DMs across terminal and browser, history for admins without other
+  people's DMs, offline DMs, images with their metadata stripped, "My data",
   `hushd export`.
+- History for newcomers: approved from a client or the command line, they see nothing
+  from before. Shared from a client while they're online (the last 7 days, with older
+  messages backdated in the database) and with `hushd share`, then never taken back.
 - The waitlist: approving and denying from a client and from the command line,
   people waiting seeing nothing, denied people staying out.
 - Key changes: when the server hands out a new key for someone, clients hide their
@@ -53,6 +57,14 @@ What it covers, roughly in order:
 - The web server: headers, path traversal, methods, Origin checks.
 - Admin commands: `clear`, `revoke`, `forget`, old key formats, database migrations, and a
   backup of the running server, opened and exported again to compare with the original.
+- Admin requests, from a chat and from the admin-only login: listing sessions, chats
+  and members, kicking, removing (and the removed person waiting again), letting people
+  in from outside the chat, and clearing, renaming and deleting a chat while someone's
+  in it. Non-admins are refused both ways.
+- Bans, behind `-x` so test clients can come from other addresses: a connected client
+  is dropped, page loads get 403, IPv6 is banned per /64 and its neighbours aren't,
+  admins can't ban themselves or loopback, and `hushd ban`, `unban` and editing
+  `hushd-bans.txt` reach a running server.
 - Permissions the server checks itself, using raw frames a normal client wouldn't
   send: DECIDE and NEWCHAT from non-admins, posting from the waitlist, fetching an
   image from another chat, a message bigger than any client builds.
@@ -100,9 +112,9 @@ the same counts.
 | `src/proto.c` | 148 | 98.7% |
 | `src/msg.c` | 79 | 98.7% |
 | `src/web.c` | 255 | 94.5% |
-| `src/server.c` | 1565 | 84.0% |
-| `src/client.c` | 1121 | 77.5% |
-| total | 3168 | 83.6% |
+| `src/server.c` | 2199 | 85.0% |
+| `src/client.c` | 1316 | 78.2% |
+| total | 3997 | 84.2% |
 
 Most of what's left in `client.c` is the interactive terminal: raw mode, the line
 editor and the hidden key prompt, which a test feeding stdin through a pipe never
@@ -137,6 +149,10 @@ Everything builds without warnings under `-Wall -Wextra -Wpedantic -Wconversion
 | The sanitizer build linked the unit tests without sanitizer flags | the first `make asan test` | `2826df8` |
 | A 40 ms stall on small messages: neither side set `TCP_NODELAY`, so frames waited for delayed ACKs | the benchmark | `7dab041` |
 | The terminal showed Unicode bidi overrides that the browser removes | writing tests for code that coverage showed untested | `ed58a8b` |
+| `test.sh` gave hushd a fixed 0.3 s to start, which a busy CI runner missed | a failed CI run | `f8d3217` |
+| hushd commands run in the wrong folder made an empty database there and reported 0 messages | a bug report | `a7fbafa` |
+| Clearing a chat lets SQLite reuse message ids, which would have hidden new messages from members whose history starts at an old id. Caught before it shipped | reading the code while adding history from join | `0018e25` |
+| A terminal client on the waitlist ignored SIGTERM and SIGHUP, so it kept waiting after its window closed | a test that hung | `a78ae72` |
 
 ## What isn't covered
 
@@ -146,4 +162,4 @@ Everything builds without warnings under `-Wall -Wextra -Wpedantic -Wconversion
 - Running out of disk. The low-disk refusals exist but are hard to trigger in a test.
 - Load. [BENCHMARK.md](BENCHMARK.md) measures it, but nothing fails a build when it
   gets slower.
-- Other systems. hush is Linux only, and CI runs on Arch.
+- Other systems. hush is Linux only, and CI runs on Arch and Ubuntu 24.04.

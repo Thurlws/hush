@@ -4,6 +4,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and version 
 follow [semantic versioning](https://semver.org/). Before 1.0 a minor release can include
 incompatible changes, and the notes will say so.
 
+## Unreleased
+
+Protocol version 2 and database schema 3. The database upgrades itself. Old terminal clients
+still work with the new server, but the new terminal client needs the new server.
+
+### Added
+
+- An admin panel in the browser, in the chat (**Admin**) and on the login page (**Manage
+  server**): who's connected and from where, each chat's members, banned addresses, and
+  buttons to kick, remove, ban, share history, and rename, clear or delete a chat. The
+  terminal client has the same as commands.
+- IP bans, kept in `hushd-bans.txt`, with `hushd ban`, `unban` and `bans`. IPv6 is banned per
+  /64, and loopback can't be banned.
+- `-L N` limits chat sessions per address, and an identity key gets one session at a time.
+- `hushd share CHAT USER [DAYS]`, `/share` and `/approve NAME [DAYS|all]`.
+
+### Changed
+
+- New members see the history from when they were let in. An admin can share the last day,
+  7 or 30 days, or all of it, when approving them or later. People who were already in a
+  chat keep seeing all of it, and admins see everything.
+- The web client keeps join and leave lines, and key warnings, across reloads and rejoins.
+- `hushd` commands no longer create an empty database in a folder hushd hasn't run in.
+  `hushd keys` says which folder it read.
+- The admin-only login stays open instead of closing after 60 seconds.
+
 ## 0.1.0 (2026-10-03)
 
 The first release: `hushd`, the terminal client `hush`, and the web client hushd serves.

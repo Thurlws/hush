@@ -48,26 +48,33 @@ an admin decides. Admins in the chat get a `PENDING` for them and answer with
 if it's no they get an error and the connection closes.
 
 A HELLO whose token is 32 zero bytes asks for no chat. Only admins get through,
-with `ADMIN` instead of `WELCOME`, and the only thing they can do then is send
-`NEWCHAT`. This is how the home page's "Create your own" works.
+with `ADMIN` instead of `WELCOME`, and then they can send `NEWCHAT` and `MANAGE`.
+This is how the home page's "Create your own" and "Manage server" work.
 
-A connection has 15 seconds to finish logging in, or 60 for the admin-only login.
-People on the waitlist can stay connected as long as they like.
+A connection has 15 seconds to finish logging in. After that, people on the
+waitlist and admins logged in without a chat can stay connected as long as they like.
+
+An identity key can be in one chat at a time: a second login with the same key is
+refused while the first one is in a chat or on its waitlist, whatever name it uses.
+The admin-only login doesn't count.
 
 ## Versions
 
-The last byte of HELLO is the protocol version, currently 1. hushd accepts versions
-`HUSH_PROTO_MIN` to `HUSH_PROTO` (0 to 1 right now) and refuses anything else with
+The last byte of HELLO is the protocol version, currently 2. hushd accepts versions
+`HUSH_PROTO_MIN` to `HUSH_PROTO` (0 to 2 right now) and refuses anything else with
 an error that names both versions and says which side needs updating:
 
 ```
-unsupported protocol version 9 (this server speaks 0 to 1), the server needs updating
+unsupported protocol version 9 (this server speaks 0 to 2), the server needs updating
 ```
 
 A HELLO without the byte counts as version 0. Those are clients from before
-versions existed. They're still accepted because nothing else on the wire changed.
-The first incompatible change will raise both numbers, and from then on old
-clients get that error instead of failing in some confusing way.
+versions existed. Version 2 added the admin requests and the frames that go with
+them (`MANAGE` and types 23 to 28). Clients that speak 0 or 1 are still accepted,
+and hushd never sends them the new frames. A version 2 client talking to an older
+hushd gets the error above, rather than a dropped connection the first time an
+admin uses something the server doesn't know. The first change old clients can't
+live with will raise both numbers.
 
 The version covers the frames. A few other things carry their own version and
 change independently:
@@ -77,7 +84,7 @@ change independently:
 | Message plaintext layout | first byte of every plaintext | 3 |
 | Signature contexts | `hush-auth-v3`, `hush-msg-v3` | v3 |
 | Chat key derivation | BLAKE2b keys `hush-chat-*-v4` | v4 (24-character keys use v3) |
-| Database schema | `PRAGMA user_version` in `hushd.db` | 2 |
+| Database schema | `PRAGMA user_version` in `hushd.db` | 3 |
 
 ## Frames
 
@@ -93,6 +100,7 @@ Client to server:
 | 6 | FETCH | blob id (16) |
 | 7 | DECIDE | approve (u8), name |
 | 8 | NEWCHAT | chat label, token (32) of a key the client made |
+| 9 | MANAGE | op (u8), then its arguments (see [Admin requests](#admin-requests)) |
 
 Server to client:
 
@@ -100,7 +108,7 @@ Server to client:
 |---|---|---|
 | 10 | CHALLENGE | 32 random bytes |
 | 11 | WELCOME | chat label, flags (u8: 1 means admin) |
-| 12 | PEER | name, public key (32), flags (u8: 1 online, 2 just joined) |
+| 12 | PEER | name, public key (32), flags (u8: 1 online, 2 just joined, 4 removed) |
 | 13 | LEAVE | name |
 | 14 | MSG | id (u64), server time in ms (u64), live (u8), sender, recipient, body |
 | 15 | ERROR | UTF-8 text |
@@ -111,6 +119,12 @@ Server to client:
 | 20 | PENDING | waiting (u8: 1 waiting, 0 decided), name, public key (32) |
 | 21 | CREATED | chat label |
 | 22 | ADMIN | nothing |
+| 23 | ITEM | list (u8), then one entry of it |
+| 24 | LIST_END | list (u8) |
+| 25 | DONE | op (u8), ok (u8), UTF-8 text |
+| 26 | SHARED | days (u16), 0 for all of it: an admin let you see more history |
+| 27 | CLEARED | nothing: the chat's history was deleted |
+| 28 | RENAMED | the chat's new label |
 
 Any frame that doesn't fit the connection's state (a POST before logging in, a HELLO
 after it) is a protocol violation and ends the connection.
@@ -140,6 +154,18 @@ was sent to you, which is what "My data" uses. The limit is at most 200. The ser
 answers with `MSG` frames (`live` 0), oldest first, then `HISTORY_END` saying whether
 there's more. DMs only ever reach their sender and recipient, in history too.
 
+Members see the history from when they were let in. Each member has a starting
+point, the newest message id when they were approved, and directions 0 and 1 only
+return messages after it. Admins see everything, and so do members from before
+schema 3. An admin can move the starting point back with `MANAGE` SHARE, to the
+start or to N days ago, but never forward again. If the member is online they get
+`SHARED`, and their client asks for the older messages. "My data" (direction 2)
+isn't limited, since it's your own messages. Clearing a chat resets everyone's
+starting point, because the deleted message ids can be used again.
+
+This is the server choosing what to send. Everyone in a chat has the same chat key,
+so it can decrypt every message stored for that chat, whatever the server shows them.
+
 ### Delivery and ordering
 
 Message ids are SQLite row ids, so they follow the order the server stored messages
@@ -168,6 +194,45 @@ the client posts a message that carries the id and the image's key.
 the blob was uploaded in the same chat. Otherwise the status is 2, "missing", the
 same answer as for an id that doesn't exist. Up to 16 fetches can be queued per
 connection.
+
+## Admin requests
+
+Admins send `MANAGE`, either from inside a chat or after the admin-only login. The first
+byte is the operation, the rest its arguments. A chat is named by its label, and an
+address is `u8 length | text`, like `203.0.113.9` or `2001:db8::/64`.
+
+| Op | Name | Arguments | Does |
+|---|---|---|---|
+| 0 | LIST | list (u8), and for members the chat | answers with `ITEM`s and a `LIST_END` |
+| 1 | KICK | session id (u32) | disconnects that session |
+| 2 | REMOVE | chat, name | takes a member out. If they come back, they wait again |
+| 3 | BAN | address | refuses the address (IPv6: its /64) and disconnects it |
+| 4 | UNBAN | address | |
+| 5 | SHARE | chat, name, days (u16) | lets a member see the last `days` days of history from before they joined, or all of it with 0 |
+| 6 | CLEAR | chat | deletes its messages and images |
+| 7 | REVOKE | chat | deletes the chat, key and all, and disconnects everyone in it |
+| 8 | RENAME | chat, new label | |
+| 9 | DECIDE | chat, approve (u8), name | `DECIDE` for any chat, not just the one you're in |
+
+Every request gets exactly one answer, in order: `ITEM`s and a `LIST_END` for a list, a
+`DONE` for anything else. `DONE` carries the op, whether it worked, and a sentence for
+people, like `banned 203.0.113.9` or `amy isn't in friends`. Someone who isn't an admin
+gets a `DONE` that says so. Arguments that can't be parsed end the connection, like any
+malformed frame.
+
+The lists:
+
+| List | Each `ITEM` |
+|---|---|
+| 0 sessions | id (u32), flags (u8: 1 browser, 2 admin, 4 waiting, 8 you, 16 still logging in), connected at (u64 ms), address, name, chat label (both empty when there's none) |
+| 1 chats | label, old key (u8), members (u32), waiting (u32), online (u32), messages (u64), images (u64), image bytes (u64) |
+| 2 members | name, public key (32), state (u8: 0 waiting, 1 in, 2 turned away), flags (u8: 1 online, 2 admin), joined at (u64 ms, 0 if unknown), sees history after (u64 ms, 0 for all of it) |
+| 3 bans | address, banned at (u64 ms), the admin who did it (empty from the command line) |
+
+What admins do reaches the people concerned: a removed member gets an error and the
+connection closes, and everyone else in the chat gets a `PEER` with flag 4. `SHARED`,
+`CLEARED` and `RENAMED` go to clients that speak protocol 2. Older clients get an `ERROR`
+saying the history was deleted, and nothing for the others.
 
 ## Errors and closing
 
@@ -202,8 +267,11 @@ connection closes.
 | Wrong chat keys | 5, then one a minute, per IP address |
 | New connections and page loads | 30 at once, then one every 2 seconds, per IP address |
 | Open connections | 16 per IP address |
+| Chat sessions | 16 per IP address, or what `-L` sets, and one per identity key |
 | Uploaded bytes | 100 MB at once, then 1 MB a second, per IP address |
 | Waitlist | 50 people per chat |
 
 IPv6 addresses count per /64. Behind a reverse proxy started with `-x`, the limits
-apply to the last address in `X-Forwarded-For`.
+apply to the last address in `X-Forwarded-For`, and so do bans. A banned address is
+refused before it gets a slot: page loads and WebSockets with `403`, terminal clients
+with an `ERROR` saying the server doesn't accept their address.

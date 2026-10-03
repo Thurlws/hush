@@ -21,7 +21,12 @@
  * Admins are identity keys the operator listed by fingerprint. They get
  * PENDING for each person waiting and answer with DECIDE.
  * A HELLO with an all-zero token asks for no chat at all: only admins get
- * through (ADMIN instead of WELCOME), and can then only send NEWCHAT.
+ * through (ADMIN instead of WELCOME), and can then send NEWCHAT and MANAGE.
+ *
+ * Members see the history from when they were let in. Admins see all of it,
+ * and can share more with a member (MANAGE, MG_SHARE). MANAGE also lists
+ * and acts on sessions, chats, members and bans: each list comes back as
+ * ITEMs and a LIST_END, each action as a DONE.
  *
  * After that, clients POST messages. The server stores them and sends a
  * MSG to everyone concerned who is online. HISTORY asks for stored ones.
@@ -67,7 +72,7 @@
 /* Protocol version, the last byte of HELLO. A HELLO without it is version 0,
  * from before versions. hushd refuses anything outside MIN..HUSH_PROTO, so
  * the first incompatible change bumps both. */
-#define HUSH_PROTO         1
+#define HUSH_PROTO         2
 #define HUSH_PROTO_MIN     0
 
 enum {
@@ -81,10 +86,11 @@ enum {
     T_FETCH = 6,   /* blob id[16] */
     T_DECIDE = 7,  /* admins: u8 approve, name */
     T_NEWCHAT = 8, /* admins: chat label, login token[32] of a key the client made */
+    T_MANAGE = 9,  /* admins: u8 op (MG_*), then its arguments, see below */
     /* server -> client */
     T_CHALLENGE = 10,   /* challenge[32] */
     T_WELCOME = 11,     /* chat label (same rules as a name), u8 flags (WELCOME_ADMIN) */
-    T_PEER = 12,        /* name, pk[32], u8 flags (PEER_ONLINE, PEER_NEW) */
+    T_PEER = 12,        /* name, pk[32], u8 flags (PEER_ONLINE, PEER_NEW, PEER_REMOVED) */
     T_LEAVE = 13,       /* name: went offline */
     T_MSG = 14,         /* u64 id, u64 server time (ms), u8 live, from, to, body */
     T_ERROR = 15,       /* utf-8 text */
@@ -95,9 +101,43 @@ enum {
     T_PENDING = 20,     /* admins: u8 waiting (1) or decided (0), name, pk[32] */
     T_CREATED = 21,     /* admins: chat label, after NEWCHAT */
     T_ADMIN = 22,       /* admins: logged in without a chat (empty) */
+    /* from protocol 2 */
+    T_ITEM = 23,     /* admins: u8 list (LIST_*), one entry of it, see below */
+    T_LIST_END = 24, /* admins: u8 list */
+    T_DONE = 25,     /* admins: u8 op, u8 ok, utf-8 text saying what happened */
+    T_SHARED = 26,   /* an admin shared history with you: u16 days, 0 for all of it */
+    T_CLEARED = 27,  /* the chat's history was deleted (empty) */
+    T_RENAMED = 28,  /* the chat has a new name: chat label */
 };
 
-enum { PEER_ONLINE = 1, PEER_NEW = 2 };
+/* MANAGE ops and their arguments. A chat is named by its label, an address is
+ * u8 len + text like "203.0.113.9" or "2001:db8::/64" (IPv6 counts per /64). */
+enum {
+    MG_LIST = 0,   /* u8 list, then for LIST_MEMBERS the chat */
+    MG_KICK = 1,   /* u32 session id: disconnect it */
+    MG_REMOVE = 2, /* chat, name: out of the chat, back to the waitlist if they return */
+    MG_BAN = 3,    /* address: refuse it and disconnect it */
+    MG_UNBAN = 4,  /* address */
+    MG_SHARE = 5,  /* chat, name, u16 days (0: everything) of history to let them see */
+    MG_CLEAR = 6,  /* chat: delete its messages and images */
+    MG_REVOKE = 7, /* chat: delete it, key and all */
+    MG_RENAME = 8, /* chat, new label */
+    MG_DECIDE = 9, /* chat, u8 approve, name: like DECIDE, for any chat */
+};
+/* ITEM entries:
+ *   LIST_SESSIONS: u32 id, u8 flags (SESSION_*), u64 connected at (ms), address,
+ *                  name (empty while logging in), chat label (empty for none)
+ *   LIST_CHATS:    label, u8 old key, u32 members, u32 waiting, u32 online,
+ *                  u64 messages, u64 images, u64 image bytes
+ *   LIST_MEMBERS:  name, pk[32], u8 state (0 waiting, 1 in, 2 turned away),
+ *                  u8 flags (MEMBER_IS_ONLINE, MEMBER_IS_ADMIN), u64 joined at (ms, 0 unknown),
+ *                  u64 sees history after (ms, 0 for all of it)
+ *   LIST_BANS:     address, u64 banned at (ms), name of the admin (empty from the command line) */
+enum { LIST_SESSIONS = 0, LIST_CHATS = 1, LIST_MEMBERS = 2, LIST_BANS = 3 };
+enum { SESSION_WEB = 1, SESSION_ADMIN = 2, SESSION_WAITING = 4, SESSION_YOU = 8, SESSION_LOGIN = 16 };
+enum { MEMBER_IS_ONLINE = 1, MEMBER_IS_ADMIN = 2 };
+
+enum { PEER_ONLINE = 1, PEER_NEW = 2, PEER_REMOVED = 4 };
 enum { UP_FIRST = 1, UP_LAST = 2 };
 enum { WELCOME_ADMIN = 1 };
 enum { HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2 };

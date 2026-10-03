@@ -335,16 +335,28 @@ function showWaitlist() {
       const row = el("div", "request");
       const approve = el("button", "approve", "Approve"), deny = el("button", "deny", "Deny");
       approve.type = deny.type = "button";
-      approve.onclick = () => { approve.disabled = deny.disabled = true; chat.decide(name, true); };
+      const hist = historyPicker();
+      approve.onclick = () => { approve.disabled = deny.disabled = true; chat.decide(name, true, pickedDays(hist)); };
       deny.onclick = () => { approve.disabled = deny.disabled = true; chat.decide(name, false); };
       const who = el("div", "who-box");
       who.append(el("span", "who", name), el("span", "fp", fp));
-      row.append(who, approve, deny);
+      row.append(who, hist, approve, deny);
       list.append(row);
     }
   $("waitlist-empty").hidden = n > 0;
   if (!admin) $("waitlist").hidden = true;
 }
+
+// How much of the history from before they joined someone gets to see.
+function historyPicker(none = "no history") {
+  const sel = el("select", "history");
+  sel.title = "History they can see from before";
+  sel.setAttribute("aria-label", sel.title);
+  for (const [v, t] of [["", none], ["1", "last day"], ["7", "last 7 days"], ["30", "last 30 days"], ["0", "all history"]])
+    sel.append(Object.assign(el("option", "", t), { value: v }));
+  return sel;
+}
+const pickedDays = sel => sel.value === "" ? null : Number(sel.value);
 
 function toggleWaitlist(open = $("waitlist").hidden) {
   $("waitlist").hidden = !open;
@@ -576,6 +588,11 @@ function onEvent(ev, name, key) {
   case "peer": showPeer(ev); showOnline(); break;
   case "leave": setOnline(ev.name, false); event(ev.name, "sys", `* ${ev.name} went offline`); showOnline(); break;
   case "notice": line(ev.level, ev.text); break;
+  case "done": line(ev.ok ? "info" : "warn", (ev.ok ? "" : "! ") + ev.text); break;
+  case "shared":
+    event("", "sys", ev.days ? `* an admin shared the last ${ev.days} day${ev.days === 1 ? "" : "s"} of history with you`
+                             : "* an admin shared the chat's history with you");
+    break;
   case "error": if (inChat && chat && chat.ready) line("warn", `! server: ${ev.text}`); break;
   case "closed":
     if (ev.quit || ev.error) { // left, or the server said no: don't retry

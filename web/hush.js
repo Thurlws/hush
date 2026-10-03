@@ -3,13 +3,15 @@
 // chat. No DOM here: app.js draws the page and tests run this in Node.
 
 const T = {
-  HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6, DECIDE: 7, NEWCHAT: 8,
+  HELLO: 1, AUTH: 2, POST: 3, HISTORY: 4, UPLOAD: 5, FETCH: 6, DECIDE: 7, NEWCHAT: 8, MANAGE: 9,
   CHALLENGE: 10, WELCOME: 11, PEER: 12, LEAVE: 13, MSG: 14, ERROR: 15, HISTORY_END: 16, UPLOADED: 17, BLOB: 18,
-  WAITING: 19, PENDING: 20, CREATED: 21, ADMIN: 22,
+  WAITING: 19, PENDING: 20, CREATED: 21, ADMIN: 22, ITEM: 23, LIST_END: 24, DONE: 25, SHARED: 26, CLEARED: 27,
+  RENAMED: 28,
 };
+export const MG = { LIST: 0, KICK: 1, REMOVE: 2, BAN: 3, UNBAN: 4, SHARE: 5, CLEAR: 6, REVOKE: 7, RENAME: 8, DECIDE: 9 };
 const HIST_OLDER = 0, HIST_NEWER = 1, HIST_MINE = 2, WELCOME_ADMIN = 1;
 const PEER_ONLINE = 1, PEER_NEW = 2, UP_FIRST = 1, UP_LAST = 2, BLOB_LAST = 1, BLOB_MISSING = 2;
-const KIND_TEXT = 0, KIND_IMAGE = 1, VERSION = 3, PROTOCOL = 1; // PROTOCOL matches HUSH_PROTO
+const KIND_TEXT = 0, KIND_IMAGE = 1, VERSION = 3, PROTOCOL = 2; // PROTOCOL matches HUSH_PROTO
 const AUTH_CONTEXT = "hush-auth-v3", MSG_CONTEXT = "hush-msg-v3";
 const NONCE = 24, MAC = 16, SIG = 64, HEAD = 26, CHUNK = 48 * 1024;
 export const MAX_TEXT = 4000;
@@ -139,6 +141,8 @@ export function createChat({ sodium, url, name, secretKey, WebSocket: WS = globa
 //   leave {name}              went offline
 //   message {msg}             a new message (msg: see openMessage)
 //   history {messages, dir, more}   a page of stored messages, oldest first
+//   shared {days}             an admin let you see more history (days, or 0 for all of it). It loads as history
+//   done {op, ok, text}       admins: what an admin request did
 //   notice {level: "info"|"warn", text}
 //   error {text}              the server refused something
 //   closed {error, wasReady, quit}  error is set if the server refused us
@@ -224,6 +228,7 @@ export class Session {
         this.emit({ type: "waiting", label: readName(p)[0] });
       } else if (type === T.WELCOME && readName(p)) {
         const [label, off] = readName(p);
+        this.label = label;
         this.ready = true;
         this.admin = off < p.length && (p[off] & WELCOME_ADMIN) !== 0;
         this.lastError = null;
@@ -242,6 +247,11 @@ export class Session {
     else if (type === T.UPLOADED && p.length === 16 && this.upload) this.upload.resolve(p.slice());
     else if (type === T.BLOB && p.length >= 17) this.onBlob(p);
     else if (type === T.PENDING) this.onPending(p);
+    else if (type === T.DONE && p.length >= 2) this.emit({ type: "done", op: p[0], ok: p[1] === 1, text: clean(dec.decode(p.subarray(2))) });
+    else if (type === T.SHARED && p.length === 2) {
+      this.emit({ type: "shared", days: view(p).getUint16(0) });
+      if (!this.exporting) this.history(HIST_OLDER, this.oldestId);
+    }
   }
 
   onPending(p) {
@@ -253,11 +263,19 @@ export class Session {
     this.emit({ type: "pending", name, fp, waiting: p[0] === 1 });
   }
 
-  // Admins: let someone on the waitlist in, or turn them away.
-  decide(name, approve) {
+  // Admins: let someone on the waitlist in, or turn them away. With days (0 for all
+  // of it), they also get to see that much of the history from before.
+  decide(name, approve, days = null) {
     if (!this.admin) return this.notice("only an admin can do that", "warn");
     if (!NAME_RE.test(name)) return this.notice(`usage: /${approve ? "approve" : "deny"} NAME`);
     this.send(T.DECIDE, Uint8Array.of(approve ? 1 : 0), nameBytes(name));
+    if (approve && days !== null) this.share(name, days);
+  }
+
+  // Admins: let a member see the last days days of history, or all of it with 0.
+  share(name, days = 0) {
+    if (!this.admin) return this.notice("only an admin can do that", "warn");
+    this.send(T.MANAGE, Uint8Array.of(MG.SHARE), nameBytes(this.label), nameBytes(name), u16(days));
   }
 
   // Everything you sent in this chat and the DMs sent to you, decrypted:
@@ -508,7 +526,7 @@ export class Session {
       else if (cmd === "fp") this.fp(arg);
       else if (cmd === "verify") this.verify(arg);
       else if (cmd === "trust") this.trust(arg);
-      else if (cmd === "approve") this.decide(arg, true);
+      else if (cmd === "approve" || cmd === "share") this.shareCommand(cmd, arg);
       else if (cmd === "deny") this.decide(arg, false);
       else if (cmd === "waiting") this.listWaiting();
       else this.notice("unknown command; try /help", "warn");
@@ -516,6 +534,15 @@ export class Session {
     }
     const text = s[0] === "/" ? s.slice(1) : s;
     if (this.fits(text)) this.post(null, KIND_TEXT, enc.encode(text));
+  }
+
+  // /approve NAME [DAYS|all], /share NAME [DAYS]
+  shareCommand(cmd, arg) {
+    const m = /^(\S+)(?:\s+(all|\d+))?$/.exec(arg), days = m && m[2] ? (m[2] === "all" ? 0 : Number(m[2])) : null;
+    if (!m || (m[2] && m[2] !== "all" && (days < 1 || days > 65535)))
+      return this.notice(`usage: /${cmd} NAME [DAYS|all]`);
+    if (cmd === "approve") this.decide(m[1], true, days);
+    else this.share(m[1], days ?? 0);
   }
 
   fits(text) {
@@ -536,8 +563,11 @@ export class Session {
       "Send an image with the + button, or paste one. \"My data\" downloads everything you sent." +
       (this.admin ? "\nAs an admin:\n" +
         "  /waiting         who's waiting to join\n" +
-        "  /approve NAME    let NAME in (check their fingerprint first)\n" +
+        "  /approve NAME [DAYS|all]  let NAME in (check their fingerprint first), and let\n" +
+        "                   them see the last DAYS days of history, or all of it\n" +
         "  /deny NAME       turn NAME away\n" +
+        "  /share NAME [DAYS]  let NAME see history from before they joined: all of it,\n" +
+        "                   or the last DAYS days\n" +
         "Create chats on the home page: + Add session, then Create your own." : ""));
   }
 

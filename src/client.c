@@ -889,25 +889,98 @@ static void on_pending(const uint8_t *p, size_t n)
         col("\033[1;33m"), name, fp, col("\033[0m"), name, name);
 }
 
-static void cmd_decide(const char *name, int approve)
+/* "all" or a number of days, as typed after a name. -1 if it's neither. */
+static int parse_days(const char *s)
+{
+    if (!strcmp(s, "all"))
+        return 0;
+    char *end;
+    long d = strtol(s, &end, 10);
+    return *s && !*end && d >= 1 && d <= 65535 ? (int)d : -1;
+}
+
+static void send_share(const char *name, int days)
+{
+    struct buf b = { 0 };
+    uint8_t op = MG_SHARE, d[2];
+    buf_put(&b, &op, 1);
+    name_put(&b, chat_label);
+    name_put(&b, name);
+    put_u16(d, (uint16_t)days);
+    buf_put(&b, d, 2);
+    net_send(T_MANAGE, &b);
+    buf_free(&b);
+}
+
+/* /approve NAME [DAYS|all] lets them see that much history too, /deny NAME */
+static void cmd_decide(char *arg, int approve)
 {
     if (!am_admin) {
         say("! only an admin can do that");
         return;
     }
-    if (!*name) {
-        say("usage: /%s NAME", approve ? "approve" : "deny");
+    char *rest = strchr(arg, ' ');
+    if (rest)
+        *rest++ = '\0';
+    int days = rest && approve ? parse_days(rest) : -2;
+    if (!*arg || days == -1 || (rest && !approve)) {
+        say(approve ? "usage: /approve NAME [DAYS|all]   (DAYS: how much history they get to see)" : "usage: /deny NAME");
+        return;
+    }
+    if (!name_valid(arg, strlen(arg))) {
+        say("! %s isn't a name", arg);
         return;
     }
     struct buf b = { 0 };
     uint8_t a = (uint8_t)approve;
     buf_put(&b, &a, 1);
-    name_put(&b, name);
-    if (name_valid(name, strlen(name)))
-        net_send(T_DECIDE, &b);
-    else
-        say("! %s isn't a name", name);
+    name_put(&b, arg);
+    net_send(T_DECIDE, &b);
     buf_free(&b);
+    if (days >= 0)
+        send_share(arg, days);
+}
+
+/* /share NAME [DAYS] */
+static void cmd_share(char *arg)
+{
+    if (!am_admin) {
+        say("! only an admin can do that");
+        return;
+    }
+    char *rest = strchr(arg, ' ');
+    if (rest)
+        *rest++ = '\0';
+    int days = rest ? parse_days(rest) : 0;
+    if (!name_valid(arg, strlen(arg)) || days < 0) {
+        say("usage: /share NAME [DAYS]   (all of the history, or the last DAYS days)");
+        return;
+    }
+    send_share(arg, days);
+}
+
+static void on_done(const uint8_t *p, size_t n)
+{
+    char text[HUSH_MAX_FRAME + 1];
+    if (n < 2)
+        return;
+    sanitize(p + 2, n - 2, text);
+    say("%s%s", p[1] ? "" : "! ", text);
+}
+
+/* An admin let us see more history: show what came before. */
+static void on_shared(const uint8_t *p, size_t n)
+{
+    if (n != 2)
+        return;
+    unsigned days = get_u16(p);
+    if (days)
+        say("%s* an admin shared the last %u day%s of history with you%s", col("\033[33m"), days, days == 1 ? "" : "s",
+            col("\033[0m"));
+    else
+        say("%s* an admin shared the chat's history with you%s", col("\033[33m"), col("\033[0m"));
+    say("%s--- older messages ---%s", col("\033[2m"), col("\033[0m"));
+    request_history(HIST_OLDER, oldest_id, HISTORY_PAGE);
 }
 
 static void cmd_newchat(const char *label)
@@ -1274,6 +1347,10 @@ static void process_frames(void)
             on_pending(p, n);
         else if (type == T_CREATED)
             on_created(p, n);
+        else if (type == T_DONE)
+            on_done(p, n);
+        else if (type == T_SHARED)
+            on_shared(p, n);
         else if (type == T_ERROR) {
             char msg[HUSH_MAX_FRAME + 1];
             sanitize(p, n, msg);
@@ -1322,8 +1399,11 @@ static void cmd_help(void)
     if (am_admin)
         say("As an admin:\n"
             "  /waiting         who's waiting to join\n"
-            "  /approve NAME    let NAME in (check their fingerprint first)\n"
+            "  /approve NAME [DAYS|all]  let NAME in (check their fingerprint first), and\n"
+            "                   let them see the last DAYS days of history, or all of it\n"
             "  /deny NAME       turn NAME away\n"
+            "  /share NAME [DAYS]  let NAME see history from before they joined: all of it,\n"
+            "                   or the last DAYS days\n"
             "  /newchat NAME    create a chat and get its key");
 }
 
@@ -1472,6 +1552,8 @@ static void submit(void)
             cmd_decide(arg, 1);
         else if (!strcmp(cmd, "deny"))
             cmd_decide(arg, 0);
+        else if (!strcmp(cmd, "share"))
+            cmd_share(arg);
         else if (!strcmp(cmd, "more")) {
             if (mydata.active) {
                 say("! wait for /mydata to finish");

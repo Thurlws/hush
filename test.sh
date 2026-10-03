@@ -118,11 +118,13 @@ def hello(tag, extra):
     s.close()
 hello("v0", b"")
 hello("v1", b"\x01")
+hello("v2", b"\x02")
 hello("v9", b"\x09")
 EOF
 check "$T/proto.out" "v0 CHALLENGE" "a HELLO without a version (old clients) still works"
-check "$T/proto.out" "v1 CHALLENGE" "the current protocol version works"
-check "$T/proto.out" "v9 type 15 unsupported protocol version 9 (this server speaks 0 to 1), the server needs updating" \
+check "$T/proto.out" "v1 CHALLENGE" "the previous protocol version works"
+check "$T/proto.out" "v2 CHALLENGE" "the current protocol version works"
+check "$T/proto.out" "v9 type 15 unsupported protocol version 9 (this server speaks 0 to 2), the server needs updating" \
     "a newer protocol version is refused with a reason"
 
 # The first person in, before there's an admin: they wait, until the operator
@@ -171,14 +173,22 @@ absent "$S/hushd-keys.txt" "$KC" "...and the server never got the key"
 admin keys >"$T/keys-club.out"
 check  "$T/keys-club.out" "club" "hushd keys lists chats made in a client"
 
-# History: someone who wasn't there gets the chat, but not other people's DMs.
+# History: an admin sees all of it, from before they joined too, but not other people's DMs.
 sleep 2 | client dave d >"$T/dave.out" 2>&1
-check  "$T/dave.out" "alice: hello from alice" "a newcomer sees the chat's history"
+check  "$T/dave.out" "alice: hello from alice" "an admin sees the chat's history from before they joined"
 check  "$T/dave.out" "bob: hi alice"           "...all of it"
 absent "$T/dave.out" "just for you"            "...but not DMs between others"
 
+# What's been said so far is from 10 days ago, for the history sharing tests below.
+python3 -c "
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute('UPDATE messages SET time = time - 10 * 86400000')
+db.commit()" "$S/hushd.db"
+
 # The waitlist: amy is let in from the chat, zed is turned away, cli from the command line.
-(sleep 2; echo "/waiting"; sleep 0.5; echo "/approve amy"; sleep 1.5; echo "/deny zed"; sleep 2) | client alice a >"$T/alice-wl.out" 2>&1 &
+(sleep 1.5; echo "fresh news"; sleep 0.5; echo "/waiting"; sleep 0.5; echo "/approve amy"; sleep 1.5; echo "/deny zed"; sleep 2) |
+    client alice a >"$T/alice-wl.out" 2>&1 &
 a=$!
 sleep 0.5
 (sleep 4; echo "/approve zed"; echo "hi, amy here"; sleep 1) | client amy am >"$T/amy.out" 2>&1 &
@@ -190,7 +200,9 @@ wait $a $m $z
 check  "$T/alice-wl.out" "amy wants to join, with fingerprint" "admins see who wants to join, with their fingerprint"
 check  "$T/alice-wl.out" "zed is waiting"                      "/waiting lists the waitlist"
 check  "$T/amy.out"      "on the waitlist"                     "newcomers wait for approval"
-check  "$T/amy.out"      "alice: hello from alice"             "once approved, they get the history"
+check  "$T/amy.out"      "chat: main"                          "once approved, they're in"
+absent "$T/amy.out"      "hello from alice"                    "...but don't see what was said before"
+absent "$T/amy.out"      "fresh news"                          "...not even just before"
 check  "$T/amy.out"      "only an admin can do that"           "people who aren't admins can't approve anyone"
 check  "$T/zed.out"      "didn't let you into this chat"       "a denied person is turned away"
 absent "$T/zed.out"      "hello from alice"                    "people waiting see nothing of the chat"
@@ -204,6 +216,25 @@ check "$T/pending.out" "cli" "hushd pending lists who's waiting"
 admin approve main cli >/dev/null
 wait $c
 check "$T/cli.out" "chat: main" "hushd approve lets someone in within a second"
+absent "$T/cli.out" "hello from alice" "...and they don't see older history either"
+
+# An admin shares history with amy while she's online: the last 7 days, then all of it.
+(sleep 3.5) | client amy am >"$T/amy-share.out" 2>&1 &
+m=$!
+(sleep 1; echo "/share amy 7"; sleep 1) | client alice a >"$T/alice-share.out" 2>&1
+wait $m
+check  "$T/alice-share.out" "amy can now see the last 7 days of main" "an admin shares the last 7 days of history"
+check  "$T/amy-share.out"   "shared the last 7 days of history with you" "...the member is told"
+check  "$T/amy-share.out"   "alice: fresh news"   "...and gets it right away"
+absent "$T/amy-share.out"   "hello from alice"    "...but nothing older"
+admin share main amy >"$T/share-cli.out"
+sleep 1 | client amy am >"$T/amy-all.out" 2>&1
+check "$T/share-cli.out" "amy can now see all of main" "hushd share shares all of it"
+check "$T/amy-all.out"   "alice: hello from alice"     "...which she gets the next time she connects"
+(sleep 0.5; echo "/share amy 7"; sleep 1) | client alice a >"$T/alice-share2.out" 2>&1
+check "$T/alice-share2.out" "could already see that much" "shared history is never taken back"
+(sleep 0.5; echo "/share amy"; sleep 1) | client bob b "$KC" >"$T/bob-share.out" 2>&1
+check "$T/bob-share.out" "amy isn't in club" "only members of the chat can be shared with"
 
 # Offline delivery: a DM to someone who isn't connected waits for them.
 (sleep 0.5; echo "/msg alice while you were out"; sleep 1) | client bob b >/dev/null 2>&1
@@ -391,6 +422,7 @@ if command -v node >/dev/null; then
     check  "$T/wally.out"  "wendy wants to join"           "a web admin sees who wants to join"
     check  "$T/wendy.out"  "waiting for approval"          "a web newcomer waits"
     check  "$T/wendy.out"  "connected as wendy"            "...and is let in by the web admin"
+    absent "$T/wendy.out"  "hello from alice"              "...without the history from before"
     check  "$T/alice3.out" "wendy: hello from a browser"   "terminal receives a web client's message"
     check  "$T/alice3.out" "?[2Jwipe ?reversed"            "escape codes and bidi overrides are defused"
     absent "$T/alice3.out" $'\033'                         "...so nothing reaches the terminal raw"
@@ -474,15 +506,15 @@ schema() { # db file -> "version N state S" for olduser if present
     python3 -c "
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
-row = db.execute(\"SELECT state FROM members WHERE name = 'olduser'\").fetchone()
-print('version', db.execute('PRAGMA user_version').fetchone()[0], 'state', row[0] if row else '-')" "$1"
+row = db.execute(\"SELECT state, since FROM members WHERE name = 'olduser'\").fetchone()
+print('version', db.execute('PRAGMA user_version').fetchone()[0], 'state', row[0] if row else '-', 'since', row[1] if row else '-')" "$1"
 }
 ./hushd -C "$T/old-db" keys >/dev/null 2>"$T/migrate.out"
 schema "$T/old-db/hushd.db" >>"$T/migrate.out"
 schema "$S/hushd.db" >"$T/fresh-db.out"
-check "$T/migrate.out"  "upgrading hushd.db from schema 1 to 2" "an old database is upgraded in place"
-check "$T/migrate.out"  "version 2 state 1" "...and people who were in a chat stay in"
-check "$T/fresh-db.out" "version 2"         "a new database starts at the latest schema"
+check "$T/migrate.out"  "upgrading hushd.db from schema 1 to 3" "an old database is upgraded in place"
+check "$T/migrate.out"  "version 3 state 1 since 0" "...and people who were in a chat stay in, seeing all of it"
+check "$T/fresh-db.out" "version 3"         "a new database starts at the latest schema"
 python3 -c "import sqlite3, sys; sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version = 99')" "$T/old-db/hushd.db"
 ./hushd -C "$T/old-db" keys >"$T/migrate2.out" 2>&1
 check "$T/migrate2.out" "written by a newer hushd" "a database from a newer hushd is refused"

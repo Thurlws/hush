@@ -19,7 +19,8 @@ body {
   background: var(--bg); color: var(--fg);
   font: 15px/1.5 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
 }
-input, button { font: inherit; color: inherit; }
+input, button, select { font: inherit; color: inherit; }
+select { background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: .3em .4em; }
 input {
   width: 100%; background: var(--field); border: 1px solid var(--line); border-radius: 6px;
   padding: .55em .75em; outline: none;
@@ -86,6 +87,8 @@ header b { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-sp
 .who-box { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .request .who { font-weight: 600; }
 .request .fp { color: var(--dim); font-size: .85em; overflow-wrap: anywhere; }
+.request select { max-width: 9.5em; }
+@media (max-width: 480px) { .request { flex-wrap: wrap; } .request .who-box { flex-basis: 100%; } }
 .approve { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 #created-key { user-select: all; margin: .2em 0 .6em; font-size: 1.4em; }
 #created .row { display: flex; gap: .5em; }

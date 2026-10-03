@@ -65,6 +65,7 @@ struct client {
     int refused;     /* dropped with an error, web clients shouldn't reconnect */
     int lingering;   /* refused, draining input before the close. 2 once our side is shut */
     int admin;       /* its identity key is on the admin list */
+    int proto;       /* protocol version from its HELLO */
     int no_chat;     /* logged in with a zero token, to create chats */
     time_t deadline; /* drop the connection after this, 0 for never */
     uint8_t ip[16];  /* rate-limit key */
@@ -471,13 +472,13 @@ static sqlite3 *db;
 enum {
     Q_INSERT_MSG, Q_OLDER, Q_NEWER, Q_MINE, Q_ADD_MEMBER, Q_MEMBERS, Q_IS_MEMBER,
     Q_MEMBER_STATE, Q_SET_STATE, Q_WAITING, Q_COUNT_WAITING,
-    Q_ADD_BLOB, Q_BLOB_ROOM, NQUERIES
+    Q_ADD_BLOB, Q_BLOB_ROOM, Q_JOIN, Q_SINCE, Q_SHARE_POINT, Q_SHARE, NQUERIES
 };
 static const char *const query_sql[NQUERIES] = {
     [Q_INSERT_MSG] = "INSERT INTO messages (room, sender, recipient, time, body) VALUES (?1, ?2, ?3, ?4, ?5)",
-    [Q_OLDER] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id < ?2 "
+    [Q_OLDER] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id < ?2 AND id > ?5 "
                 "AND (recipient IS NULL OR recipient = ?3 OR sender = ?3) ORDER BY id DESC LIMIT ?4",
-    [Q_NEWER] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id > ?2 "
+    [Q_NEWER] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id > ?2 AND id > ?5 "
                 "AND (recipient IS NULL OR recipient = ?3 OR sender = ?3) ORDER BY id ASC LIMIT ?4",
     [Q_MINE] = "SELECT id, time, sender, recipient, body FROM messages WHERE room = ?1 AND id > ?2 "
                "AND (sender = ?3 OR recipient = ?3) ORDER BY id ASC LIMIT ?4",
@@ -490,6 +491,11 @@ static const char *const query_sql[NQUERIES] = {
     [Q_COUNT_WAITING] = "SELECT count(*) FROM members WHERE room = ?1 AND state = 0",
     [Q_ADD_BLOB] = "INSERT INTO blobs (id, room, size, time) VALUES (?1, ?2, ?3, ?4)",
     [Q_BLOB_ROOM] = "SELECT room FROM blobs WHERE id = ?1",
+    [Q_JOIN] = "UPDATE members SET since = (SELECT coalesce(max(id), 0) FROM messages WHERE room = ?1), joined = ?3 "
+               "WHERE room = ?1 AND name = ?2",
+    [Q_SINCE] = "SELECT since FROM members WHERE room = ?1 AND name = ?2",
+    [Q_SHARE_POINT] = "SELECT coalesce(max(id), 0) FROM messages WHERE room = ?1 AND time < ?2",
+    [Q_SHARE] = "UPDATE members SET since = ?3 WHERE room = ?1 AND name = ?2",
 };
 static sqlite3_stmt *queries[NQUERIES];
 
@@ -512,6 +518,10 @@ static const char *const migrations[] = {
     "CREATE INDEX blobs_room ON blobs (room);",
     /* 2: the waitlist. Members from before it stay in. */
     "ALTER TABLE members ADD COLUMN state INTEGER NOT NULL DEFAULT 1;",
+    /* 3: members see history from when they were let in (messages after id since).
+     * Members from before keep seeing all of it. */
+    ("ALTER TABLE members ADD COLUMN since INTEGER NOT NULL DEFAULT 0;"
+     "ALTER TABLE members ADD COLUMN joined INTEGER NOT NULL DEFAULT 0;"),
 };
 
 static int db_int(const char *sql)
@@ -616,15 +626,37 @@ static int member_state(const uint8_t *room, const char *name)
     return state;
 }
 
+/* Letting someone in starts their history at the newest message. */
 static void set_member_state(const uint8_t *room, const char *name, int state)
 {
-    sqlite3_stmt *s = q(member_state(room, name) == MEMBER_NONE ? Q_ADD_MEMBER : Q_SET_STATE);
+    int was = member_state(room, name);
+    sqlite3_stmt *s = q(was == MEMBER_NONE ? Q_ADD_MEMBER : Q_SET_STATE);
     sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
     sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
     sqlite3_bind_int(s, 3, state);
     if (sqlite3_step(s) != SQLITE_DONE)
         note("updating chat members failed: %s", sqlite3_errmsg(db));
     sqlite3_reset(s);
+    if (state != MEMBER_IN || was == MEMBER_IN)
+        return;
+    s = q(Q_JOIN);
+    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 3, (int64_t)now_ms());
+    if (sqlite3_step(s) != SQLITE_DONE)
+        note("updating chat members failed: %s", sqlite3_errmsg(db));
+    sqlite3_reset(s);
+}
+
+/* The newest message id name can't see, 0 if they see everything. */
+static int64_t member_since(const uint8_t *room, const char *name)
+{
+    sqlite3_stmt *s = q(Q_SINCE);
+    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    int64_t since = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int64(s, 0) : 0;
+    sqlite3_reset(s);
+    return since;
 }
 
 static void blob_path(const uint8_t id[HUSH_BLOB_ID], char *out, size_t n)
@@ -709,6 +741,7 @@ static void on_hello(struct client *c, const uint8_t *p, size_t n)
         return;
     }
     int version = rest == crypto_sign_PUBLICKEYBYTES + 33 ? p[n - 1] : 0;
+    c->proto = version;
     if (version < HUSH_PROTO_MIN || version > HUSH_PROTO) {
         char msg[160];
         snprintf(msg, sizeof msg, "unsupported protocol version %d (this server speaks %d to %d), %s", version,
@@ -1066,6 +1099,8 @@ static void on_history(struct client *c, const uint8_t *p, size_t n)
     sqlite3_bind_int64(s, 2, (int64_t)anchor);
     sqlite3_bind_text(s, 3, c->name, -1, SQLITE_STATIC);
     sqlite3_bind_int(s, 4, limit + 1); /* one extra says whether there's more */
+    if (dir != HIST_MINE) /* "My data" is your own, whenever you joined */
+        sqlite3_bind_int64(s, 5, c->admin ? 0 : member_since(c->room, c->name));
 
     /* Older pages come newest first, so collect them and send reversed. */
     struct buf frames[HUSH_HISTORY_MAX];
@@ -1290,6 +1325,109 @@ static void on_newchat(struct client *c, const uint8_t *p, size_t n)
     buf_free(&b);
 }
 
+/* Let name see more of room's history: the last days days, or all of it with 0. Shared
+ * history is never taken back. 1 if they see more now. If they're online, their
+ * client is told so it can load it. */
+static int share_history(const uint8_t *room, const char *name, unsigned days)
+{
+    int64_t point = 0;
+    if (days) {
+        sqlite3_stmt *s = q(Q_SHARE_POINT);
+        sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+        sqlite3_bind_int64(s, 2, (int64_t)now_ms() - (int64_t)days * 86400000);
+        if (sqlite3_step(s) == SQLITE_ROW)
+            point = sqlite3_column_int64(s, 0);
+        sqlite3_reset(s);
+    }
+    if (point >= member_since(room, name))
+        return 0;
+    sqlite3_stmt *s = q(Q_SHARE);
+    sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 3, point);
+    int ok = sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_reset(s);
+    if (!ok) {
+        note("sharing history failed: %s", sqlite3_errmsg(db));
+        return 0;
+    }
+    uint8_t d[2];
+    put_u16(d, (uint16_t)days);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        struct client *o = clients[i];
+        if (o && !o->dead && o->st == ST_READY && o->proto >= 2 && !memcmp(o->room, room, 32) &&
+            !strcmp(o->name, name))
+            send_to(o, T_SHARED, d, sizeof d);
+    }
+    return 1;
+}
+
+__attribute__((format(printf, 4, 5))) static void done(struct client *c, uint8_t op, int ok, const char *fmt, ...)
+{
+    char text[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(text + 2, sizeof text - 2, fmt, ap);
+    va_end(ap);
+    text[0] = (char)op;
+    text[1] = (char)ok;
+    send_to(c, T_DONE, text, 2 + (k < 0 ? 0 : k >= (int)sizeof text - 2 ? sizeof text - 3 : (size_t)k));
+}
+
+static struct room *chat_or_done(struct client *c, uint8_t op, const char *label)
+{
+    struct room *r = room_by_label(label);
+    if (!r || r->old)
+        done(c, op, 0, "there's no chat called %s", label);
+    return r && !r->old ? r : NULL;
+}
+
+static void manage_share(struct client *c, const uint8_t *p, size_t n)
+{
+    char label[HUSH_NAME_MAX + 1], name[HUSH_NAME_MAX + 1];
+    int k1 = name_get(p, n, label), k2 = k1 < 0 ? -1 : name_get(p + k1, n - (size_t)k1, name);
+    if (k2 < 0 || n - (size_t)k1 - (size_t)k2 != 2) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    unsigned days = get_u16(p + k1 + k2);
+    struct room *r = chat_or_done(c, MG_SHARE, label);
+    if (!r)
+        return;
+    if (member_state(r->hash, name) != MEMBER_IN) {
+        done(c, MG_SHARE, 0, "%s isn't in %s", name, label);
+        return;
+    }
+    if (!share_history(r->hash, name, days))
+        done(c, MG_SHARE, 1, "%s could already see that much of %s", name, label);
+    else if (days)
+        done(c, MG_SHARE, 1, "%s can now see the last %u day%s of %s", name, days, days == 1 ? "" : "s", label);
+    else
+        done(c, MG_SHARE, 1, "%s can now see all of %s", name, label);
+    note("%s: %s shared %s history with %s", c->addr, c->name, label, name);
+}
+
+/* Admins manage chats, members, sessions and bans, from a chat or from the
+ * admin-only login. Each request gets one answer: a DONE, or ITEMs and a LIST_END. */
+static void on_manage(struct client *c, const uint8_t *p, size_t n)
+{
+    if (n < 1) {
+        send_error(c, "malformed request", 1);
+        return;
+    }
+    uint8_t op = p[0];
+    if (!c->admin) {
+        done(c, op, 0, "only an admin can do that");
+        return;
+    }
+    if (!take_request(c))
+        return;
+    if (op == MG_SHARE)
+        manage_share(c, p + 1, n - 1);
+    else
+        send_error(c, "malformed request", 1);
+}
+
 static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_t n)
 {
     if (c->st == ST_HELLO && type == T_HELLO)
@@ -1308,6 +1446,8 @@ static void handle_frame(struct client *c, uint8_t type, const uint8_t *p, size_
         on_decide(c, p, n);
     else if ((c->st == ST_READY || c->st == ST_ADMIN) && type == T_NEWCHAT)
         on_newchat(c, p, n);
+    else if ((c->st == ST_READY || c->st == ST_ADMIN) && type == T_MANAGE)
+        on_manage(c, p, n);
     else
         send_error(c, "protocol violation", 1);
 }
@@ -1699,10 +1839,11 @@ static void delete_history(const uint8_t *room, int members)
         unlink(path);
     }
     sqlite3_finalize(s);
-    static const char *const del[] = { "DELETE FROM blobs WHERE room = ?1",
-                                       "DELETE FROM messages WHERE room = ?1",
-                                       "DELETE FROM members WHERE room = ?1" };
-    for (int i = 0; i < (members ? 3 : 2); i++) {
+    /* With the messages gone their ids can be used again, so a member's since has to go too */
+    const char *const del[] = { "DELETE FROM blobs WHERE room = ?1", "DELETE FROM messages WHERE room = ?1",
+                                members ? "DELETE FROM members WHERE room = ?1"
+                                        : "UPDATE members SET since = 0 WHERE room = ?1" };
+    for (int i = 0; i < 3; i++) {
         if (sqlite3_prepare_v2(db, del[i], -1, &s, NULL) != SQLITE_OK)
             die("database: %s", sqlite3_errmsg(db));
         sqlite3_bind_blob(s, 1, room, 32, SQLITE_STATIC);
@@ -1898,6 +2039,27 @@ static void cmd_decide(const char *label, const char *name, int approve)
            approve ? "is in" : "was turned away");
 }
 
+static void cmd_share(const char *label, const char *name, const char *days_text)
+{
+    struct room *r = room_or_die(label);
+    unsigned days = 0;
+    if (days_text) {
+        char *end;
+        long d = strtol(days_text, &end, 10);
+        if (*end || d < 1 || d > 65535)
+            die("give a number of days, e.g. hushd share %s %s 7 (or nothing, for all of it)", label, name);
+        days = (unsigned)d;
+    }
+    if (!name || member_state(r->hash, name) != MEMBER_IN)
+        die("%s isn't in %s", name ? name : "?", label);
+    if (!share_history(r->hash, name, days))
+        printf("%s could already see that much of %s\n", name, label);
+    else if (days)
+        printf("%s can now see the last %u day%s of %s\n", name, days, days == 1 ? "" : "s", label);
+    else
+        printf("%s can now see all of %s\n", name, label);
+}
+
 /* The chat key, from $HUSH_KEY or asked for on the terminal without echo. */
 static void read_chat_key(char *out, size_t n)
 {
@@ -1916,15 +2078,18 @@ static void read_chat_key(char *out, size_t n)
         off.c_lflag &= ~(tcflag_t)ECHO;
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &off);
     }
-    char *ok = fgets(out, (int)n, stdin);
+    char line[HUSH_KEY_MAX + 2]; /* a buffer of known size, so the analyzer can follow the index */
+    char *ok = fgets(line, sizeof line, stdin);
     if (hide)
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
     fputc('\n', stderr);
     if (!ok)
         die("no chat key given");
-    size_t end = strcspn(out, "\r\n");
-    if (end < n)
-        out[end] = '\0';
+    size_t end = strcspn(line, "\r\n");
+    if (end < sizeof line)
+        line[end] = '\0';
+    snprintf(out, n, "%s", line);
+    sodium_memzero(line, sizeof line);
 }
 
 static void iso_time(uint64_t ms, char *out, size_t n, int local)
@@ -2182,6 +2347,8 @@ static void usage(void)
             "       hushd [options] admins       list admins\n"
             "       hushd [options] pending      who's waiting to join which chat\n"
             "       hushd [options] approve CHAT USER, deny CHAT USER\n"
+            "       hushd [options] share CHAT USER [DAYS]  let USER see the chat's history from\n"
+            "                    before they joined: all of it, or the last DAYS days\n"
             "       hushd [options] export CHAT DIR   decrypt a chat into DIR (asks for its key)\n"
             "       hushd [options] backup DIR   copy everything hushd keeps into DIR, safe while it runs\n"
             "options:\n"
@@ -2233,6 +2400,7 @@ int main(int argc, char **argv)
     if (optind < argc) {
         const char *cmd = argv[optind], *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
         const char *arg2 = optind + 2 < argc ? argv[optind + 2] : NULL;
+        const char *arg3 = optind + 3 < argc ? argv[optind + 3] : NULL;
         int nargs = argc - optind - 1;
         if (!strcmp(cmd, "admin") || !strcmp(cmd, "unadmin")) {
             /* the fingerprint may come quoted or as eight separate groups */
@@ -2242,7 +2410,8 @@ int main(int argc, char **argv)
             cmd_admin(fp, !strcmp(cmd, "admin"));
             return 0;
         }
-        if (nargs > 2 || (nargs == 2 && strcmp(cmd, "approve") && strcmp(cmd, "deny") && strcmp(cmd, "export")))
+        int two = !strcmp(cmd, "approve") || !strcmp(cmd, "deny") || !strcmp(cmd, "export") || !strcmp(cmd, "share");
+        if (nargs > 3 || (nargs == 3 && strcmp(cmd, "share")) || (nargs == 2 && !two))
             usage();
         if (!strcmp(cmd, "newkey")) {
             cmd_newkey(arg);
@@ -2263,6 +2432,8 @@ int main(int argc, char **argv)
             cmd_decide(arg, arg2, !strcmp(cmd, "approve"));
         else if (!strcmp(cmd, "export") && arg2)
             cmd_export(arg, arg2);
+        else if (!strcmp(cmd, "share") && arg2)
+            cmd_share(arg, arg2, arg3);
         else if (!strcmp(cmd, "revoke"))
             cmd_revoke(arg);
         else if (!strcmp(cmd, "clear"))

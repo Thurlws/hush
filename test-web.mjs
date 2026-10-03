@@ -59,6 +59,8 @@ const s = new Session({ sodium, url, name, key, secretKey: sk, known, WebSocket:
   case "message": show(ev.msg); break;
   case "history": ev.messages.forEach(show); if (ev.more) console.log("(more history)"); break;
   case "notice": console.log(ev.text); break;
+  case "done": console.log(`${ev.ok ? "" : "! "}${ev.text}`); break;
+  case "shared": console.log(`* history shared with you (${ev.days || "all"})`); break;
   case "error": console.log(`! server: ${ev.text}`); break;
   case "closed": console.log(`closed${ev.error ? `: ${ev.error}` : ""}`); process.exit(0);
   }
